@@ -2678,7 +2678,7 @@ function renderNewParentModal(){
   let html='<div class="overlay" onclick="if(event.target===this) closeNewParentForm()"><div class="modal">';
   html+='<h3>Add a parent</h3>';
   html+='<label>Name</label><input type="text" value="'+f.name+'" oninput="setNPF(\'name\', this.value)"/>';
-  html+='<label>Email</label><input type="email" value="'+f.email+'" oninput="setNPF(\'email\', this.value)"/>';
+  html+='<label>Email</label><input type="text" value="'+f.email+'" oninput="setNPF(\'email\', this.value)"/>';
   if(supabaseClient){
     html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;margin-top:10px"><input type="checkbox" style="width:auto;margin:0" '+(f.inviteNow?'checked':'')+' onchange="setNPF(\'inviteNow\',this.checked)"/> Email them an invite to set up their login now</label>';
   }
@@ -2714,7 +2714,7 @@ function renderNewInstructorModal(){
   let html='<div class="overlay" onclick="if(event.target===this) closeNewInstructorForm()"><div class="modal">';
   html+='<h3>Add an instructor</h3>';
   html+='<label>Name</label><input type="text" value="'+f.name+'" oninput="setNIF(\'name\', this.value)"/>';
-  html+='<label>Email</label><input type="email" value="'+f.email+'" oninput="setNIF(\'email\', this.value)"/>';
+  html+='<label>Email</label><input type="text" value="'+f.email+'" oninput="setNIF(\'email\', this.value)"/>';
   html+='<label>Best suited for <span class="small muted">(a preference only — they can teach any year)</span></label>';
   html+='<div class="row2"><div><label>From</label><select onchange="setNIF(\'yearMin\', Number(this.value))">'
     +YEARS.map(function(y){ return '<option value="'+y+'"'+(y===f.yearMin?' selected':'')+'>'+yearLabel(y)+'</option>'; }).join('')
@@ -2811,7 +2811,7 @@ function renderNewStudentModal(){
       +'</select>';
   } else {
     html+='<div class="row2"><div><label>Parent name</label><input type="text" value="'+f.parentName+'" oninput="setNSF(\'parentName\', this.value)"/></div>'
-      +'<div><label>Parent email</label><input type="email" value="'+f.parentEmail+'" oninput="setNSF(\'parentEmail\', this.value)"/></div></div>';
+      +'<div><label>Parent email</label><input type="text" value="'+f.parentEmail+'" oninput="setNSF(\'parentEmail\', this.value)"/></div></div>';
   }
   html+='<label>Student name</label><input type="text" value="'+f.studentName+'" oninput="setNSF(\'studentName\', this.value)"/>';
   html+='<label>School year</label><select onchange="setNSF(\'year\', Number(this.value))">'
