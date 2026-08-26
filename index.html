@@ -425,7 +425,7 @@ var parents=[
   {id:'p5', name:'Priya Singh', email:'priya.singh@example.com', studentIds:['s5']},
 ];
 
-var nextSessionId=100, nextCreditId=100, nextStudentId=100, nextParentId=100, nextInstructorId=10;
+var nextSessionId=100, nextCreditId=100, nextStudentId=100, nextParentId=100, nextInstructorId=10, nextPlanChangeId=1;
 
 // Sessions record podId (the bookable resource) plus the instructor(s) actually covering it,
 // snapshotted at booking time from the pod's schedule — so editing the pod schedule later never
@@ -842,6 +842,105 @@ function currentOrUpcomingPlanChange(studentId){
   return (student.planChanges||[]).slice().sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); })[0] || null;
 }
 
+/* ---------- plan changes: stop or change frequency from a future date (5.16b) ---------- */
+function openPlanChangeForm(studentId){
+  const student=findStudent(studentId);
+  state.planChangeForm={
+    studentId, mode:'stop', effectiveFrom:toKey(simNow()),
+    sessionsPerWeek: student.sessionsPerWeek,
+    recurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
+    error:''
+  };
+  render();
+}
+function closePlanChangeForm(){ state.planChangeForm=null; render(); }
+function setPlanChangeMode(mode){ state.planChangeForm.mode=mode; state.planChangeForm.error=''; render(); }
+function setPlanChangeField(field, value){ state.planChangeForm[field]=value; state.planChangeForm.error=''; render(); }
+function setPlanChangeSessionsPerWeek(v){
+  const f=state.planChangeForm;
+  const student=findStudent(f.studentId);
+  f.sessionsPerWeek=Number(v);
+  const starts=possibleStarts(student.duration);
+  while(f.recurring.length<f.sessionsPerWeek) f.recurring.push({weekday:'Mon', start:starts[0]});
+  f.recurring=f.recurring.slice(0,f.sessionsPerWeek);
+  f.error='';
+  render();
+}
+function setPlanChangeRecurringSlot(idx, field, value){
+  state.planChangeForm.recurring[idx][field] = field==='start'? Number(value) : value;
+  render();
+}
+function savePlanChange(){
+  const f=state.planChangeForm;
+  const student=findStudent(f.studentId);
+  if(!f.effectiveFrom){ f.error='Choose an effective date.'; render(); return; }
+  if(toKey(new Date(f.effectiveFrom))<toKey(simNow())){ f.error='Effective date must be today or in the future.'; render(); return; }
+  const stopped = f.mode==='stop';
+  if(!stopped && f.recurring.length===0){ f.error='Add at least one standing day/time.'; render(); return; }
+  const change={
+    id:newId()||('pc'+(nextPlanChangeId++)),
+    effectiveFrom:new Date(f.effectiveFrom), stopped,
+    sessionsPerWeek: stopped? 0 : Number(f.sessionsPerWeek),
+    recurring: stopped? [] : f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; }),
+  };
+  // One pending change per effective date — re-saving the same date replaces it, same convention
+  // as the standing Pod pin (saveStudentPodAssignment) uses for its own dated history.
+  student.planChanges = (student.planChanges||[]).filter(function(pc){ return toKey(pc.effectiveFrom)!==f.effectiveFrom; });
+  student.planChanges.push(change);
+
+  // Cancel already-generated future standing occurrences from the effective date forward — same
+  // as a standing Pod pin (saveStudentPodAssignment) — so a "stop" or a frequency change actually
+  // takes hold for every upcoming standing session, not just ones not yet generated. Restores any
+  // linked make-up credit first, same as any other cancellation (5.11). One-off/staff-placed
+  // sessions are left alone; only the auto-generated standing ones regenerate.
+  let movedCount=0;
+  sessions.forEach(function(s){
+    if(s.studentId!==student.id || !s.recurring || s.status!=='scheduled') return;
+    if(toKey(s.date) < f.effectiveFrom) return;
+    s.status='cancelled';
+    movedCount++;
+    dbWrite('cancelling a session for a plan change', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+    if(s.creditId){
+      const cr=findCredit(s.creditId);
+      if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){
+        cr.status='available'; cr.redeemedSessionId=null;
+        dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', cr.id); });
+      }
+    }
+  });
+
+  dbWrite('scheduling a plan change', function(){
+    // Deleting any existing row for this exact date first (cascades its own recurring rows) keeps
+    // this idempotent on re-save, same as the local array replace above.
+    return supabaseClient.from('student_plan_changes').delete().eq('student_id', student.id).eq('effective_from', f.effectiveFrom).then(function(){
+      return supabaseClient.from('student_plan_changes').insert({
+        id:change.id, student_id:student.id, effective_from:f.effectiveFrom, stopped:stopped, sessions_per_week:change.sessionsPerWeek
+      });
+    }).then(function(r){
+      if(r.error || stopped || !change.recurring.length) return r;
+      return supabaseClient.from('student_plan_change_recurring').insert(change.recurring.map(function(rec){
+        return {plan_change_id:change.id, weekday:rec.weekday, start_min:rec.start};
+      }));
+    });
+  });
+  regenerateAllRecurring();
+  toast(student.name+(stopped
+    ? ' scheduled to stop attending from '+fmtShort(new Date(f.effectiveFrom))+'.'
+    : '’s schedule changing to '+change.sessionsPerWeek+'x/week from '+fmtShort(new Date(f.effectiveFrom))+'.')
+    +(movedCount? ' '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match.' : ''));
+  state.planChangeForm=null;
+  render();
+}
+function cancelPlanChange(studentId, effectiveFromKey){
+  const student=findStudent(studentId);
+  student.planChanges=(student.planChanges||[]).filter(function(pc){ return toKey(pc.effectiveFrom)!==effectiveFromKey; });
+  dbWrite('cancelling a scheduled plan change', function(){ return supabaseClient.from('student_plan_changes').delete()
+    .eq('student_id', studentId).eq('effective_from', effectiveFromKey); });
+  const made=regenerateAllRecurring();
+  toast('Scheduled plan change removed'+(made>0? ' — '+made+' standing session(s) re-booked.' : '.'));
+  render();
+}
+
 // Everything a parent should be told is changing about a child's schedule (5.20) — any front-desk-
 // scheduled hold, plan change (stop / frequency change), or standing Pod move that hasn't taken
 // effect yet. Purely informational on the parent side; they can't edit any of it themselves, only
@@ -936,9 +1035,13 @@ function saveStudentPodAssignment(){
     if(toKey(s.date) < f.effectiveFrom) return;
     s.status='cancelled';
     movedCount++;
+    dbWrite('cancelling a session for a Pod move', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
     if(s.creditId){
       const cr=findCredit(s.creditId);
-      if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){ cr.status='available'; cr.redeemedSessionId=null; }
+      if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){
+        cr.status='available'; cr.redeemedSessionId=null;
+        dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', cr.id); });
+      }
     }
   });
   regenerateAllRecurring();
@@ -1015,11 +1118,12 @@ function setRole(r){ state.role=r; state.booking=null; state.parentBookingCredit
 function advanceClock(days){
   state.offsetDays += days;
   const promoted=applyPromotions();
+  applyPlanChanges();
   regenerateAllRecurring();
   if(promoted>0) toast(promoted+' student'+(promoted===1?'':'s')+' promoted to their next school year.');
   else render();
 }
-function resetClock(){ state.offsetDays=0; applyPromotions(); render(); }
+function resetClock(){ state.offsetDays=0; applyPromotions(); applyPlanChanges(); render(); }
 
 function openBooking(podId, dateKey){
   const d = new Date(dateKey);
@@ -2408,7 +2512,7 @@ function renderStudentsPanel(){
       +'<td class="small">'+recurringSummary(s)+'</td>'
       +'<td>'+(short? '<span class="badge soon">'+booked+' / '+s.sessionsPerWeek+'</span>' : '<span class="badge available">'+booked+' / '+s.sessionsPerWeek+'</span>')+'</td>'
       +'<td class="small">'+(parent? parent.name : '—')+'</td>'
-      +'<td><button class="btn sm ghost" onclick="openRecurringForm(\''+s.id+'\')">Edit</button> <button class="btn sm ghost" onclick="openHoldForm(\''+s.id+'\')">Hold</button> <button class="btn sm ghost" onclick="openAddCreditForm(\''+s.id+'\')">+ Credit</button> <button class="btn sm ghost" onclick="openAttendanceLog(\''+s.id+'\')">History</button> <button class="btn sm ghost" onclick="openStudentPodForm(\''+s.id+'\')">Change Pod</button></td></tr>';
+      +'<td><button class="btn sm ghost" onclick="openRecurringForm(\''+s.id+'\')">Edit</button> <button class="btn sm ghost" onclick="openHoldForm(\''+s.id+'\')">Hold</button> <button class="btn sm ghost" onclick="openAddCreditForm(\''+s.id+'\')">+ Credit</button> <button class="btn sm ghost" onclick="openAttendanceLog(\''+s.id+'\')">History</button> <button class="btn sm ghost" onclick="openStudentPodForm(\''+s.id+'\')">Change Pod</button> <button class="btn sm ghost" onclick="openPlanChangeForm(\''+s.id+'\')">Stop / change plan</button></td></tr>';
   });
   html+='</table></div>';
   html+=renderNewStudentModal();
@@ -2416,6 +2520,7 @@ function renderStudentsPanel(){
   html+=renderHoldModal();
   html+=renderAttendanceLogModal();
   html+=renderStudentPodModal();
+  html+=renderPlanChangeModal();
   return html;
 }
 
@@ -2625,6 +2730,45 @@ function renderStudentPodModal(){
     +'<button class="btn ghost" onclick="closeStudentPodForm()">Cancel</button>'
     +'<button class="btn primary" onclick="saveStudentPodAssignment()">Save</button>'
   +'</div>';
+  html+='</div></div>';
+  return html;
+}
+
+function renderPlanChangeModal(){
+  const f=state.planChangeForm;
+  if(!f) return '';
+  const student=findStudent(f.studentId);
+  const starts=possibleStarts(student.duration);
+  const pending=(student.planChanges||[]).slice().sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); });
+  let html='<div class="overlay" onclick="if(event.target===this) closePlanChangeForm()"><div class="modal">';
+  html+='<h3>Stop or change '+student.name+'’s plan</h3>';
+  html+='<p>Schedules a change to take effect from a chosen future date, without disturbing anything between now and then — the same way a standing Pod pin or a hold works. Sessions already booked before the effective date are left alone; standing sessions from that date on regenerate to match automatically.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div style="display:flex;gap:14px;margin-bottom:8px;font-size:.8rem">'
+    +'<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0"><input type="radio" name="pcmode" style="width:auto" '+(f.mode==='stop'?'checked':'')+' onchange="setPlanChangeMode(\'stop\')"/> Stop attending</label>'
+    +'<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0"><input type="radio" name="pcmode" style="width:auto" '+(f.mode==='frequency'?'checked':'')+' onchange="setPlanChangeMode(\'frequency\')"/> Change frequency</label>'
+  +'</div>';
+  html+='<label>Effective from</label><input type="date" value="'+f.effectiveFrom+'" onchange="setPlanChangeField(\'effectiveFrom\',this.value)"/>';
+  if(f.mode==='frequency'){
+    html+='<label>Sessions per week</label><select onchange="setPlanChangeSessionsPerWeek(this.value)">'
+      +SESSIONS_PER_WEEK_OPTIONS.map(function(n){ return '<option value="'+n+'"'+(n===f.sessionsPerWeek?' selected':'')+'>'+n+'x/week</option>'; }).join('')
+      +'</select>';
+    html+='<label>New standing schedule</label>';
+    html+=renderRecurringPickers(f.recurring, starts, 'setPlanChangeRecurringSlot');
+  }
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closePlanChangeForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="savePlanChange()">Save</button>'
+  +'</div>';
+  if(pending.length>0){
+    html+='<h3 style="margin-top:18px">Scheduled changes</h3><table><tr><th>From</th><th>Change</th><th></th></tr>'
+      +pending.map(function(pc){
+        const desc = pc.stopped? 'Stop attending' : pc.sessionsPerWeek+'x/week';
+        return '<tr><td>'+fmtShort(pc.effectiveFrom)+'</td><td class="small">'+desc+'</td>'
+          +'<td><button class="btn sm ghost" onclick="cancelPlanChange(\''+student.id+'\',\''+toKey(pc.effectiveFrom)+'\')">Remove</button></td></tr>';
+      }).join('')
+      +'</table>';
+  }
   html+='</div></div>';
   return html;
 }
@@ -3224,9 +3368,17 @@ function afterLogin(){
       currentUser={role:r.data.role, instructorId:r.data.instructor_id, parentId:r.data.parent_id};
       loadAllData().then(function(){
         state.role=currentUser.role;
+        applyPromotions();
+        applyPlanChanges();
         regenerateAllRecurring();
         render();
-        setInterval(render, 30000); // checked-in "time left" countdown — see the offline-mode comment below
+        // Live mode has no demo-clock button to trigger applyPromotions()/applyPlanChanges() as
+        // days actually pass — real time just ticks forward on its own. Re-checking both on the
+        // same 30s heartbeat that already drives the checked-in "time left" countdown (see the
+        // offline-mode comment below) means a scheduled promotion or plan change takes effect
+        // within 30 seconds of its date arriving, not only the next time someone happens to
+        // re-open the page.
+        setInterval(function(){ applyPromotions(); applyPlanChanges(); render(); }, 30000);
       }).catch(function(err){
         console.error(err);
         showLoginScreen('Signed in, but loading your data failed — check your connection and reload.');
@@ -3254,6 +3406,7 @@ function loadAllData(){
     T('student_holds','id,student_id,start_date,end_date,note'),
     T('student_pod_assignments','id,student_id,pod_id,effective_from'),
     T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
+    T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
     T('parents','id,name,email'),
     T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,booked_by,is_recurring,credit_id'),
     T('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note'),
@@ -3261,7 +3414,7 @@ function loadAllData(){
     T('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
     T('waitlist_entries','id,student_id,name,year,weekday,start_min,duration,note,status,notified,date_added'),
   ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows]=t;
+    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows]=t;
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
@@ -3296,7 +3449,10 @@ function loadAllData(){
       recurring: slotRows.filter(function(s){ return s.student_id===r.id; }).map(function(s){ return {weekday:s.weekday, start:s.start_min}; }),
       holds: holdRows.filter(function(h){ return h.student_id===r.id; }).map(function(h){ return {id:h.id, start:new Date(h.start_date), end:new Date(h.end_date), note:h.note||''}; }),
       podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from)}; }),
-      planChanges: planChangeRows.filter(function(pc){ return pc.student_id===r.id; }).map(function(pc){ return {effectiveFrom:new Date(pc.effective_from), stopped:pc.stopped, sessionsPerWeek:pc.sessions_per_week}; }),
+      planChanges: planChangeRows.filter(function(pc){ return pc.student_id===r.id; }).map(function(pc){ return {
+        id:pc.id, effectiveFrom:new Date(pc.effective_from), stopped:pc.stopped, sessionsPerWeek:pc.sessions_per_week,
+        recurring: planChangeRecurRows.filter(function(rec){ return rec.plan_change_id===pc.id; }).map(function(rec){ return {weekday:rec.weekday, start:rec.start_min}; }),
+      }; }),
     }; });
 
     parents=parentRows.map(function(r){ return {
