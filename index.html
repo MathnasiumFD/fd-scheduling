@@ -2068,9 +2068,36 @@ function removeHold(studentId, holdId){
 }
 
 /* ---------- render: shell ---------- */
+// Every state change re-renders by rebuilding the whole #app innerHTML from scratch (no virtual
+// DOM/diffing) — simple and reliable, but naively doing that on every keystroke would tear down
+// and recreate the very <input> the person is typing into, kicking focus out and forcing them to
+// click back in before every single character. To avoid that: note which field (and cursor
+// position) was focused, rebuild the HTML as usual, then find the same field in the new markup —
+// by its position among the other text fields in the same modal, since these forms don't carry
+// individual ids — and restore focus/cursor there. A plain click, dropdown change, or button press
+// has nothing focused that this applies to, so it's a no-op the rest of the time.
 function render(){
   const app=document.getElementById('app');
+  const active = (typeof document!=='undefined') ? document.activeElement : null;
+  const isTextField = active && (active.tagName==='TEXTAREA' || (active.tagName==='INPUT' && ['text','email','password','number','search','tel','date'].indexOf(active.type)>=0));
+  let restore=null;
+  if(isTextField && app.contains(active)){
+    const scope = (active.closest && active.closest('.modal')) || app;
+    const fields = Array.prototype.slice.call(scope.querySelectorAll('input, textarea'));
+    const idx = fields.indexOf(active);
+    if(idx>=0) restore={ inModal: scope!==app, idx:idx, start:active.selectionStart, end:active.selectionEnd };
+  }
   app.innerHTML = renderTop() + renderTabs() + renderRole() + (state.toast? '<div class="toast">'+state.toast+'</div>':'') + renderFooter();
+  if(restore){
+    const scope = restore.inModal ? app.querySelector('.modal') : app;
+    const el = scope && scope.querySelectorAll('input, textarea')[restore.idx];
+    if(el){
+      el.focus();
+      if(typeof el.setSelectionRange==='function'){
+        try{ el.setSelectionRange(restore.start, restore.end); }catch(e){}
+      }
+    }
+  }
 }
 
 // The name shown in the "Welcome" greeting — an instructor's or parent's own record has a real
