@@ -179,6 +179,17 @@ var supabaseClient = (typeof window !== 'undefined' && window.supabase)
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
   : null;
 var currentUser = null; // {role, instructorId, parentId} — set once login resolves
+var SITE_URL = 'https://fd-scheduling.vercel.app/'; // update if the production Vercel URL ever changes — used as the redirect target for invite/password-reset emails
+
+// Supabase appends "#access_token=...&type=invite" or "...&type=recovery" to the redirect URL for
+// an invite link or a password-reset link. Captured once, synchronously, at page load — before
+// the Supabase SDK's own detectSessionInUrl logic runs and rewrites the URL — so it's reliable
+// regardless of exactly which auth event name a given supabase-js version fires for each case.
+var AUTH_REDIRECT_TYPE = (function(){
+  if(typeof window==='undefined' || !window.location || !window.location.hash) return null;
+  const m=window.location.hash.match(/type=(\w+)/);
+  return m? m[1] : null;
+})();
 
 // A real UUID when live (so a newly-created record's local id already matches what Postgres will
 // store — no reconciliation needed), or null in demo/offline mode so callers fall back to the
@@ -251,6 +262,36 @@ function notifyParentOfCheckIn(sessionId){
   supabaseClient.functions.invoke('send-checkin-email', {body:{sessionId}}).then(function(r){
     if(r && r.error) console.error('Check-in email failed:', r.error);
   }).catch(function(err){ console.error('Check-in email failed:', err); });
+}
+// One-click account setup (front desk only): creates the real Supabase Auth login and emails an
+// invite the person uses to set their own password — replacing the old two-step "add them in the
+// Supabase dashboard, then paste SQL to link their role" process. Unlike dbWrite(), this isn't
+// fire-and-forget — front desk is actively waiting to know whether the invite actually went out,
+// so it always leaves a toast either way.
+function inviteLogin(email, role, linkedId, personName){
+  if(!supabaseClient || !currentUser){ toast('Invites only work when signed in to the live app.'); return; }
+  supabaseClient.functions.invoke('invite-user', {body:{email:email, role:role, linkedId:linkedId}}).then(function(r){
+    const errMsg = (r && r.error && r.error.message) || (r && r.data && r.data.error);
+    if(errMsg){ toast('Could not invite '+personName+' — '+errMsg); return; }
+    if(role==='instructor'){ const i=findInstructor(linkedId); if(i) i.authUserId='pending'; }
+    if(role==='parent'){ const p=parents.find(function(x){ return x.id===linkedId; }); if(p) p.authUserId='pending'; }
+    toast('Invite sent to '+email+' — they\'ll get an email to set their own password.');
+    render();
+  }).catch(function(err){ toast('Could not invite '+personName+' — '+(err&&err.message?err.message:'unknown error')); });
+}
+function deactivateInstructor(instrId){
+  const instr=findInstructor(instrId);
+  instr.active=false;
+  dbWrite('deactivating an instructor', function(){ return supabaseClient.from('instructors').update({active:false}).eq('id', instrId); });
+  toast(instr.name+' deactivated — no longer offered for new bookings, coverage, or shift assignments. Their existing rostered shifts aren\'t touched automatically; reassign those from the Pod schedule or coverage tools.');
+  render();
+}
+function reactivateInstructor(instrId){
+  const instr=findInstructor(instrId);
+  instr.active=true;
+  dbWrite('reactivating an instructor', function(){ return supabaseClient.from('instructors').update({active:true}).eq('id', instrId); });
+  toast(instr.name+' reactivated.');
+  render();
 }
 var START_STEP=15; // sessions — and instructor/pod shift start/end times — can fall on any quarter-hour
 var DURATIONS=[60,90,120]; // minutes — sessions run 1, 1.5, or 2 hours
@@ -386,6 +427,7 @@ function blockInstructorOn(block, date){
 function qualifyingInstructorsForBlock(weekday, block, date){
   const dateKey=toKey(date);
   return instructors.filter(function(instr){
+    if(instr.active===false) return false; // deactivated instructors are never offered for a new shift/coverage
     const oneOff=instr.oneOffs.find(function(o){ return toKey(o.date)===dateKey; });
     if(oneOff) return !oneOff.off && block.start>=oneOff.start && block.end<=oneOff.end;
     const candidates=instr.availRules.filter(function(r){ return r.weekday===weekday && toKey(r.effectiveFrom)<=dateKey; });
@@ -1905,7 +1947,7 @@ function saveNewStudent(){
 function openNewInstructorForm(){
   const availability={};
   WEEKDAY_KEYS.forEach(function(day){ availability[day]={off:true, start:900, end:1140}; });
-  state.newInstructorForm={ name:'', email:'', yearMin:1, yearMax:12, availability, error:'' };
+  state.newInstructorForm={ name:'', email:'', yearMin:1, yearMax:12, availability, inviteNow:true, error:'' };
   render();
 }
 function closeNewInstructorForm(){ state.newInstructorForm=null; render(); }
@@ -1947,6 +1989,7 @@ function saveNewInstructor(){
   toast(newInstructor.name+' added — available '+workingDays.join(', ')+'. Best suited for '+yearLabel(f.yearMin)+'–'+yearLabel(f.yearMax)+' (a preference only — they can be assigned any shift they\'re staffed for).');
   state.newInstructorForm=null;
   render();
+  if(f.inviteNow) inviteLogin(newInstructor.email, 'instructor', newInstructor.id, newInstructor.name);
 }
 
 function openRecurringForm(studentId){
@@ -2030,13 +2073,23 @@ function render(){
   app.innerHTML = renderTop() + renderTabs() + renderRole() + (state.toast? '<div class="toast">'+state.toast+'</div>':'') + renderFooter();
 }
 
+// The name shown in the "Welcome" greeting — an instructor's or parent's own record has a real
+// name; a staff login has no individual name on file at all (by design — every front-desk account
+// has full access and isn't tied to one specific person, see app_users), so their sign-in email is
+// the closest thing to "who am I logged in as" for that role.
+function currentUserDisplayName(){
+  if(!currentUser) return '';
+  if(currentUser.role==='instructor'){ const i=findInstructor(currentUser.instructorId); if(i) return i.name; }
+  if(currentUser.role==='parent'){ const p=parents.find(function(x){ return x.id===currentUser.parentId; }); if(p) return p.name; }
+  return currentUser.email || 'Front Desk';
+}
 function renderTop(){
   const now=simNow();
   const introText = currentUser
     ? 'Sessions run 60, 90, or 120 minutes depending on the student’s program — times shown are scheduled starts; kids start when they arrive, typically within about 15 minutes either side.'
     : 'Sample data only. Simulated date used below so the 3‑month make‑up window can be demoed without waiting three months. Sessions run 60, 90, or 120 minutes depending on the student’s program — times shown are scheduled starts; kids start when they arrive, typically within about 15 minutes either side.';
   const clockControls = currentUser
-    ? '<div class="clock"><span>Today: <b>'+fmtLong(now)+'</b></span></div>'
+    ? '<div class="clock"><span>Welcome, <b>'+currentUserDisplayName()+'</b></span><span>Today: <b>'+fmtLong(now)+'</b></span></div>'
     : '<div class="clock">'
       +'<span>Simulated today: <b>'+fmtLong(now)+'</b></span>'
       +'<button class="btn sm" onclick="advanceClock(1)">+1 day</button>'
@@ -2155,6 +2208,7 @@ function renderStaff(){
   html+=renderWaitlistModal();
   html+=renderStudentsPanel();
   html+=renderInstructorsPanel();
+  html+=renderParentsPanel();
   html+=renderCreditsReport();
   return html;
 }
@@ -2241,7 +2295,7 @@ function renderCoverageRequestsPanel(){
         html+='<td>'+subs.map(function(i){ return '<button class="btn sm primary" style="margin:2px" onclick="fillCoverageRequest(\''+r.id+'\',\''+i.id+'\')">'+i.name+'</button>'; }).join('')+'</td>';
       }
       const selId='manualCover_'+r.id;
-      const options=instructors.filter(function(i){ return i.id!==r.requestedBy; })
+      const options=instructors.filter(function(i){ return i.id!==r.requestedBy && i.active!==false; })
         .map(function(i){ return '<option value="'+i.id+'">'+i.name+'</option>'; }).join('');
       html+='<td><select id="'+selId+'" class="small"><option value="">Choose instructor…</option>'+options+'</select> '
         +'<button class="btn sm" style="margin-top:4px" onclick="assignCoverageManually(\''+r.id+'\', document.getElementById(\''+selId+'\').value)">Assign</button></td>';
@@ -2531,17 +2585,89 @@ function renderInstructorsPanel(){
   let html='<div class="card"><div class="card-head"><h2>Instructors</h2>'
     +'<button class="btn sm primary" onclick="openNewInstructorForm()">+ Add instructor</button></div>';
   html+='<p>Every instructor can teach any year — "best suited" is just a preference used to break ties when auto-picking a Pod (5.3); it never blocks a booking, a coverage assignment, or being assigned a shift. Set a new instructor\'s starting weekly hours here. Once they\'re on the roster, ongoing or one-off changes to their availability are self-service from their own login.</p>';
-  html+='<table><tr><th>Instructor</th><th>Email</th><th>Best suited for</th><th>Working days</th></tr>';
+  html+='<table><tr><th>Instructor</th><th>Email</th><th>Best suited for</th><th>Working days</th><th>Login</th><th></th></tr>';
   instructors.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(instr){
     const pattern=instructorCurrentWeeklyPattern(instr.id);
     const days=WEEKDAY_KEYS.filter(function(d){ return pattern[d]; });
     const summary = days.length? days.map(function(d){ return d+' '+minToLabel(pattern[d].start)+'–'+minToLabel(pattern[d].end); }).join(', ') : 'No standing availability set';
-    html+='<tr><td>'+instr.name+'</td><td class="small">'+instr.email+'</td><td>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</td><td class="small">'+summary+'</td></tr>';
+    const inactive = instr.active===false;
+    const loginCell = !supabaseClient? '<span class="small muted">—</span>'
+      : instr.authUserId==='pending'? '<span class="badge soon">Invited</span>'
+      : instr.authUserId? '<span class="badge available">Active</span>'
+      : '<button class="btn sm ghost" onclick="inviteLogin(\''+instr.email+'\',\'instructor\',\''+instr.id+'\',\''+instr.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
+    html+='<tr'+(inactive?' style="opacity:.55"':'')+'><td>'+instr.name+(inactive?' <span class="small muted">(inactive)</span>':'')+'</td><td class="small">'+instr.email+'</td><td>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</td><td class="small">'+summary+'</td>'
+      +'<td>'+loginCell+'</td>'
+      +'<td><button class="btn sm ghost" onclick="openStaffAvailManager(\''+instr.id+'\')">Adjust hours</button> '
+      +(inactive
+        ? '<button class="btn sm ghost" onclick="reactivateInstructor(\''+instr.id+'\')">Reactivate</button>'
+        : '<button class="btn sm ghost" onclick="deactivateInstructor(\''+instr.id+'\')">Deactivate</button>')
+      +'</td></tr>';
   });
   html+='</table></div>';
   html+=renderNewInstructorModal();
+  html+=renderStaffAvailManagerModal();
   return html;
 }
+/* ---------- standalone parent accounts (usually created inline via new-student enrollment;
+   this covers adding one directly, e.g. before their kid is enrolled, or inviting a login for an
+   existing parent who doesn't have one yet) ---------- */
+function openNewParentForm(){
+  state.newParentForm={ name:'', email:'', inviteNow:true, error:'' };
+  render();
+}
+function closeNewParentForm(){ state.newParentForm=null; render(); }
+function setNPF(field, value){ state.newParentForm[field]=value; state.newParentForm.error=''; render(); }
+function saveNewParent(){
+  const f=state.newParentForm;
+  if(!f.name.trim()){ f.error='Enter the parent\'s name.'; render(); return; }
+  if(!f.email.trim()){ f.error='Enter an email address.'; render(); return; }
+  if(parents.some(function(p){ return p.email.toLowerCase()===f.email.trim().toLowerCase(); })){
+    f.error='A parent with that email already exists.'; render(); return;
+  }
+  const newParent={id:newId()||('p'+(nextParentId++)), name:f.name.trim(), email:f.email.trim(), studentIds:[]};
+  parents.push(newParent);
+  dbWrite('adding a new parent', function(){ return supabaseClient.from('parents').insert({id:newParent.id, name:newParent.name, email:newParent.email}); });
+  toast(newParent.name+' added. Link their child from the student\'s enrollment or edit screen.');
+  state.newParentForm=null;
+  render();
+  if(f.inviteNow) inviteLogin(newParent.email, 'parent', newParent.id, newParent.name);
+}
+function renderNewParentModal(){
+  const f=state.newParentForm;
+  if(!f) return '';
+  let html='<div class="overlay" onclick="if(event.target===this) closeNewParentForm()"><div class="modal">';
+  html+='<h3>Add a parent</h3>';
+  html+='<label>Name</label><input type="text" value="'+f.name+'" oninput="setNPF(\'name\', this.value)"/>';
+  html+='<label>Email</label><input type="email" value="'+f.email+'" oninput="setNPF(\'email\', this.value)"/>';
+  if(supabaseClient){
+    html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;margin-top:10px"><input type="checkbox" style="width:auto;margin:0" '+(f.inviteNow?'checked':'')+' onchange="setNPF(\'inviteNow\',this.checked)"/> Email them an invite to set up their login now</label>';
+  }
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeNewParentForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveNewParent()">Add parent</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+function renderParentsPanel(){
+  let html='<div class="card"><div class="card-head"><h2>Parents</h2>'
+    +'<button class="btn sm primary" onclick="openNewParentForm()">+ Add parent</button></div>';
+  html+='<p>Parents are usually created automatically when you enroll their first child. Use "Add parent" here only if you need their record to exist before that (e.g. lining up their login in advance).</p>';
+  html+='<table><tr><th>Parent</th><th>Email</th><th>Children</th><th>Login</th><th></th></tr>';
+  parents.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(p){
+    const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); return s? s.name : null; }).filter(Boolean);
+    const loginCell = !supabaseClient? '<span class="small muted">—</span>'
+      : p.authUserId==='pending'? '<span class="badge soon">Invited</span>'
+      : p.authUserId? '<span class="badge available">Active</span>'
+      : '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
+    html+='<tr><td>'+p.name+'</td><td class="small">'+p.email+'</td><td class="small">'+(kids.length? kids.join(', ') : '—')+'</td><td>'+loginCell+'</td><td></td></tr>';
+  });
+  html+='</table></div>';
+  html+=renderNewParentModal();
+  return html;
+}
+
 function renderNewInstructorModal(){
   const f=state.newInstructorForm;
   if(!f) return '';
@@ -2574,6 +2700,9 @@ function renderNewInstructorModal(){
     }
     html+='</div>';
   });
+  if(supabaseClient){
+    html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;margin-top:10px"><input type="checkbox" style="width:auto;margin:0" '+(f.inviteNow?'checked':'')+' onchange="setNIF(\'inviteNow\',this.checked)"/> Email them an invite to set up their login now</label>';
+  }
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeNewInstructorForm()">Cancel</button>'
@@ -3053,42 +3182,7 @@ function renderInstructor(){
   html+='</div>';
   html+=renderMoveModal();
 
-  const pattern=instructorCurrentWeeklyPattern(instr.id);
-  html+='<div class="card"><div class="card-head"><h2>My availability</h2></div>'
-    +'<p>This reflects staffing, not a fixed shift you set once — adjust it as an ongoing change starting from a date, or a one-off change to a single day (e.g. an appointment or extra shift).</p>';
-  html+='<div class="hours-row" style="flex-wrap:wrap">'+WEEKDAY_KEYS.map(function(day){
-    const a=pattern[day];
-    return '<div class="cal-row-label" style="min-width:110px;flex:0 0 auto">'+day+'<span class="small muted" style="font-weight:400">'+(a? rangeLabel(a.start,a.end-a.start) : 'Off')+'</span></div>';
-  }).join('')+'</div>';
-  html+='<div style="display:flex;gap:8px;margin-top:6px"><button class="btn sm primary" onclick="openAvailRuleForm(\''+instr.id+'\')">+ Ongoing change</button><button class="btn sm ghost" onclick="openOneOffForm(\''+instr.id+'\')">+ One-off change</button></div>';
-
-  const rules=instr.availRules.slice().sort(function(a,b){ return toKey(b.effectiveFrom).localeCompare(toKey(a.effectiveFrom)); });
-  html+='<h3 style="margin-top:16px">Ongoing changes</h3>';
-  if(rules.length===0) html+='<div class="empty-note">None on file.</div>';
-  else{
-    html+='<table><tr><th>From</th><th>Day</th><th>Hours</th><th></th></tr>'
-      +rules.map(function(r){
-        const idx=instr.availRules.indexOf(r);
-        const upcoming = toKey(r.effectiveFrom) > toKey(simNow());
-        return '<tr><td>'+fmtShort(r.effectiveFrom)+(upcoming?' <span class="small muted">(upcoming)</span>':'')+'</td><td>'+r.weekday+'</td><td>'+(r.off?'Not working':rangeLabel(r.start,r.end-r.start))+'</td>'
-          +'<td><button class="btn sm ghost" onclick="removeAvailRule(\''+instr.id+'\','+idx+')">Remove</button></td></tr>';
-      }).join('')
-      +'</table>';
-  }
-
-  const oneOffs=instr.oneOffs.slice().sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)); });
-  html+='<h3 style="margin-top:16px">One-off changes</h3>';
-  if(oneOffs.length===0) html+='<div class="empty-note">None on file.</div>';
-  else{
-    html+='<table><tr><th>Date</th><th>Hours</th><th></th></tr>'
-      +oneOffs.map(function(o){
-        const idx=instr.oneOffs.indexOf(o);
-        return '<tr><td>'+fmtShort(o.date)+'</td><td>'+(o.off?'Not working':rangeLabel(o.start,o.end-o.start))+'</td>'
-          +'<td><button class="btn sm ghost" onclick="removeOneOff(\''+instr.id+'\','+idx+')">Remove</button></td></tr>';
-      }).join('')
-      +'</table>';
-  }
-  html+='</div>';
+  html+=renderAvailabilityManager(instr, 'My availability');
   html+=renderAvailRuleModal();
   html+=renderOneOffModal();
 
@@ -3172,6 +3266,64 @@ function renderInstructorLogin(){
       +'<p style="margin-top:14px">Sample accounts:</p>'
       +'<div class="small">'+instructors.map(function(i){ return '<div class="pill" style="display:inline-block;margin:2px;cursor:pointer" onclick="quickInstructorLogin(\''+i.email+'\')">'+i.email+'</div>'; }).join('')+'</div>'
     +'</div>';
+  return html;
+}
+
+// Shared by an instructor managing their own hours (renderInstructor) and front desk adjusting
+// them on someone's behalf (renderInstructorsPanel, via the staff availability manager modal
+// below) — same underlying ongoing/one-off change records either way, just a different entry
+// point and wording depending on who's looking at it.
+function renderAvailabilityManager(instr, heading, intro){
+  const pattern=instructorCurrentWeeklyPattern(instr.id);
+  let html='<div class="card"><div class="card-head"><h2>'+heading+'</h2></div>'
+    +'<p>'+intro+'</p>';
+  html+='<div class="hours-row" style="flex-wrap:wrap">'+WEEKDAY_KEYS.map(function(day){
+    const a=pattern[day];
+    return '<div class="cal-row-label" style="min-width:110px;flex:0 0 auto">'+day+'<span class="small muted" style="font-weight:400">'+(a? rangeLabel(a.start,a.end-a.start) : 'Off')+'</span></div>';
+  }).join('')+'</div>';
+  html+='<div style="display:flex;gap:8px;margin-top:6px"><button class="btn sm primary" onclick="openAvailRuleForm(\''+instr.id+'\')">+ Ongoing change</button><button class="btn sm ghost" onclick="openOneOffForm(\''+instr.id+'\')">+ One-off change</button></div>';
+
+  const rules=instr.availRules.slice().sort(function(a,b){ return toKey(b.effectiveFrom).localeCompare(toKey(a.effectiveFrom)); });
+  html+='<h3 style="margin-top:16px">Ongoing changes</h3>';
+  if(rules.length===0) html+='<div class="empty-note">None on file.</div>';
+  else{
+    html+='<table><tr><th>From</th><th>Day</th><th>Hours</th><th></th></tr>'
+      +rules.map(function(r){
+        const idx=instr.availRules.indexOf(r);
+        const upcoming = toKey(r.effectiveFrom) > toKey(simNow());
+        return '<tr><td>'+fmtShort(r.effectiveFrom)+(upcoming?' <span class="small muted">(upcoming)</span>':'')+'</td><td>'+r.weekday+'</td><td>'+(r.off?'Not working':rangeLabel(r.start,r.end-r.start))+'</td>'
+          +'<td><button class="btn sm ghost" onclick="removeAvailRule(\''+instr.id+'\','+idx+')">Remove</button></td></tr>';
+      }).join('')
+      +'</table>';
+  }
+
+  const oneOffs=instr.oneOffs.slice().sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)); });
+  html+='<h3 style="margin-top:16px">One-off changes</h3>';
+  if(oneOffs.length===0) html+='<div class="empty-note">None on file.</div>';
+  else{
+    html+='<table><tr><th>Date</th><th>Hours</th><th></th></tr>'
+      +oneOffs.map(function(o){
+        const idx=instr.oneOffs.indexOf(o);
+        return '<tr><td>'+fmtShort(o.date)+'</td><td>'+(o.off?'Not working':rangeLabel(o.start,o.end-o.start))+'</td>'
+          +'<td><button class="btn sm ghost" onclick="removeOneOff(\''+instr.id+'\','+idx+')">Remove</button></td></tr>';
+      }).join('')
+      +'</table>';
+  }
+  html+='</div>';
+  return html;
+}
+function openStaffAvailManager(instrId){ state.staffAvailManagerFor=instrId; render(); }
+function closeStaffAvailManager(){ state.staffAvailManagerFor=null; render(); }
+function renderStaffAvailManagerModal(){
+  const instrId=state.staffAvailManagerFor;
+  if(!instrId) return '';
+  const instr=findInstructor(instrId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeStaffAvailManager()"><div class="modal" style="max-width:640px">';
+  html+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><h3 style="margin:0">Adjust availability</h3><button class="btn sm ghost" onclick="closeStaffAvailManager()">Close</button></div>';
+  html+=renderAvailabilityManager(instr, instr.name+'’s hours', 'Front desk can adjust '+instr.name+'\'s working hours here — as an ongoing change starting from a date, or a one-off change to a single day (e.g. an appointment or time off). These are the same hours '+instr.name+' would set from their own login.');
+  html+='</div></div>';
+  html+=renderAvailRuleModal();
+  html+=renderOneOffModal();
   return html;
 }
 
@@ -3340,6 +3492,7 @@ function showLoginScreen(errorMsg){
     +'<label>Email</label><input id="loginEmail" type="email" autocomplete="username" />'
     +'<label>Password</label><input id="loginPassword" type="password" autocomplete="current-password" />'
     +'<button class="btn" onclick="doLogin()">Sign in</button>'
+    +'<p style="text-align:center;margin-top:12px"><a href="#" onclick="showForgotPasswordScreen();return false;" class="small">Forgot password?</a></p>'
     +'</div></div>';
   const pw=document.getElementById('loginPassword');
   if(pw) pw.addEventListener('keydown', function(e){ if(e.key==='Enter') doLogin(); });
@@ -3355,6 +3508,55 @@ function doLogin(){
   });
 }
 
+function showForgotPasswordScreen(msg, isError){
+  const app=document.getElementById('app');
+  app.innerHTML =
+    '<div class="login-wrap"><div class="card login-card">'
+    +'<div class="brand-logo"><img src="'+MATHNASIUM_LOGO+'" alt="Mathnasium"/></div>'
+    +'<h2>Reset your password</h2>'
+    +'<p class="small muted">Enter the email your account was set up with — we\'ll send a link to reset your password.</p>'
+    +(msg? '<div class="banner '+(isError?'danger':'info')+'">'+msg+'</div>' : '')
+    +'<label>Email</label><input id="forgotEmail" type="email" autocomplete="username" />'
+    +'<button class="btn" onclick="sendPasswordReset()">Send reset link</button>'
+    +'<p style="text-align:center;margin-top:12px"><a href="#" onclick="showLoginScreen();return false;" class="small">Back to sign in</a></p>'
+    +'</div></div>';
+}
+function sendPasswordReset(){
+  const email=(document.getElementById('forgotEmail').value||'').trim();
+  if(!email){ showForgotPasswordScreen('Enter your email address.', true); return; }
+  supabaseClient.auth.resetPasswordForEmail(email, {redirectTo:SITE_URL}).then(function(){
+    // Same confirmation whether or not that email is actually registered — never reveal which
+    // emails have accounts.
+    showForgotPasswordScreen('If that email has an account, a reset link is on its way.', false);
+  });
+}
+
+// Reached via the link in either an invite email or a password-reset email — Supabase's SDK
+// parses the token in the URL and establishes a session automatically; this just asks for (and
+// sets) the actual new password before letting them into the app proper.
+function showSetPasswordScreen(errorMsg){
+  const app=document.getElementById('app');
+  app.innerHTML =
+    '<div class="login-wrap"><div class="card login-card">'
+    +'<div class="brand-logo"><img src="'+MATHNASIUM_LOGO+'" alt="Mathnasium"/></div>'
+    +'<h2>Set your password</h2>'
+    +(errorMsg? '<div class="banner danger">'+errorMsg+'</div>' : '')
+    +'<label>New password</label><input id="newPassword" type="password" autocomplete="new-password" />'
+    +'<label>Confirm password</label><input id="newPassword2" type="password" autocomplete="new-password" />'
+    +'<button class="btn" onclick="setNewPassword()">Set password</button>'
+    +'</div></div>';
+}
+function setNewPassword(){
+  const p1=document.getElementById('newPassword').value||'';
+  const p2=document.getElementById('newPassword2').value||'';
+  if(p1.length<6){ showSetPasswordScreen('Password must be at least 6 characters.'); return; }
+  if(p1!==p2){ showSetPasswordScreen('Passwords don\'t match.'); return; }
+  supabaseClient.auth.updateUser({password:p1}).then(function(res){
+    if(res.error){ showSetPasswordScreen(res.error.message); return; }
+    afterLogin();
+  });
+}
+
 function logOut(){
   supabaseClient.auth.signOut().then(function(){ location.reload(); });
 }
@@ -3365,7 +3567,7 @@ function afterLogin(){
     const uid=res.data.user.id;
     supabaseClient.from('app_users').select('role,instructor_id,parent_id').eq('auth_user_id', uid).single().then(function(r){
       if(r.error || !r.data){ showLoginScreen("Your account isn't set up yet — ask front desk to add you."); return; }
-      currentUser={role:r.data.role, instructorId:r.data.instructor_id, parentId:r.data.parent_id};
+      currentUser={role:r.data.role, instructorId:r.data.instructor_id, parentId:r.data.parent_id, email:res.data.user.email};
       loadAllData().then(function(){
         state.role=currentUser.role;
         applyPromotions();
@@ -3394,7 +3596,7 @@ function afterLogin(){
 function loadAllData(){
   const T=function(name, sel){ return supabaseClient.from(name).select(sel).then(function(r){ if(r.error) throw r.error; return r.data||[]; }); };
   return Promise.all([
-    T('instructors','id,name,email,year_min,year_max'),
+    T('instructors','id,name,email,year_min,year_max,auth_user_id,active'),
     T('instructor_avail_rules','instructor_id,weekday,effective_from,off,start_min,end_min'),
     T('instructor_one_offs','instructor_id,the_date,off,start_min,end_min'),
     T('pods','id,name,capacity'),
@@ -3407,7 +3609,7 @@ function loadAllData(){
     T('student_pod_assignments','id,student_id,pod_id,effective_from'),
     T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
-    T('parents','id,name,email'),
+    T('parents','id,name,email,auth_user_id'),
     T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,booked_by,is_recurring,credit_id'),
     T('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note'),
     T('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
@@ -3418,6 +3620,7 @@ function loadAllData(){
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
+      authUserId:r.auth_user_id, active: r.active!==false,
       availRules: availRows.filter(function(a){ return a.instructor_id===r.id; }).map(function(a){
         return {weekday:a.weekday, effectiveFrom:new Date(a.effective_from), off:a.off, start:a.start_min, end:a.end_min};
       }),
@@ -3456,7 +3659,7 @@ function loadAllData(){
     }; });
 
     parents=parentRows.map(function(r){ return {
-      id:r.id, name:r.name, email:r.email,
+      id:r.id, name:r.name, email:r.email, authUserId:r.auth_user_id,
       studentIds: students.filter(function(s){ return s.parentId===r.id; }).map(function(s){ return s.id; }),
     }; });
 
@@ -3487,6 +3690,11 @@ function loadAllData(){
 
 if(supabaseClient){
   supabaseClient.auth.getSession().then(function(res){
+    // An invite or password-reset link lands here with a session already established (Supabase's
+    // SDK parses the token from the URL on its own) — but they still need to actually choose a
+    // password before going any further, so this takes priority over the normal "already signed
+    // in, skip straight to the app" path.
+    if((AUTH_REDIRECT_TYPE==='recovery' || AUTH_REDIRECT_TYPE==='invite') && res.data && res.data.session){ showSetPasswordScreen(); return; }
     if(res.data && res.data.session){ afterLogin(); } else { showLoginScreen(); }
   });
 } else {
