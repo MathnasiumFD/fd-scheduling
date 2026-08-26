@@ -160,6 +160,7 @@
 <body>
 <div class="wrap" id="app"></div>
 
+
 <!-- Only reachable from a real browser hitting the real internet — harmless to leave in when this
      file is opened as a Claude Artifact preview or run through the Node smoke tests, since both of
      those environments simply won't have `window.supabase`, and the app below falls back to its
@@ -554,7 +555,10 @@ function countdownInfo(exitMinute){
   return {label:(-diff)+' min overdue', cls:'full'};
 }
 
-function simNow(){ return addDays(BASE, state.offsetDays); }
+// In live mode (a real logged-in user) "today" is the real, actual date — the BASE/offsetDays
+// demo clock only ever applies to the offline sample-data mode (no login), where a fixed BASE date
+// keeps the 3-month make-up window demoable without waiting three months in real time.
+function simNow(){ return currentUser ? new Date() : addDays(BASE, state.offsetDays); }
 
 function findStudent(id){ return students.find(s=>s.id===id); }
 function findInstructor(id){ return instructors.find(i=>i.id===id); }
@@ -916,6 +920,11 @@ function saveStudentPodAssignment(){
   const student=findStudent(f.studentId);
   student.podAssignments=(student.podAssignments||[]).filter(function(a){ return toKey(a.effectiveFrom)!==f.effectiveFrom; });
   student.podAssignments.push({podId: f.podId || null, effectiveFrom:new Date(f.effectiveFrom)});
+  dbWrite('pinning standing Pod', function(){
+    return supabaseClient.from('student_pod_assignments').delete().eq('student_id', student.id).eq('effective_from', f.effectiveFrom).then(function(){
+      return supabaseClient.from('student_pod_assignments').insert({student_id:student.id, pod_id:f.podId||null, effective_from:f.effectiveFrom});
+    });
+  });
 
   // Cancel already-generated future standing occurrences from the effective date forward, so the
   // new pin actually takes hold for every upcoming standing session — not just ones not yet
@@ -941,6 +950,8 @@ function saveStudentPodAssignment(){
 function removeStudentPodAssignment(studentId, effectiveFromKey){
   const student=findStudent(studentId);
   student.podAssignments=(student.podAssignments||[]).filter(function(a){ return toKey(a.effectiveFrom)!==effectiveFromKey; });
+  dbWrite('removing standing Pod pin', function(){ return supabaseClient.from('student_pod_assignments').delete()
+    .eq('student_id', studentId).eq('effective_from', effectiveFromKey); });
   regenerateAllRecurring();
   render();
 }
@@ -1362,13 +1373,21 @@ function saveAvailRule(){
   const instr=findInstructor(f.instructorId);
   if(!f.effectiveFrom) return;
   instr.availRules.push({weekday:f.weekday, start:f.start, end:f.end, off:f.off, effectiveFrom:new Date(f.effectiveFrom)});
+  dbWrite('saving availability change', function(){ return supabaseClient.from('instructor_avail_rules').insert({
+    instructor_id:instr.id, weekday:f.weekday, effective_from:f.effectiveFrom, off:f.off, start_min:f.start, end_min:f.end
+  }); });
   toast('Saved — '+instr.name+'\'s '+f.weekday+'s '+(f.off?'become unavailable':'change to '+minToLabel(f.start)+'–'+minToLabel(f.end))+' starting '+fmtShort(new Date(f.effectiveFrom))+'.');
   state.availRuleForm=null;
   render();
 }
 function removeAvailRule(instrId, idx){
   const instr=findInstructor(instrId);
+  const rule=instr.availRules[idx];
   instr.availRules.splice(idx,1);
+  if(rule){
+    dbWrite('removing availability change', function(){ return supabaseClient.from('instructor_avail_rules').delete()
+      .eq('instructor_id', instr.id).eq('weekday', rule.weekday).eq('effective_from', toKey(rule.effectiveFrom)); });
+  }
   render();
 }
 
@@ -1390,13 +1409,23 @@ function saveOneOff(){
   if(!f.date) return;
   instr.oneOffs=instr.oneOffs.filter(function(o){ return toKey(o.date)!==f.date; }); // one override per date
   instr.oneOffs.push({date:new Date(f.date), start:f.start, end:f.end, off:f.off});
+  dbWrite('saving one-off change', function(){
+    return supabaseClient.from('instructor_one_offs').delete().eq('instructor_id', instr.id).eq('the_date', f.date).then(function(){
+      return supabaseClient.from('instructor_one_offs').insert({instructor_id:instr.id, the_date:f.date, off:f.off, start_min:f.start, end_min:f.end});
+    });
+  });
   toast('Saved — one-off change for '+instr.name+' on '+fmtShort(new Date(f.date))+' ('+(f.off?'unavailable':minToLabel(f.start)+'–'+minToLabel(f.end))+').');
   state.oneOffForm=null;
   render();
 }
 function removeOneOff(instrId, idx){
   const instr=findInstructor(instrId);
+  const oo=instr.oneOffs[idx];
   instr.oneOffs.splice(idx,1);
+  if(oo){
+    dbWrite('removing one-off change', function(){ return supabaseClient.from('instructor_one_offs').delete()
+      .eq('instructor_id', instr.id).eq('the_date', toKey(oo.date)); });
+  }
   render();
 }
 
@@ -1418,10 +1447,13 @@ function closePodAssignForm(){ state.podAssignForm=null; render(); }
 function addPodShiftBlock(podId, weekday){
   const blocks=podBlocksForDay(podId, weekday);
   const lastEnd = blocks.length? blocks[blocks.length-1].end : CENTER_OPEN;
-  const block={id:'blk'+(nextBlockId++), start:Math.min(lastEnd, CENTER_CLOSE-START_STEP), end:Math.min(lastEnd+60, CENTER_CLOSE), assignments:[], oneOffCoverage:[]};
+  const block={id:newId()||('blk'+(nextBlockId++)), start:Math.min(lastEnd, CENTER_CLOSE-START_STEP), end:Math.min(lastEnd+60, CENTER_CLOSE), assignments:[], oneOffCoverage:[]};
   if(!podSchedule[podId]) podSchedule[podId]={};
   if(!podSchedule[podId][weekday]) podSchedule[podId][weekday]=[];
   podSchedule[podId][weekday].push(block);
+  dbWrite('adding a shift block', function(){ return supabaseClient.from('pod_shift_blocks').insert({
+    id:block.id, pod_id:podId, weekday:weekday, start_min:block.start, end_min:block.end
+  }); });
   state.podAssignForm.drafts[block.id]={instructorId:'', effectiveFrom:toKey(simNow())};
   state.podAssignForm.error='';
   regenerateAllRecurring();
@@ -1429,6 +1461,7 @@ function addPodShiftBlock(podId, weekday){
 }
 function removePodShiftBlock(podId, weekday, blockId){
   podSchedule[podId][weekday]=podBlocksForDay(podId, weekday).filter(function(b){ return b.id!==blockId; });
+  dbWrite('removing a shift block', function(){ return supabaseClient.from('pod_shift_blocks').delete().eq('id', blockId); });
   delete state.podAssignForm.drafts[blockId];
   regenerateAllRecurring();
   render();
@@ -1450,6 +1483,7 @@ function setPodBlockTime(podId, weekday, blockId, field, value){
     }
   }
   state.podAssignForm.error='';
+  dbWrite('updating shift block time', function(){ return supabaseClient.from('pod_shift_blocks').update({start_min:block.start, end_min:block.end}).eq('id', blockId); });
   regenerateAllRecurring();
   render();
 }
@@ -1487,6 +1521,9 @@ function saveAssignmentChange(podId, weekday, blockId){
     }
   }
   block.assignments.push({instructorId:draft.instructorId, effectiveFrom:effDate});
+  dbWrite('assigning instructor to shift', function(){ return supabaseClient.from('pod_shift_assignments').insert({
+    block_id:blockId, instructor_id:draft.instructorId, effective_from:draft.effectiveFrom
+  }); });
   delete f.drafts[blockId];
   regenerateAllRecurring();
   toast(findInstructor(draft.instructorId).name+' assigned to '+findPod(podId).name+'’s '+weekday+' '+rangeLabel(block.start,block.end-block.start)+' shift, starting '+fmtShort(effDate)+'.');
@@ -1495,6 +1532,8 @@ function saveAssignmentChange(podId, weekday, blockId){
 function removeAssignment(podId, weekday, blockId, effectiveFromKey){
   const block=podBlocksForDay(podId, weekday).find(function(b){ return b.id===blockId; });
   block.assignments=block.assignments.filter(function(a){ return toKey(a.effectiveFrom)!==effectiveFromKey; });
+  dbWrite('removing shift assignment', function(){ return supabaseClient.from('pod_shift_assignments').delete()
+    .eq('block_id', blockId).eq('effective_from', effectiveFromKey); });
   regenerateAllRecurring();
   render();
 }
@@ -1635,7 +1674,7 @@ function saveWaitlistForm(){
   if(f.mode==='existing' && !f.studentId){ f.error='Choose a student.'; render(); return; }
   if(f.mode==='new' && !f.name.trim()){ f.error='Enter a name.'; render(); return; }
   const entry={
-    id:'wl'+(nextWaitlistId++),
+    id:newId()||('wl'+(nextWaitlistId++)),
     studentId: f.mode==='existing'? f.studentId : null,
     name: f.mode==='existing'? findStudent(f.studentId).name : f.name.trim(),
     year: f.mode==='existing'? findStudent(f.studentId).year : f.year,
@@ -1643,6 +1682,11 @@ function saveWaitlistForm(){
     note:f.note, dateAdded:new Date(simNow()), notified:false, status:'waiting',
   };
   waitlist.push(entry);
+  dbWrite('adding to waitlist', function(){ return supabaseClient.from('waitlist_entries').insert({
+    id:entry.id, student_id:entry.studentId, name:entry.name, year:entry.year, weekday:entry.weekday,
+    start_min:entry.start, duration:entry.duration, note:entry.note, status:'waiting', notified:false,
+    date_added:entry.dateAdded.toISOString()
+  }); });
   toast(entry.name+' added to the waitlist for '+f.weekday+' '+rangeLabel(f.start,f.duration)+'.');
   state.waitlistForm=null;
   render();
@@ -1650,6 +1694,7 @@ function saveWaitlistForm(){
 function removeWaitlistEntry(id){
   const w=waitlist.find(function(x){ return x.id===id; });
   if(w) w.status='removed';
+  dbWrite('removing from waitlist', function(){ return supabaseClient.from('waitlist_entries').update({status:'removed'}).eq('id', id); });
   render();
 }
 // Front desk has decided to reach out now that a seat exists — records that the family was
@@ -1661,6 +1706,7 @@ function notifyWaitlistEntry(id){
   const seat=waitlistOpenSeat(w);
   if(!seat){ toast('No open seat right now for that slot.'); return; }
   w.notified=true;
+  dbWrite('marking waitlist entry notified', function(){ return supabaseClient.from('waitlist_entries').update({notified:true}).eq('id', id); });
   toast('Contacted '+w.name+' — a seat is open '+w.weekday+' '+fmtShort(seat.date)+' '+rangeLabel(w.start,w.duration)+'. Remove them from the waitlist once booked.');
   render();
 }
@@ -1784,8 +1830,16 @@ function saveNewInstructor(){
     const a=f.availability[day];
     return {weekday:day, start:a.start, end:a.end, effectiveFrom:AVAIL_BASELINE};
   });
-  const newInstructor={id:'i'+(nextInstructorId++), name:f.name.trim(), email:f.email.trim(), yearMin:Number(f.yearMin), yearMax:Number(f.yearMax), availRules, oneOffs:[]};
+  const newInstructor={id:newId()||('i'+(nextInstructorId++)), name:f.name.trim(), email:f.email.trim(), yearMin:Number(f.yearMin), yearMax:Number(f.yearMax), availRules, oneOffs:[]};
   instructors.push(newInstructor);
+  dbWrite('adding a new instructor', function(){ return supabaseClient.from('instructors').insert({
+    id:newInstructor.id, name:newInstructor.name, email:newInstructor.email, year_min:newInstructor.yearMin, year_max:newInstructor.yearMax
+  }).then(function(r){
+    if(r.error || !availRules.length) return r;
+    return supabaseClient.from('instructor_avail_rules').insert(availRules.map(function(a){
+      return {instructor_id:newInstructor.id, weekday:a.weekday, effective_from:toKey(a.effectiveFrom), off:false, start_min:a.start, end_min:a.end};
+    }));
+  }); });
   toast(newInstructor.name+' added — available '+workingDays.join(', ')+'. Best suited for '+yearLabel(f.yearMin)+'–'+yearLabel(f.yearMax)+' (a preference only — they can be assigned any shift they\'re staffed for).');
   state.newInstructorForm=null;
   render();
@@ -2712,7 +2766,18 @@ function submitCoverageRequest(){
   // shift" case (5.14) — alert the manager immediately rather than waiting for front desk to notice
   // the request sitting open, or to click "mark unstaffed" themselves days later.
   const managerNotified = notify.length===0;
-  coverageRequests.push({id:'cov'+(nextCoverageId++), podId:f.podId, weekday:f.weekday, blockId:f.blockId, date:d, requestedBy:f.instructorId, note:f.note, status:'open', filledBy:null, notifiedInstructorIds:notify.map(function(i){ return i.id; }), managerNotified});
+  const notifiedIds = notify.map(function(i){ return i.id; });
+  const req={id:newId()||('cov'+(nextCoverageId++)), podId:f.podId, weekday:f.weekday, blockId:f.blockId, date:d, requestedBy:f.instructorId, note:f.note, status:'open', filledBy:null, notifiedInstructorIds:notifiedIds, managerNotified};
+  coverageRequests.push(req);
+  dbWrite('submitting coverage request', function(){ return supabaseClient.from('coverage_requests').insert({
+    id:req.id, pod_id:req.podId, block_id:req.blockId, weekday:req.weekday, the_date:toKey(req.date),
+    requested_by:req.requestedBy, note:req.note, status:'open', filled_by:null, manager_notified:managerNotified
+  }).then(function(r){
+    if(r.error || !notifiedIds.length) return r;
+    return supabaseClient.from('coverage_request_notified_instructors').insert(notifiedIds.map(function(iid){
+      return {coverage_request_id:req.id, instructor_id:iid};
+    }));
+  }); });
   const notifyMsg = notify.length
     ? ' Emailed '+notify.length+' available instructor'+(notify.length===1?'':'s')+' ('+notify.map(function(i){ return i.name; }).join(', ')+').'
     : ' Nobody is currently available — emailed '+MANAGER_EMAIL+' so it doesn\'t sit unnoticed.';
@@ -2723,6 +2788,7 @@ function submitCoverageRequest(){
 function cancelCoverageRequest(id){
   const r=coverageRequests.find(function(x){ return x.id===id; });
   if(r) r.status='cancelled';
+  dbWrite('cancelling coverage request', function(){ return supabaseClient.from('coverage_requests').update({status:'cancelled'}).eq('id', id); });
   render();
 }
 // Qualified (5.3) instructors who are also actually free that exact date — not already covering a
@@ -2768,6 +2834,13 @@ function fillCoverageRequest(requestId, instructorId){
   block.oneOffCoverage.push({date:new Date(req.date), instructorId});
   req.status='filled';
   req.filledBy=instructorId;
+  dbWrite('filling coverage request', function(){
+    return supabaseClient.from('coverage_requests').update({status:'filled', filled_by:instructorId}).eq('id', requestId).then(function(){
+      return supabaseClient.from('pod_shift_one_off_coverage').delete().eq('block_id', block.id).eq('the_date', dateKey);
+    }).then(function(){
+      return supabaseClient.from('pod_shift_one_off_coverage').insert({block_id:block.id, the_date:dateKey, instructor_id:instructorId});
+    });
+  });
   regenerateAllRecurring();
   toast(findInstructor(instructorId).name+' is covering '+findPod(req.podId).name+'’s '+req.weekday+' shift on '+fmtShort(req.date)+'.');
   render();
@@ -2797,6 +2870,13 @@ function markCoverageUncovered(requestId){
   // the one confirming, right now, that nobody can cover it.
   const alreadyNotified=!!req.managerNotified;
   req.managerNotified=true;
+  dbWrite('marking shift unstaffed', function(){
+    return supabaseClient.from('coverage_requests').update({status:'filled', filled_by:null, manager_notified:true}).eq('id', requestId).then(function(){
+      return supabaseClient.from('pod_shift_one_off_coverage').delete().eq('block_id', block.id).eq('the_date', dateKey);
+    }).then(function(){
+      return supabaseClient.from('pod_shift_one_off_coverage').insert({block_id:block.id, the_date:dateKey, instructor_id:null});
+    });
+  });
   regenerateAllRecurring();
   toast(findPod(req.podId).name+' is marked unstaffed for '+fmtShort(req.date)+' — no replacement found.'+(alreadyNotified? '' : ' Emailed '+MANAGER_EMAIL+'.'));
   render();
@@ -3264,6 +3344,5 @@ if(supabaseClient){
   setInterval(render, 30000);
 }
 </script>
-
 </body>
 </html>
