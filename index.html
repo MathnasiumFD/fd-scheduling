@@ -66,6 +66,14 @@
 
   .card{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); padding:16px 18px; margin-bottom:16px; }
   .card-head{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+  /* Collapsible front-desk sections: clicking a section's own title toggles it — everything in the
+     card except the header row (buttons included) just gets hidden via CSS, so no section's markup
+     had to be restructured to support this. */
+  .sec-toggle{ cursor:pointer; user-select:none; display:inline-flex; align-items:center; gap:6px; }
+  .sec-toggle .chev{ display:inline-block; transition:transform .15s ease; font-size:.75em; }
+  .card.collapsed .chev{ transform:rotate(-90deg); }
+  .card.collapsed > *:not(.card-head){ display:none; }
+  .card.collapsed{ margin-bottom:8px; }
 
   .clock{ display:flex; align-items:center; gap:8px; font-size:.78rem; background:var(--surface); border:1px solid var(--border); border-radius:999px; padding:6px 8px 6px 14px; box-shadow:var(--shadow); }
   .clock b{ color:var(--text); }
@@ -2171,6 +2179,24 @@ function podCoverageSummary(podId, weekday, date){
   }).join(' → ');
 }
 
+// Collapse state for front-desk sections lives on `state` (so it survives the full-page
+// re-render every action triggers) but isn't persisted anywhere beyond the current browser tab —
+// each section just remembers whether it's open or closed for the rest of this visit.
+function sectionCollapsed(id){ return !!(state.collapsedSections && state.collapsedSections[id]); }
+function toggleSection(id){
+  state.collapsedSections = state.collapsedSections || {};
+  state.collapsedSections[id] = !state.collapsedSections[id];
+  render();
+}
+// Builds the opening "<div class='card'><div class='card-head'><h2>...</h2>" markup shared by
+// every front-desk section, with the collapse toggle wired onto the title itself (not the whole
+// header row) so any action buttons placed in extraHeaderHtml stay independently clickable.
+function sectionOpen(id, title, extraHeaderHtml){
+  return '<div class="card'+(sectionCollapsed(id)?' collapsed':'')+'">'
+    +'<div class="card-head"><h2 class="sec-toggle" onclick="toggleSection(\''+id+'\')"><span class="chev">▾</span>'+title+'</h2>'
+    +(extraHeaderHtml||'')+'</div>';
+}
+
 function renderStaff(){
   const now=simNow();
   const monday=addDays(getMonday(now), state.weekOffset*7);
@@ -2189,12 +2215,11 @@ function renderStaff(){
   html+=renderAvailabilityLookup();
   html+=renderWaitlistPanel();
 
-  html+='<div class="card">';
-  html+='<div class="card-head"><h2>Schedule</h2>'
-      +'<div style="display:flex;gap:6px">'
+  html+=sectionOpen('schedule','Schedule',
+      '<div style="display:flex;gap:6px">'
         +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
         +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
-      +'</div></div>';
+      +'</div>');
   html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Standing weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below).</p>';
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
@@ -2311,7 +2336,7 @@ function renderPodAssignModal(){
 function renderCoverageRequestsPanel(){
   const open=coverageRequests.filter(function(r){ return r.status==='open'; }).sort(function(a,b){ return new Date(a.date)-new Date(b.date); });
   if(open.length===0) return '';
-  let html='<div class="card"><div class="card-head"><h2>⚠️ Shifts needing coverage</h2><span class="small muted">'+open.length+'</span></div>';
+  let html=sectionOpen('coverage','⚠️ Shifts needing coverage','<span class="small muted">'+open.length+'</span>');
   html+='<p>An instructor has flagged they can\'t work one of their shifts — every qualified, available instructor was emailed the moment it was raised. Pick a replacement for just that date — their regular assignment is untouched every other day. If it\'s already been sorted out face-to-face in the centre, use "Assign directly" to record whoever agreed to cover, even if they\'re not in the suggested list. If nobody at all is available, the manager is emailed automatically so it doesn\'t sit unnoticed.</p>';
   html+='<table><tr><th>Date</th><th>Pod / shift</th><th>Requested by</th><th>Emailed</th><th>Cover with</th><th>Assign directly</th></tr>';
   open.forEach(function(r){
@@ -2350,7 +2375,7 @@ function renderCheckedInPanel(){
   const now=simNow();
   const todays=sessions.filter(function(s){ return s.status==='attended' && toKey(s.date)===toKey(now) && s.actualEnd!=null; })
     .sort(function(a,b){ return a.actualEnd-b.actualEnd; });
-  let html='<div class="card"><div class="card-head"><h2>Checked in today</h2><span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+'</span></div>';
+  let html=sectionOpen('checkedin','Checked in today','<span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+'</span>');
   html+='<p>Exit time defaults to check-in time plus their usual session length (90 min for most, per each student\'s plan), capped at 15 minutes late per the check-in rule. Adjust it here if a parent\'s pick-up plan changes. “Time left” counts down live against the actual clock, so it stays accurate even if you don\'t touch this page.</p>';
   if(todays.length===0){ html+='<div class="empty-note">Nobody checked in yet today.</div>'; }
   else{
@@ -2377,11 +2402,11 @@ function renderCheckedInPanel(){
 function renderAvailabilityLookup(){
   const monday=addDays(getMonday(simNow()), state.availWeekOffset*7);
   const days=[0,1,2,3,4].map(function(i){ return addDays(monday,i); });
-  let html='<div class="card"><div class="card-head"><h2>Availability lookup</h2>'
-    +'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+  let html=sectionOpen('availability','Availability lookup',
+    '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
       +'<button class="btn sm'+(state.availWeekOffset===0?' primary':'')+'" onclick="setAvailWeek(0)">This week</button>'
       +'<button class="btn sm'+(state.availWeekOffset===1?' primary':'')+'" onclick="setAvailWeek(1)">Next week</button>'
-    +'</div></div>';
+    +'</div>');
   html+='<p>Open seats in 30-minute columns, up to 6:00pm, summed across every Pod with an assigned instructor covering that half-hour — a quick reference for sales calls, so front desk can tell a parent on the spot whether there\'s room, for any year (every instructor can teach any year, 5.3). “No staff” means no Pod has an instructor assigned that half-hour; “Full” means staffed but at capacity. Click a full or unstaffed slot to add someone to the waitlist for it.</p>';
   html+='<div class="avail-grid" style="grid-template-columns:90px repeat('+AVAIL_BLOCKS.length+',1fr)">';
   html+='<div></div>'+AVAIL_BLOCKS.map(function(hb){ return '<div class="cal-head">'+minToLabel(hb)+'</div>'; }).join('');
@@ -2409,9 +2434,9 @@ function renderAvailabilityLookup(){
 function renderWaitlistPanel(){
   const waiting=waitlist.filter(function(w){ return w.status==='waiting'; })
     .sort(function(a,b){ return WEEKDAY_KEYS.indexOf(a.weekday)-WEEKDAY_KEYS.indexOf(b.weekday) || a.start-b.start; });
-  let html='<div class="card"><div class="card-head"><h2>Waitlist</h2>'
-    +'<div style="display:flex;gap:6px"><span class="small muted">'+waiting.length+'</span>'
-    +'<button class="btn sm" onclick="openWaitlistForm()">+ Add to waitlist</button></div></div>';
+  let html=sectionOpen('waitlist','Waitlist',
+    '<div style="display:flex;gap:6px"><span class="small muted">'+waiting.length+'</span>'
+    +'<button class="btn sm" onclick="openWaitlistForm()">+ Add to waitlist</button></div>');
   html+='<p>Families waiting for a Mon–Fri day/time that\'s currently full or unstaffed — matched on day, time, and session length, not a specific Pod, the same way a standing booking auto-picks whichever Pod fits (5.8). First in, first served: when a slot opens up, whoever\'s been waiting longest for it gets flagged first — a later entry won\'t show that same opening until the family ahead of them is booked or removed. When a matching seat opens up, reach out and finish the booking through the usual booking (5.1) or new-student (5.6) flow — this list is just what tells you it\'s worth the call.</p>';
   if(waiting.length===0){ html+='<div class="empty-note">Nobody currently waiting.</div>'; }
   else{
@@ -2592,8 +2617,8 @@ function renderBookingModal(){
 }
 
 function renderStudentsPanel(){
-  let html='<div class="card"><div class="card-head"><h2>Students</h2>'
-    +'<button class="btn sm primary" onclick="openNewStudentForm()">+ Add student</button></div>';
+  let html=sectionOpen('students','Students',
+    '<button class="btn sm primary" onclick="openNewStudentForm()">+ Add student</button>');
   html+='<p>Set once at enrollment: school year, sessions per week (1 or 2), usual length, and a standing day/time for each. The system pre-books actual sessions from that automatically, up to '+HORIZON_WEEKS+' weeks ahead — staff can still move, cancel, or add one-off sessions by hand any time. “Hold” is front-desk only — it pauses a student for a date range without losing their standing spot, and frees those sessions up for one-off bookings while they’re away.</p>';
   html+='<table><tr><th>Student</th><th>Year</th><th>Plan</th><th>Standing schedule</th><th>Booked this week</th><th>Parent</th><th></th></tr>';
   students.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
@@ -2622,8 +2647,8 @@ function renderStudentsPanel(){
 // are. "Best suited for" is shown as a preference-only tag here too — see the comment on
 // openNewInstructorForm for why it can never gate a booking or assignment.
 function renderInstructorsPanel(){
-  let html='<div class="card"><div class="card-head"><h2>Instructors</h2>'
-    +'<button class="btn sm primary" onclick="openNewInstructorForm()">+ Add instructor</button></div>';
+  let html=sectionOpen('instructors','Instructors',
+    '<button class="btn sm primary" onclick="openNewInstructorForm()">+ Add instructor</button>');
   html+='<p>Every instructor can teach any year — "best suited" is just a preference used to break ties when auto-picking a Pod (5.3); it never blocks a booking, a coverage assignment, or being assigned a shift. Set a new instructor\'s starting weekly hours here. Once they\'re on the roster, ongoing or one-off changes to their availability are self-service from their own login.</p>';
   html+='<table><tr><th>Instructor</th><th>Email</th><th>Best suited for</th><th>Working days</th><th>Login</th><th></th></tr>';
   instructors.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(instr){
@@ -2691,8 +2716,8 @@ function renderNewParentModal(){
   return html;
 }
 function renderParentsPanel(){
-  let html='<div class="card"><div class="card-head"><h2>Parents</h2>'
-    +'<button class="btn sm primary" onclick="openNewParentForm()">+ Add parent</button></div>';
+  let html=sectionOpen('parents','Parents',
+    '<button class="btn sm primary" onclick="openNewParentForm()">+ Add parent</button>');
   html+='<p>Parents are usually created automatically when you enroll their first child. Use "Add parent" here only if you need their record to exist before that (e.g. lining up their login in advance).</p>';
   html+='<table><tr><th>Parent</th><th>Email</th><th>Children</th><th>Login</th><th></th></tr>';
   parents.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(p){
@@ -2852,7 +2877,7 @@ function renderRecurringModal(){
 }
 
 function renderCreditsReport(){
-  let html='<div class="card"><div class="card-head"><h2>Make-up credits</h2><button class="btn sm primary" onclick="openAddCreditForm(\'\')">+ Add credit</button></div>';
+  let html=sectionOpen('credits','Make-up credits','<button class="btn sm primary" onclick="openAddCreditForm(\'\')">+ Add credit</button>');
   html+='<p>Issued automatically on no-show, or added by hand — for a make-up owed from before this system (e.g. carried over from the old manual log), or any other credit front desk needs to grant directly. Both expire automatically 3 months after the date entered — no manual cleanup.</p>';
   html+='<table><tr><th>Student</th><th>Issued (missed session)</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
   credits.slice().sort(function(a,b){ return a.expiryDate-b.expiryDate; }).forEach(function(c){
@@ -3729,23 +3754,27 @@ function loadAllData(){
 }
 
 if(supabaseClient){
-  // Driven entirely off onAuthStateChange rather than a one-off getSession() call — a direct
-  // getSession() right at page load can resolve before the SDK has finished parsing the
-  // access token out of the URL, which raced with this exact routing decision and briefly showed
-  // the set-password screen before falling back to the plain login screen a moment later.
-  // onAuthStateChange fires INITIAL_SESSION once the SDK has fully settled, so there's no race.
-  var bootRouted = false; // once the very first screen is decided, ignore later refresh/duplicate events
+  // Driven off onAuthStateChange rather than a one-off getSession() call, since the SDK sometimes
+  // fires an early "no session yet" event before it's actually finished parsing the invite/recovery
+  // token out of the URL — a direct getSession() (or treating that first event as final) can catch
+  // that premature moment and show the plain login screen, permanently ignoring the correct
+  // "you're actually signed in via this link" event that arrives a beat later. So instead: a
+  // "no session" result is treated as provisional (shows login, but keeps listening) while a real
+  // signed-in result is treated as final and always wins, whenever it arrives.
+  var routedToApp = false; // true once we've acted on an actual session — later events can't undo it
   supabaseClient.auth.onAuthStateChange(function(event, session){
-    if(event==='PASSWORD_RECOVERY'){ bootRouted=true; showSetPasswordScreen(); return; }
-    if(bootRouted) return;
-    if(event==='INITIAL_SESSION' || event==='SIGNED_IN'){
-      bootRouted=true;
+    if(event==='PASSWORD_RECOVERY'){ routedToApp=true; showSetPasswordScreen(); return; }
+    if(session && (event==='SIGNED_IN' || event==='INITIAL_SESSION') && !routedToApp){
+      routedToApp=true;
       // An invite link also lands here with a session already established (Supabase's SDK parses
       // the token from the URL on its own) — but they still need to actually choose a password
       // before going any further, so this takes priority over the normal "already signed in, skip
       // straight to the app" path. (Password-reset links get their own dedicated event above.)
-      if(AUTH_REDIRECT_TYPE==='invite' && session){ showSetPasswordScreen(); return; }
-      if(session){ afterLogin(); } else { showLoginScreen(); }
+      if(AUTH_REDIRECT_TYPE==='invite'){ showSetPasswordScreen(); } else { afterLogin(); }
+      return;
+    }
+    if(!session && event==='INITIAL_SESSION' && !routedToApp){
+      showLoginScreen(); // provisional — a following SIGNED_IN with a real session still overrides this
     }
   });
 } else {
