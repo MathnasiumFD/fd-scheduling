@@ -186,7 +186,10 @@
 // the race and strip the hash first, silently skipping the "set your password" screen entirely.)
 var AUTH_REDIRECT_TYPE = (function(){
   if(typeof window==='undefined' || !window.location || !window.location.hash) return null;
-  const m=window.location.hash.match(/type=(\w+)/);
+  // Must require "&" or "#" right before "type=" — the hash also contains "token_type=bearer",
+  // and an unanchored /type=(\w+)/ matches the tail of "token_type" first (since it appears
+  // earlier in the string), silently capturing "bearer" instead of the real "invite"/"recovery".
+  const m=window.location.hash.match(/[#&]type=(\w+)/);
   return m? m[1] : null;
 })();
 if(typeof window!=='undefined' && window.console){
