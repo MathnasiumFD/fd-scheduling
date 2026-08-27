@@ -156,10 +156,7 @@
   }
 </style>
 
-</head>
-<body>
 <div class="wrap" id="app"></div>
-
 
 <!-- Only reachable from a real browser hitting the real internet — harmless to leave in when this
      file is opened as a Claude Artifact preview or run through the Node smoke tests, since both of
@@ -173,6 +170,18 @@
 // Publishable/anon key only — safe to ship in browser code, since every table it can reach is
 // still governed by the Row Level Security policies in supabase_schema.sql. The service_role/
 // secret key must NEVER appear here or anywhere else client-side.
+// Supabase appends "#access_token=...&type=invite" or "...&type=recovery" to the redirect URL for
+// an invite link or a password-reset link. Captured as the very first thing this script does —
+// before window.supabase.createClient() runs and has any chance to process/clear the URL — so it's
+// reliable regardless of exactly which auth event name a given supabase-js version fires for each
+// case. (This was previously computed after createClient() ran, which let the SDK occasionally win
+// the race and strip the hash first, silently skipping the "set your password" screen entirely.)
+var AUTH_REDIRECT_TYPE = (function(){
+  if(typeof window==='undefined' || !window.location || !window.location.hash) return null;
+  const m=window.location.hash.match(/type=(\w+)/);
+  return m? m[1] : null;
+})();
+
 var SUPABASE_URL = 'https://irtydpjjrscmtctoeffc.supabase.co';
 var SUPABASE_ANON_KEY = 'sb_publishable_rcmZZ2KIplqWI1nGeuLlMg_tusxf0KG';
 var supabaseClient = (typeof window !== 'undefined' && window.supabase)
@@ -181,15 +190,14 @@ var supabaseClient = (typeof window !== 'undefined' && window.supabase)
 var currentUser = null; // {role, instructorId, parentId} — set once login resolves
 var SITE_URL = 'https://fd-scheduling.vercel.app/'; // update if the production Vercel URL ever changes — used as the redirect target for invite/password-reset emails
 
-// Supabase appends "#access_token=...&type=invite" or "...&type=recovery" to the redirect URL for
-// an invite link or a password-reset link. Captured once, synchronously, at page load — before
-// the Supabase SDK's own detectSessionInUrl logic runs and rewrites the URL — so it's reliable
-// regardless of exactly which auth event name a given supabase-js version fires for each case.
-var AUTH_REDIRECT_TYPE = (function(){
-  if(typeof window==='undefined' || !window.location || !window.location.hash) return null;
-  const m=window.location.hash.match(/type=(\w+)/);
-  return m? m[1] : null;
-})();
+// Belt-and-braces backup for the check above: Supabase's SDK fires this specific event whenever a
+// password-recovery link is what established the current session, regardless of any hash-timing
+// race. If the hash-based check above ever misses it, this catches it independently.
+if(supabaseClient){
+  supabaseClient.auth.onAuthStateChange(function(event){
+    if(event==='PASSWORD_RECOVERY') showSetPasswordScreen();
+  });
+}
 
 // A real UUID when live (so a newly-created record's local id already matches what Postgres will
 // store — no reconciliation needed), or null in demo/offline mode so callers fall back to the
