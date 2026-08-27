@@ -1324,7 +1324,7 @@ function parentCancelSession(sessionId){
   }
   const student=findStudent(sess.studentId);
   const issued=sess.date, expiry=addMonths(issued,3);
-  if(!confirm('Cancel this session on '+fmtShort(sess.date)+' at '+minToLabel(sess.start)+'? '+student.name+' will receive a make-up credit valid until '+fmtShort(expiry)+'.')) return;
+  if(!confirm('Cancel '+student.name+'\'s session?\n'+fmtLong(sess.date)+' at '+minToLabel(sess.start)+'\n\nThis will cancel this session only. '+student.name+'\'s regular session time will remain unchanged. You\'ll get a make-up credit valid until '+fmtShort(expiry)+'.')) return;
   sess.status='cancelled';
   dbWrite('cancelling session (parent, with notice)', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
   const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'parent-cancel', note:''};
@@ -2276,7 +2276,7 @@ function renderStaff(){
         +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
         +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
       +'</div>');
-  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Standing weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below).</p>';
+  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below).</p>';
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
     return '<button class="daybtn'+(k===dayKey?' active':'')+'" onclick="selectDay(\''+k+'\')">'+WEEKDAY_KEYS[(d.getDay()+6)%7]+'<span class="d2">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
@@ -2683,7 +2683,7 @@ function renderStudentsPanel(){
   let html=sectionOpen('students','Students',
     '<button class="btn sm primary" onclick="openNewStudentForm()">+ Add student</button>');
   html+='<p>Set once at enrollment: school year, sessions per week (1 or 2), usual length, and a standing day/time for each. The system pre-books actual sessions from that automatically, up to '+HORIZON_WEEKS+' weeks ahead — staff can still move, cancel, or add one-off sessions by hand any time. “Hold” is front-desk only — it pauses a student for a date range without losing their standing spot, and frees those sessions up for one-off bookings while they’re away.</p>';
-  html+='<table><tr><th>Student</th><th>Year</th><th>Plan</th><th>Standing schedule</th><th>Booked this week</th><th>Parent</th><th></th></tr>';
+  html+='<table><tr><th>Student</th><th>Year</th><th>Plan</th><th>Regular schedule</th><th>Booked this week</th><th>Parent</th><th></th></tr>';
   students.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
     const parent=parents.find(function(p){ return p.id===s.parentId; });
     const booked=bookedThisWeek(s.id);
@@ -2911,7 +2911,7 @@ function renderNewStudentModal(){
     +'<div><label>Session length</label><select onchange="setNSFDuration(this.value)">'
     +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===f.duration?' selected':'')+'>'+d+' min</option>'; }).join('')
     +'</select></div></div>';
-  html+='<label>Standing schedule</label>';
+  html+='<label>Regular schedule</label>';
   html+=renderRecurringPickers(f.recurring, starts, 'setNSFRecurring');
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
@@ -3531,7 +3531,7 @@ function renderParent(){
     html+='<div class="card parent-card">';
     html+='<div class="parent-header"><div class="avatar-circle">'+initials+'</div>'
       +'<div><h2>'+student.name+'</h2><div class="small muted">'+yearLabel(student.year)+' · '+student.sessionsPerWeek+'x/week · '+student.duration+'-min sessions</div>'
-      +'<div class="small muted">Standing schedule: '+recurringSummary(student)+'</div></div></div>';
+      +'<div class="small muted">Regular schedule: '+recurringSummary(student)+'</div></div></div>';
 
     const changes=upcomingChangesForStudent(sid);
     if(changes.length>0){
@@ -3552,12 +3552,12 @@ function renderParent(){
         const pod=findPod(s.podId);
         const instr=s.instructorId? findInstructor(s.instructorId) : null;
         const isMakeUp=credits.some(function(c){ return c.redeemedSessionId===s.id; });
-        const typeBadge=s.recurring? '<span class="badge booked">Standing</span>' : (isMakeUp? '<span class="badge available">Make-Up</span>' : '<span class="badge soon">One-off</span>');
+        const typeBadge=s.recurring? '<span class="badge booked">Regular</span>' : (isMakeUp? '<span class="badge available">Make-Up</span>' : '<span class="badge soon">One-off</span>');
         return '<div class="session-row">'
           +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
           +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(pod?pod.name:'—')+' · '+(instr?instr.name:'Unassigned')+'</div></div>'
           +typeBadge
-          +'<button class="btn sm ghost" onclick="parentCancelSession(\''+s.id+'\')">Swap for make-up</button>'
+          +'<button class="btn sm ghost" onclick="parentCancelSession(\''+s.id+'\')">Cancel</button>'
         +'</div>';
       }).join('')+'</div>';
     }
