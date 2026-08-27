@@ -192,10 +192,6 @@ var AUTH_REDIRECT_TYPE = (function(){
   const m=window.location.hash.match(/[#&]type=(\w+)/);
   return m? m[1] : null;
 })();
-if(typeof window!=='undefined' && window.console){
-  console.log('[MATHQ debug] raw location.hash at script start:', (window.location&&window.location.hash)||'(empty)');
-  console.log('[MATHQ debug] AUTH_REDIRECT_TYPE captured as:', AUTH_REDIRECT_TYPE);
-}
 
 var SUPABASE_URL = 'https://irtydpjjrscmtctoeffc.supabase.co';
 var SUPABASE_ANON_KEY = 'sb_publishable_rcmZZ2KIplqWI1nGeuLlMg_tusxf0KG';
@@ -3784,7 +3780,6 @@ if(supabaseClient){
   // signed-in result is treated as final and always wins, whenever it arrives.
   var routedToApp = false; // true once we've acted on an actual session — later events can't undo it
   supabaseClient.auth.onAuthStateChange(function(event, session){
-    if(window.console) console.log('[MATHQ debug] onAuthStateChange:', event, '| session present:', !!session, '| AUTH_REDIRECT_TYPE:', AUTH_REDIRECT_TYPE, '| routedToApp:', routedToApp);
     // PASSWORD_RECOVERY is supposedly Supabase's dedicated event for this, but it isn't firing
     // reliably for this project's link format — so both invite and recovery links are now decided
     // purely from the link's own type (captured synchronously from the URL at the very top of this
