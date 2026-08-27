@@ -148,10 +148,30 @@
   .toast{ position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:var(--text); color:var(--bg); padding:10px 18px; border-radius:999px; font-size:.8rem; box-shadow:var(--shadow); z-index:60; max-width:80vw; text-align:center; }
 
   .slot-opt{ border:1px solid var(--border); border-radius:8px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; font-size:.8rem; }
-  .credit-card{ border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-bottom:12px; }
+  .credit-card{ border:1px solid var(--border); border-left:4px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-bottom:12px; }
+  .credit-card.st-available, .credit-card.st-soon{ border-left-color:var(--success); }
+  .credit-card.st-booked{ border-left-color:var(--info); }
+  .credit-card.st-expired, .credit-card.st-completed{ border-left-color:var(--text-muted); }
   .credit-card .row{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:6px; }
   .small{ font-size:.72rem; }
   .empty-note{ font-size:.8rem; color:var(--text-muted); padding:6px 0 10px; }
+
+  /* ---------- Parent dashboard restyle ---------- */
+  .parent-card{ padding-top:18px; padding-bottom:18px; }
+  .parent-header{ display:flex; align-items:center; gap:14px; margin-bottom:16px; }
+  .avatar-circle{ width:50px; height:50px; border-radius:50%; background:var(--accent-bg); color:var(--accent); display:flex; align-items:center; justify-content:center; font-weight:800; font-size:1rem; flex-shrink:0; letter-spacing:.02em; }
+  .parent-header h2{ margin:0; }
+  .section-label{ font-size:.75rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--text-muted); margin:20px 0 10px; }
+  .parent-card > .section-label:first-of-type{ margin-top:4px; }
+  .session-list{ display:flex; flex-direction:column; gap:8px; }
+  .session-row{ display:flex; align-items:center; gap:14px; border:1px solid var(--border); border-radius:10px; padding:10px 14px; flex-wrap:wrap; }
+  .session-date-chip{ width:50px; text-align:center; flex-shrink:0; }
+  .session-date-chip .sd-day{ font-size:.62rem; font-weight:700; text-transform:uppercase; color:var(--text-muted); }
+  .session-date-chip .sd-num{ font-size:1.15rem; font-weight:800; line-height:1.1; }
+  .session-row .session-main{ flex:1; min-width:140px; }
+  .makeup-summary{ display:flex; gap:24px; align-items:center; flex-wrap:wrap; border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:14px; background:var(--surface-2); }
+  .makeup-count{ font-size:2rem; font-weight:800; color:var(--accent); line-height:1; }
+  .makeup-count-label{ font-size:.72rem; color:var(--text-muted); }
   .footer-note{ font-size:.72rem; color:var(--text-muted); margin-top:24px; text-align:center; }
   .recurring-row{ margin-bottom:8px; }
   .hours-row{ display:flex; align-items:flex-end; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
@@ -1286,6 +1306,39 @@ function markStatus(sessionId, status){
   } else {
     render();
   }
+}
+
+// Parent self-service cancellation (5.7-style rule): cancelling with notice — any day before today,
+// or same-day but before the 10:00am cutoff — frees the slot and automatically issues a make-up
+// credit, exactly like a front-desk no-show would, dated from the missed session and expiring 3
+// months later. Cancelling a same-day session after the cutoff isn't offered here at all — that's
+// the same cutoff already used for booking make-ups (5.7), so front desk can still record it as a
+// genuine no-show if the family doesn't call ahead.
+function parentCancelSession(sessionId){
+  const sess=findSession(sessionId);
+  if(!sess || sess.status!=='scheduled') return;
+  const now=simNow();
+  if(toKey(sess.date)===toKey(now) && sameDayMakeUpCutoffPassed()){
+    toast("It's past 10:00am, so today's session can no longer be cancelled here — please call the centre directly.");
+    return;
+  }
+  const student=findStudent(sess.studentId);
+  const issued=sess.date, expiry=addMonths(issued,3);
+  if(!confirm('Cancel this session on '+fmtShort(sess.date)+' at '+minToLabel(sess.start)+'? '+student.name+' will receive a make-up credit valid until '+fmtShort(expiry)+'.')) return;
+  sess.status='cancelled';
+  dbWrite('cancelling session (parent, with notice)', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
+  const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'parent-cancel', note:''};
+  credits.push(c);
+  dbWrite('issuing a make-up credit', function(){ return supabaseClient.from('credits').insert({
+    id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
+    status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
+  }); });
+  toast('Session cancelled — a make-up credit was added, valid until '+fmtShort(expiry)+'.');
+}
+function toggleViewAllSessions(sid){
+  state.parentViewAllSessions = state.parentViewAllSessions || {};
+  state.parentViewAllSessions[sid] = !state.parentViewAllSessions[sid];
+  render();
 }
 
 /* ---------- manual make-up credits (e.g. migrating owed make-ups from an old manual log) ---------- */
@@ -3471,32 +3524,58 @@ function renderParent(){
 
   parent.studentIds.forEach(function(sid){
     const student=findStudent(sid);
-    const studentCredits=credits.filter(function(c){ return c.studentId===sid; });
-    html+='<div class="card"><h2>'+student.name+' <span class="small muted">('+yearLabel(student.year)+' · '+student.sessionsPerWeek+'x/week · '+student.duration+'-min sessions)</span></h2>';
-    html+='<p class="small muted" style="margin-top:-8px">Standing schedule: '+recurringSummary(student)+'</p>';
+    const studentCredits=credits.filter(function(c){ return c.studentId===sid; })
+      .sort(function(a,b){ return a.expiryDate-b.expiryDate; });
+    const initials=student.name.split(' ').filter(Boolean).slice(0,2).map(function(w){ return w[0]; }).join('').toUpperCase();
+
+    html+='<div class="card parent-card">';
+    html+='<div class="parent-header"><div class="avatar-circle">'+initials+'</div>'
+      +'<div><h2>'+student.name+'</h2><div class="small muted">'+yearLabel(student.year)+' · '+student.sessionsPerWeek+'x/week · '+student.duration+'-min sessions</div>'
+      +'<div class="small muted">Standing schedule: '+recurringSummary(student)+'</div></div></div>';
 
     const changes=upcomingChangesForStudent(sid);
     if(changes.length>0){
       html+='<div class="banner info">'+changes.map(describeUpcomingChange).join('<br/>')+'</div>';
     }
 
-    const upcomingSessions=sessions.filter(function(s){ return s.studentId===sid && s.status==='scheduled' && toKey(s.date)>=toKey(simNow()); })
-      .sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)) || a.start-b.start; })
-      .slice(0,5);
-    html+='<h3 style="margin-top:12px;font-size:.95rem">Upcoming sessions</h3>';
+    const allUpcoming=sessions.filter(function(s){ return s.studentId===sid && s.status==='scheduled' && toKey(s.date)>=toKey(simNow()); })
+      .sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)) || a.start-b.start; });
+    const viewAll=!!(state.parentViewAllSessions && state.parentViewAllSessions[sid]);
+    const upcomingSessions=viewAll? allUpcoming : allUpcoming.slice(0,5);
+    html+='<div class="section-label" style="display:flex;justify-content:space-between;align-items:center">'
+      +'<span>Upcoming sessions</span>'
+      +(allUpcoming.length>5? '<a href="#" onclick="toggleViewAllSessions(\''+sid+'\');return false;" class="small">'+(viewAll?'Show fewer':'View all ('+allUpcoming.length+')')+'</a>' : '')
+    +'</div>';
     if(upcomingSessions.length===0){ html+='<div class="empty-note">No upcoming sessions scheduled.</div>'; }
     else{
-      html+='<table><tr><th>Date</th><th>Time</th><th>Pod</th><th>Instructor</th></tr>'
-        +upcomingSessions.map(function(s){
-          const pod=findPod(s.podId);
-          const instr=s.instructorId? findInstructor(s.instructorId) : null;
-          return '<tr><td>'+fmtShort(s.date)+'</td><td>'+rangeLabel(s.start,s.duration)+'</td><td>'+(pod?pod.name:'—')+'</td><td>'+(instr?instr.name:'Unassigned')+'</td></tr>';
-        }).join('')
-        +'</table>';
+      html+='<div class="session-list">'+upcomingSessions.map(function(s){
+        const pod=findPod(s.podId);
+        const instr=s.instructorId? findInstructor(s.instructorId) : null;
+        const isMakeUp=credits.some(function(c){ return c.redeemedSessionId===s.id; });
+        const typeBadge=s.recurring? '<span class="badge booked">Standing</span>' : (isMakeUp? '<span class="badge available">Make-Up</span>' : '<span class="badge soon">One-off</span>');
+        return '<div class="session-row">'
+          +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
+          +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(pod?pod.name:'—')+' · '+(instr?instr.name:'Unassigned')+'</div></div>'
+          +typeBadge
+          +'<button class="btn sm ghost" onclick="parentCancelSession(\''+s.id+'\')">Swap for make-up</button>'
+        +'</div>';
+      }).join('')+'</div>';
     }
 
+    html+='<div class="section-label">Make-up credits</div>';
     if(studentCredits.length===0){ html+='<div class="empty-note">No make-up credits on file.</div>'; }
-    studentCredits.forEach(function(c){ html+=renderParentCredit(c, student); });
+    else{
+      const availableCount=studentCredits.filter(function(c){ const s=creditDisplayStatus(c); return s==='available'||s==='soon'; }).length;
+      const soonest=studentCredits.filter(function(c){ const s=creditDisplayStatus(c); return s==='available'||s==='soon'; })
+        .sort(function(a,b){ return a.expiryDate-b.expiryDate; })[0];
+      if(availableCount>0){
+        html+='<div class="makeup-summary"><div><div class="makeup-count">'+availableCount+'</div><div class="makeup-count-label">available</div></div>'
+          +(soonest? '<div><div class="small muted">Next expiry</div><b>'+fmtShort(soonest.expiryDate)+'</b><div class="small muted">'+daysUntil(simNow(),soonest.expiryDate)+' days remaining</div></div>' : '')
+          +(soonest? '<button class="btn primary" style="margin-left:auto" onclick="startBookMakeUp(\''+soonest.id+'\')">Book a make-up</button>' : '')
+        +'</div>';
+      }
+      studentCredits.forEach(function(c){ html+=renderParentCredit(c, student); });
+    }
     html+='</div>';
   });
   return html;
@@ -3518,7 +3597,7 @@ function quickLogin(email){ parentLoginSubmit(email); }
 function renderParentCredit(c, student){
   const st=creditDisplayStatus(c);
   const now=simNow();
-  let html='<div class="credit-card">';
+  let html='<div class="credit-card st-'+st+'">';
   if(st==='available' || st==='soon'){
     html+='<div class="row"><div><b>Make-up credit available</b><div class="small muted">From missed session on '+fmtShort(c.issuedDate)+'</div></div>'
       + (st==='soon'? '<span class="badge soon">Expires '+fmtShort(c.expiryDate)+'</span>' : '<span class="badge available">Expires '+fmtShort(c.expiryDate)+'</span>') +'</div>';
