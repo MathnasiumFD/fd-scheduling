@@ -2266,6 +2266,13 @@ function renderStaff(){
     html+='</div>';
   });
 
+  html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above — the pod
+                   // cards just rendered are the last thing that belongs inside it. This was
+                   // previously left unclosed (harmless before the collapsible-sections feature,
+                   // since it just meant later cards were technically-invalid nested children
+                   // rather than siblings) — now that collapsing hides a card's direct children,
+                   // that missing tag was making "Schedule" swallow everything after it.
+
   html+=renderBookingModal();
   html+=renderPodAssignModal();
   html+=renderCheckInModal();
