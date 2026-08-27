@@ -3228,9 +3228,14 @@ function markCoverageUncovered(requestId){
 }
 
 function renderInstructor(){
-  if(!state.instructorLoggedIn) return renderInstructorLogin();
-  const instr=findInstructor(state.instructorLoggedIn);
-  let html='<div class="card"><div class="card-head"><h2>Welcome, '+instr.name+'</h2><button class="btn sm ghost" onclick="instructorLogout()">Log out</button></div>'
+  // Live mode (supabaseClient set) is already gated by real Supabase sign-in before rendering ever
+  // reaches here — currentUser.instructorId is the real identity. state.instructorLoggedIn is the
+  // old pre-Supabase demo mechanism (a fake "pick a sample account" login) and only still applies
+  // in offline/test mode, where there's no real auth to check.
+  const instrId = supabaseClient ? (currentUser && currentUser.instructorId) : state.instructorLoggedIn;
+  if(!instrId) return supabaseClient? '<div class="card"><p class="small muted">Your login isn\'t linked to an instructor record — ask front desk to check your account.</p></div>' : renderInstructorLogin();
+  const instr=findInstructor(instrId);
+  let html='<div class="card"><div class="card-head"><h2>Welcome, '+instr.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'instructorLogout()')+'">Log out</button></div>'
     +'<p>Best suited for: <b>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</b> <span class="small muted">(a preference only — you can be assigned or booked for any year)</span></p>'
     +'<p>You can only see and manage your own availability — not other instructors\'.</p></div>';
 
@@ -3454,9 +3459,11 @@ function renderOneOffModal(){
 
 /* ---------- PARENT ---------- */
 function renderParent(){
-  if(!state.parentLoggedIn) return renderParentLogin();
-  const parent=parents.find(function(p){ return p.id===state.parentLoggedIn; });
-  let html='<div class="card"><div class="card-head"><h2>Welcome, '+parent.name+'</h2><button class="btn sm ghost" onclick="parentLogout()">Log out</button></div>'
+  // See the matching comment in renderInstructor() — same old pre-Supabase demo mechanism, same fix.
+  const parentId = supabaseClient ? (currentUser && currentUser.parentId) : state.parentLoggedIn;
+  if(!parentId) return supabaseClient? '<div class="card"><p class="small muted">Your login isn\'t linked to a parent record — ask front desk to check your account.</p></div>' : renderParentLogin();
+  const parent=parents.find(function(p){ return p.id===parentId; });
+  let html='<div class="card"><div class="card-head"><h2>Welcome, '+parent.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'parentLogout()')+'">Log out</button></div>'
     +'<p>You can view and book make-up sessions here. You\'ll only ever see open times — never other families\' bookings or which instructor works which day.</p></div>';
 
   parent.studentIds.forEach(function(sid){
