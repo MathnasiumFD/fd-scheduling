@@ -190,14 +190,6 @@ var supabaseClient = (typeof window !== 'undefined' && window.supabase)
 var currentUser = null; // {role, instructorId, parentId} — set once login resolves
 var SITE_URL = 'https://fd-scheduling.vercel.app/'; // update if the production Vercel URL ever changes — used as the redirect target for invite/password-reset emails
 
-// Belt-and-braces backup for the check above: Supabase's SDK fires this specific event whenever a
-// password-recovery link is what established the current session, regardless of any hash-timing
-// race. If the hash-based check above ever misses it, this catches it independently.
-if(supabaseClient){
-  supabaseClient.auth.onAuthStateChange(function(event){
-    if(event==='PASSWORD_RECOVERY') showSetPasswordScreen();
-  });
-}
 
 // A real UUID when live (so a newly-created record's local id already matches what Postgres will
 // store — no reconciliation needed), or null in demo/offline mode so callers fall back to the
@@ -3737,13 +3729,24 @@ function loadAllData(){
 }
 
 if(supabaseClient){
-  supabaseClient.auth.getSession().then(function(res){
-    // An invite or password-reset link lands here with a session already established (Supabase's
-    // SDK parses the token from the URL on its own) — but they still need to actually choose a
-    // password before going any further, so this takes priority over the normal "already signed
-    // in, skip straight to the app" path.
-    if((AUTH_REDIRECT_TYPE==='recovery' || AUTH_REDIRECT_TYPE==='invite') && res.data && res.data.session){ showSetPasswordScreen(); return; }
-    if(res.data && res.data.session){ afterLogin(); } else { showLoginScreen(); }
+  // Driven entirely off onAuthStateChange rather than a one-off getSession() call — a direct
+  // getSession() right at page load can resolve before the SDK has finished parsing the
+  // access token out of the URL, which raced with this exact routing decision and briefly showed
+  // the set-password screen before falling back to the plain login screen a moment later.
+  // onAuthStateChange fires INITIAL_SESSION once the SDK has fully settled, so there's no race.
+  var bootRouted = false; // once the very first screen is decided, ignore later refresh/duplicate events
+  supabaseClient.auth.onAuthStateChange(function(event, session){
+    if(event==='PASSWORD_RECOVERY'){ bootRouted=true; showSetPasswordScreen(); return; }
+    if(bootRouted) return;
+    if(event==='INITIAL_SESSION' || event==='SIGNED_IN'){
+      bootRouted=true;
+      // An invite link also lands here with a session already established (Supabase's SDK parses
+      // the token from the URL on its own) — but they still need to actually choose a password
+      // before going any further, so this takes priority over the normal "already signed in, skip
+      // straight to the app" path. (Password-reset links get their own dedicated event above.)
+      if(AUTH_REDIRECT_TYPE==='invite' && session){ showSetPasswordScreen(); return; }
+      if(session){ afterLogin(); } else { showLoginScreen(); }
+    }
   });
 } else {
   // Offline / test-harness fallback — exactly the original demo bootstrap, untouched.
