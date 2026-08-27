@@ -433,6 +433,81 @@ var nextCoverageId=1;
 var waitlist=[];
 var nextWaitlistId=1;
 
+// Public holidays / centre closures (front desk managed) — a single flag on a date blocks that
+// date everywhere sessions get created or offered: standing (regular) pre-booking, staff manual
+// one-off booking, and make-up slot offers. A "recurring" entry (e.g. Christmas Day) matches on
+// month+day every year without re-entering it; a one-off entry (e.g. an unplanned storm closure)
+// matches that exact date only — front desk chooses which, per entry, when adding it. Adding one
+// immediately cancels any already-scheduled sessions landing on it and issues each affected family
+// a make-up credit (same 90-day rule as any other cancellation — it isn't the family's fault).
+var closedDays=[];
+var nextClosedDayId=1;
+function closedDayFor(date){
+  const m=date.getMonth(), d=date.getDate(), dateKey=toKey(date);
+  return closedDays.find(function(c){ return c.recurring? (c.date.getMonth()===m && c.date.getDate()===d) : (toKey(c.date)===dateKey); }) || null;
+}
+function isClosedDate(date){ return !!closedDayFor(date); }
+// For a recurring entry, when its next actual occurrence falls (on/after `from`) — used for sorting
+// and for the "next: ..." display; a one-off entry's occurrence is just its own date.
+function nextClosedDayOccurrence(c, from){
+  if(!c.recurring) return c.date;
+  let occ=new Date(from.getFullYear(), c.date.getMonth(), c.date.getDate());
+  if(toKey(occ)<toKey(from)) occ=new Date(from.getFullYear()+1, c.date.getMonth(), c.date.getDate());
+  return occ;
+}
+// Cancels every still-scheduled session that lands on `date` (any pod/instructor) and issues each
+// affected family a make-up credit, exactly like a front-desk no-show credit — used when a date is
+// newly marked closed so nobody has to hunt down and cancel those sessions by hand.
+function cancelSessionsOnClosedDate(date){
+  const dateKey=toKey(date);
+  const affected=sessions.filter(function(s){ return toKey(s.date)===dateKey && s.status==='scheduled'; });
+  affected.forEach(function(sess){
+    sess.status='cancelled';
+    dbWrite('cancelling a session for a centre closure', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
+    const issued=sess.date, expiry=addMonths(issued,3);
+    const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'closure', note:''};
+    credits.push(c);
+    dbWrite('issuing a make-up credit (closure)', function(){ return supabaseClient.from('credits').insert({
+      id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
+      status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
+    }); });
+  });
+  return affected.length;
+}
+function openAddClosedDayForm(){
+  state.closedDayForm={date:toKey(addDays(simNow(),1)), label:'', recurring:false, error:''};
+  render();
+}
+function closeAddClosedDayForm(){ state.closedDayForm=null; render(); }
+function setClosedDayField(field, value){
+  if(!state.closedDayForm) return;
+  state.closedDayForm[field] = field==='recurring' ? !!value : value;
+  render();
+}
+function saveClosedDayForm(){
+  const f=state.closedDayForm; if(!f) return;
+  if(!f.date){ f.error='Pick a date.'; render(); return; }
+  if(!f.label || !f.label.trim()){ f.error='Give it a short label (e.g. "Christmas Day" or "Storm closure").'; render(); return; }
+  const date=new Date(f.date);
+  const already=closedDayFor(date);
+  if(already){ f.error='That date is already marked closed ("'+already.label+'").'; render(); return; }
+  const cd={id:newId()||('cd'+(nextClosedDayId++)), date, label:f.label.trim(), recurring:!!f.recurring};
+  closedDays.push(cd);
+  dbWrite('adding a closed day', function(){ return supabaseClient.from('closed_days').insert({
+    id:cd.id, the_date:toKey(cd.date), label:cd.label, recurring:cd.recurring
+  }); });
+  const cancelled=cancelSessionsOnClosedDate(date);
+  regenerateAllRecurring();
+  state.closedDayForm=null;
+  toast('Marked '+fmtLong(date)+' as closed'+(cancelled>0? ' — '+cancelled+' scheduled session'+(cancelled===1?'':'s')+' cancelled, each with a make-up credit.' : '.'));
+}
+function removeClosedDay(id){
+  closedDays=closedDays.filter(function(c){ return c.id!==id; });
+  dbWrite('removing a closed day', function(){ return supabaseClient.from('closed_days').delete().eq('id', id); });
+  regenerateAllRecurring();
+  toast('Closure removed — future regular sessions will fill back in automatically.');
+}
+
 function findPod(id){ return pods.find(p=>p.id===id); }
 function podCapacity(id){ const p=findPod(id); return p? p.capacity : CAPACITY; }
 function podBlocksForDay(podId, weekday){ return (podSchedule[podId] && podSchedule[podId][weekday]) || []; }
@@ -590,6 +665,7 @@ var state={
   attendanceLogFor:null,
   studentPodForm:null,
   waitlistForm:null,
+  closedDayForm:null,
   toast:null,
 };
 
@@ -1143,6 +1219,7 @@ function generateRecurringSessions(student, weeksAhead){
     WEEKDAY_KEYS.forEach(function(weekday, dayIdx){
       const date=addDays(monday, dayIdx);
       if(date < new Date(toKey(simNow()))) return; // never backfill the past
+      if(isClosedDate(date)) return; // centre's closed this day — never pre-book a regular session onto it
       const dateKey=toKey(date);
       if(isStudentOnHold(student.id, date)) return; // on hold — leave this occurrence unbooked
       const plan=studentPlanOn(student.id, date); // respects any scheduled stop/frequency change
@@ -1204,6 +1281,8 @@ function resetClock(){ state.offsetDays=0; applyPromotions(); applyPlanChanges()
 function openBooking(podId, dateKey){
   const d = new Date(dateKey);
   if(d < new Date(toKey(simNow()))) return; // can't book into the past
+  const closure=closedDayFor(d);
+  if(closure){ toast("The centre's marked closed that day (\""+closure.label+"\") — nothing can be booked onto it."); return; }
   const dur=90;
   state.booking={podId, dateKey};
   state.bookingForm={studentId:'', duration:dur, start:possibleStarts(dur)[0], overrideOk:false};
@@ -1516,6 +1595,7 @@ function openSlotsForCredit(credit){
     for(let i=0;i<5;i++){
       const date=addDays(monday,i);
       if(date < new Date(todayKey)) continue;
+      if(isClosedDate(date)) continue; // centre's closed this day — never offer it as a make-up slot
       if(sameDayCutoffPassed && toKey(date)===todayKey) continue; // past 10am — today's no longer offered
       const weekday=WEEKDAY_KEYS[i];
       const dateKey=toKey(date);
@@ -2265,11 +2345,13 @@ function renderStaff(){
   const selectedDate=new Date(dayKey);
   const weekday=WEEKDAY_KEYS[(selectedDate.getDay()+6)%7];
   const isPast = selectedDate < new Date(toKey(now));
+  const closure=closedDayFor(selectedDate);
 
   let html=renderCoverageRequestsPanel();
   html+=renderCheckedInPanel();
   html+=renderAvailabilityLookup();
   html+=renderWaitlistPanel();
+  html+=renderClosedDaysPanel();
 
   html+=sectionOpen('schedule','Schedule',
       '<div style="display:flex;gap:6px">'
@@ -2282,6 +2364,8 @@ function renderStaff(){
     return '<button class="daybtn'+(k===dayKey?' active':'')+'" onclick="selectDay(\''+k+'\')">'+WEEKDAY_KEYS[(d.getDay()+6)%7]+'<span class="d2">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
   }).join('')+'</div>';
 
+  if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
+
   pods.forEach(function(pod){
     const roster=sessionsForDay(pod.id, dayKey).slice().sort(function(a,b){ return a.start-b.start; });
     const peak=peakConcurrency(pod.id, dayKey);
@@ -2292,7 +2376,7 @@ function renderStaff(){
       +'<div style="display:flex;align-items:center;gap:8px">'
         +'<span class="badge '+(peak>=cap?'full':'available')+'">'+peak+'/'+cap+'</span>'
         +'<button class="btn sm ghost" onclick="openPodAssignForm(\''+pod.id+'\',\''+weekday+'\')">Assign</button>'
-        +(isPast? '' : '<button class="btn sm primary" onclick="openBooking(\''+pod.id+'\',\''+dayKey+'\')">+ Book a session</button>')
+        +(isPast || closure? '' : '<button class="btn sm primary" onclick="openBooking(\''+pod.id+'\',\''+dayKey+'\')">+ Book a session</button>')
       +'</div></div>';
     if(roster.length===0){ html+='<div class="empty-note">Nothing booked yet.</div>'; }
     roster.forEach(function(sess){
@@ -2305,7 +2389,7 @@ function renderStaff(){
         handoffNote = ' · with '+findInstructor(sess.instructorId).name;
       }
       html+='<div class="sess-chip status-'+sess.status+(sess.instructorId2?' handoff':'')+'">'
-        +'<div><span class="time">'+rangeLabel(sess.start,sess.duration)+'</span> · <b>'+student.name+'</b> <span class="small muted">'+yearLabel(student.year)+' · '+sess.status+(sess.bookedBy==='parent'?' · 👪 parent':'')+(sess.recurring?' · standing':'')+handoffNote+actualNote+'</span></div>';
+        +'<div><span class="time">'+rangeLabel(sess.start,sess.duration)+'</span> · <b>'+student.name+'</b> <span class="small muted">'+yearLabel(student.year)+' · '+sess.status+(sess.bookedBy==='parent'?' · 👪 parent':'')+(sess.recurring?' · regular':'')+handoffNote+actualNote+'</span></div>';
       let actions='';
       if(sess.status==='scheduled' && toKey(sess.date)<=toKey(now)){
         actions+='<button class="btn sm success" onclick="openCheckIn(\''+sess.id+'\')">✓ Check in</button>'
@@ -2334,6 +2418,7 @@ function renderStaff(){
   html+=renderCheckInModal();
   html+=renderMoveModal();
   html+=renderWaitlistModal();
+  html+=renderClosedDayModal();
   html+=renderStudentsPanel();
   html+=renderInstructorsPanel();
   html+=renderParentsPanel();
@@ -2500,7 +2585,7 @@ function renderWaitlistPanel(){
   let html=sectionOpen('waitlist','Waitlist',
     '<div style="display:flex;gap:6px"><span class="small muted">'+waiting.length+'</span>'
     +'<button class="btn sm" onclick="openWaitlistForm()">+ Add to waitlist</button></div>');
-  html+='<p>Families waiting for a Mon–Fri day/time that\'s currently full or unstaffed — matched on day, time, and session length, not a specific Pod, the same way a standing booking auto-picks whichever Pod fits (5.8). First in, first served: when a slot opens up, whoever\'s been waiting longest for it gets flagged first — a later entry won\'t show that same opening until the family ahead of them is booked or removed. When a matching seat opens up, reach out and finish the booking through the usual booking (5.1) or new-student (5.6) flow — this list is just what tells you it\'s worth the call.</p>';
+  html+='<p>Families waiting for a Mon–Fri day/time that\'s currently full or unstaffed — matched on day, time, and session length, not a specific Pod, the same way a regular booking auto-picks whichever Pod fits (5.8). First in, first served: when a slot opens up, whoever\'s been waiting longest for it gets flagged first — a later entry won\'t show that same opening until the family ahead of them is booked or removed. When a matching seat opens up, reach out and finish the booking through the usual booking (5.1) or new-student (5.6) flow — this list is just what tells you it\'s worth the call.</p>';
   if(waiting.length===0){ html+='<div class="empty-note">Nobody currently waiting.</div>'; }
   else{
     html+='<table><tr><th>Day / time</th><th>Name</th><th>Year</th><th>Added</th><th>Note</th><th>Status</th><th></th></tr>';
@@ -2523,6 +2608,45 @@ function renderWaitlistPanel(){
     html+='</table>';
   }
   html+='</div>';
+  return html;
+}
+
+function renderClosedDaysPanel(){
+  const now=simNow();
+  const rows=closedDays.slice().sort(function(a,b){ return toKey(nextClosedDayOccurrence(a,now)).localeCompare(toKey(nextClosedDayOccurrence(b,now))); });
+  let html=sectionOpen('closedDays','Closed Days',
+    '<button class="btn sm" onclick="openAddClosedDayForm()">+ Mark a day closed</button>');
+  html+='<p>Public holidays and other days the centre is shut — Mon–Fri or otherwise. Marking a day closed stops it from being pre-booked or offered as a make-up slot, and immediately cancels (with a make-up credit) anything already sitting on it. Tick "repeats every year" for a fixed holiday like Christmas Day so you never have to re-add it; leave it unticked for a one-off, unscheduled closure.</p>';
+  if(rows.length===0){ html+='<div class="empty-note">No closures on file.</div>'; }
+  else{
+    html+='<table><tr><th>Date</th><th>Label</th><th>Type</th><th></th></tr>';
+    rows.forEach(function(c){
+      const occ=nextClosedDayOccurrence(c, now);
+      const isPast = !c.recurring && toKey(c.date)<toKey(now);
+      html+='<tr><td>'+fmtShort(occ)+(isPast? ' <span class="small muted">(past)</span>' : '')+'</td>'
+        +'<td>'+c.label+'</td>'
+        +'<td><span class="badge '+(c.recurring?'booked':'available')+'">'+(c.recurring?'Repeats yearly':'One-off')+'</span></td>'
+        +'<td><button class="btn sm ghost" onclick="removeClosedDay(\''+c.id+'\')">Remove</button></td></tr>';
+    });
+    html+='</table>';
+  }
+  html+='</div>';
+  return html;
+}
+function renderClosedDayModal(){
+  const f=state.closedDayForm;
+  if(!f) return '';
+  let html='<div class="overlay" onclick="if(event.target===this) closeAddClosedDayForm()"><div class="modal">';
+  html+='<h3>Mark a day closed</h3>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<label>Date</label><input type="date" value="'+f.date+'" onchange="setClosedDayField(\'date\',this.value)"/>';
+  html+='<label>Label</label><input type="text" placeholder="e.g. Christmas Day, Storm closure" value="'+f.label+'" oninput="setClosedDayField(\'label\',this.value)"/>';
+  html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;margin-top:10px"><input type="checkbox" style="width:auto;margin:0" '+(f.recurring?'checked':'')+' onchange="setClosedDayField(\'recurring\',this.checked)"/> Repeats every year on this date</label>';
+  html+='<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeAddClosedDayForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveClosedDayForm()">Mark closed</button>'
+  +'</div>';
+  html+='</div></div>';
   return html;
 }
 
@@ -2682,7 +2806,7 @@ function renderBookingModal(){
 function renderStudentsPanel(){
   let html=sectionOpen('students','Students',
     '<button class="btn sm primary" onclick="openNewStudentForm()">+ Add student</button>');
-  html+='<p>Set once at enrollment: school year, sessions per week (1 or 2), usual length, and a standing day/time for each. The system pre-books actual sessions from that automatically, up to '+HORIZON_WEEKS+' weeks ahead — staff can still move, cancel, or add one-off sessions by hand any time. “Hold” is front-desk only — it pauses a student for a date range without losing their standing spot, and frees those sessions up for one-off bookings while they’re away.</p>';
+  html+='<p>Set once at enrollment: school year, sessions per week (1 or 2), usual length, and a regular day/time for each. The system pre-books actual sessions from that automatically, up to '+HORIZON_WEEKS+' weeks ahead — staff can still move, cancel, or add one-off sessions by hand any time. “Hold” is front-desk only — it pauses a student for a date range without losing their regular spot, and frees those sessions up for one-off bookings while they’re away.</p>';
   html+='<table><tr><th>Student</th><th>Year</th><th>Plan</th><th>Regular schedule</th><th>Booked this week</th><th>Parent</th><th></th></tr>';
   students.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
     const parent=parents.find(function(p){ return p.id===s.parentId; });
@@ -2717,7 +2841,7 @@ function renderInstructorsPanel(){
   instructors.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(instr){
     const pattern=instructorCurrentWeeklyPattern(instr.id);
     const days=WEEKDAY_KEYS.filter(function(d){ return pattern[d]; });
-    const summary = days.length? days.map(function(d){ return d+' '+minToLabel(pattern[d].start)+'–'+minToLabel(pattern[d].end); }).join(', ') : 'No standing availability set';
+    const summary = days.length? days.map(function(d){ return d+' '+minToLabel(pattern[d].start)+'–'+minToLabel(pattern[d].end); }).join(', ') : 'No regular availability set';
     const inactive = instr.active===false;
     const loginCell = !supabaseClient? '<span class="small muted">—</span>'
       : instr.authUserId==='pending'? '<span class="badge soon">Invited</span>'
@@ -2846,7 +2970,7 @@ function renderHoldModal(){
   const student=findStudent(f.studentId);
   let html='<div class="overlay" onclick="if(event.target===this) closeHoldForm()"><div class="modal">';
   html+='<h3>Place '+student.name+' on hold</h3>';
-  html+='<p>Front-desk only. Their standing spot isn\'t touched — it\'ll resume automatically after the hold ends. Any of their sessions inside this date range (standing or one-off) are freed up so someone else can book that Pod slot in the meantime.</p>';
+  html+='<p>Front-desk only. Their regular spot isn\'t touched — it\'ll resume automatically after the hold ends. Any of their sessions inside this date range (regular or one-off) are freed up so someone else can book that Pod slot in the meantime.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.start+'" onchange="setHoldField(\'start\',this.value)"/></div>'
     +'<div><label>End date</label><input type="date" value="'+f.end+'" onchange="setHoldField(\'end\',this.value)"/></div></div>';
@@ -2928,7 +3052,7 @@ function renderRecurringModal(){
   const student=findStudent(f.studentId);
   const starts=possibleStarts(student.duration);
   let html='<div class="overlay" onclick="if(event.target===this) closeRecurringForm()"><div class="modal">';
-  html+='<h3>'+student.name+'’s standing schedule</h3>';
+  html+='<h3>'+student.name+'’s regular schedule</h3>';
   html+='<p>The system pre-books actual sessions from this automatically, using the same qualification, availability, and capacity rules as any other booking. Front desk can still move or cancel any individual session.</p>';
   html+=renderRecurringPickers(f.slots, starts, 'setRecurringSlot');
   html+='<div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">'
@@ -2971,7 +3095,7 @@ function renderStudentPodModal(){
   const upcoming=currentOrUpcomingPodAssignments(student.id).filter(function(a){ return toKey(a.effectiveFrom)>toKey(now); });
   let html='<div class="overlay" onclick="if(event.target===this) closeStudentPodForm()"><div class="modal">';
   html+='<h3>Change '+student.name+'’s Pod</h3>';
-  html+='<p>Sets which Pod '+student.name+'’s standing sessions land in from a chosen date forward — today\'s auto-generated sessions and any beyond it regenerate to match. For a one-off change to a single already-booked session instead, use “Move pod” on that session from the day\'s schedule.</p>';
+  html+='<p>Sets which Pod '+student.name+'’s regular sessions land in from a chosen date forward — today\'s auto-generated sessions and any beyond it regenerate to match. For a one-off change to a single already-booked session instead, use “Move pod” on that session from the day\'s schedule.</p>';
   html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+(currentPodId? findPod(currentPodId).name : 'Auto-assigned')+'</b></div>';
   if(upcoming.length>0){
     html+='<div class="small muted" style="margin-bottom:8px">Scheduled changes: '+upcoming.map(function(a){
@@ -2999,7 +3123,7 @@ function renderPlanChangeModal(){
   const pending=(student.planChanges||[]).slice().sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); });
   let html='<div class="overlay" onclick="if(event.target===this) closePlanChangeForm()"><div class="modal">';
   html+='<h3>Stop or change '+student.name+'’s plan</h3>';
-  html+='<p>Schedules a change to take effect from a chosen future date, without disturbing anything between now and then — the same way a standing Pod pin or a hold works. Sessions already booked before the effective date are left alone; standing sessions from that date on regenerate to match automatically.</p>';
+  html+='<p>Schedules a change to take effect from a chosen future date, without disturbing anything between now and then — the same way a regular Pod pin or a hold works. Sessions already booked before the effective date are left alone; regular sessions from that date on regenerate to match automatically.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div style="display:flex;gap:14px;margin-bottom:8px;font-size:.8rem">'
     +'<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0"><input type="radio" name="pcmode" style="width:auto" '+(f.mode==='stop'?'checked':'')+' onchange="setPlanChangeMode(\'stop\')"/> Stop attending</label>'
@@ -3010,7 +3134,7 @@ function renderPlanChangeModal(){
     html+='<label>Sessions per week</label><select onchange="setPlanChangeSessionsPerWeek(this.value)">'
       +SESSIONS_PER_WEEK_OPTIONS.map(function(n){ return '<option value="'+n+'"'+(n===f.sessionsPerWeek?' selected':'')+'>'+n+'x/week</option>'; }).join('')
       +'</select>';
-    html+='<label>New standing schedule</label>';
+    html+='<label>New regular schedule</label>';
     html+=renderRecurringPickers(f.recurring, starts, 'setPlanChangeRecurringSlot');
   }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
@@ -3055,7 +3179,7 @@ function renderAttendanceLogModal(){
       if(s.status==='attended' && s.actualStart!=null){
         detail='Checked in '+minToLabel(s.actualStart)+', ran to '+minToLabel(s.actualEnd)+(s.checkInOffset>LATE_GRACE_MIN? ' (capped)':'');
       }
-      detail += (detail?' · ':'') + (s.bookedBy==='parent'? '👪 booked by parent' : s.recurring? 'standing schedule' : 'booked by staff');
+      detail += (detail?' · ':'') + (s.bookedBy==='parent'? '👪 booked by parent' : s.recurring? 'regular schedule' : 'booked by staff');
       html+='<tr><td>'+fmtShort(s.date)+'</td><td>'+rangeLabel(s.start,s.duration)+'</td><td>'+(pod?pod.name:'—')+'</td><td class="small">'+instrLabel+'</td><td>'+statusBadge+'</td><td class="small muted">'+detail+'</td></tr>';
     });
     html+='</table></div>';
@@ -3778,8 +3902,9 @@ function loadAllData(){
     T('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
     T('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
     T('waitlist_entries','id,student_id,name,year,weekday,start_min,duration,note,status,notified,date_added'),
+    T('closed_days','id,the_date,label,recurring'),
   ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows]=t;
+    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows]=t;
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
@@ -3847,6 +3972,10 @@ function loadAllData(){
     waitlist=waitlistRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, name:r.name, year:r.year, weekday:r.weekday, start:r.start_min, duration:r.duration,
       note:r.note||'', dateAdded:new Date(r.date_added), notified:r.notified, status:r.status,
+    }; });
+
+    closedDays=closedDayRows.map(function(r){ return {
+      id:r.id, date:new Date(r.the_date), label:r.label, recurring:r.recurring,
     }; });
   });
 }
