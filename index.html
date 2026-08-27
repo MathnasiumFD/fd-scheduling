@@ -297,6 +297,18 @@ function notifyParentOfCheckIn(sessionId){
     if(r && r.error) console.error('Check-in email failed:', r.error);
   }).catch(function(err){ console.error('Check-in email failed:', err); });
 }
+// Closure reminder emails — a daily scheduled job (see add_closure_reminder_cron.sql) already
+// catches every closure on its own once it's 7 days out, so this call is purely for the
+// last-minute case: a closure added with less than a week's notice shouldn't have to wait for
+// tomorrow's scheduled run. Fire-and-forget, same as the check-in email — front desk already got
+// their own toast confirming the closure and credits, this is a bonus, not something to block on.
+var CLOSURE_REMINDER_ENABLED=true;
+function notifyClosureReminders(){
+  if(!CLOSURE_REMINDER_ENABLED || !supabaseClient || !currentUser) return;
+  supabaseClient.functions.invoke('send-closure-reminders', {body:{}}).then(function(r){
+    if(r && r.error) console.error('Closure reminder email failed:', r.error);
+  }).catch(function(err){ console.error('Closure reminder email failed:', err); });
+}
 // One-click account setup (front desk only): creates the real Supabase Auth login and emails an
 // invite the person uses to set their own password — replacing the old two-step "add them in the
 // Supabase dashboard, then paste SQL to link their role" process. Unlike dbWrite(), this isn't
@@ -500,6 +512,9 @@ function saveClosedDayForm(){
   regenerateAllRecurring();
   state.closedDayForm=null;
   toast('Marked '+fmtLong(date)+' as closed'+(cancelled>0? ' — '+cancelled+' scheduled session'+(cancelled===1?'':'s')+' cancelled, each with a make-up credit.' : '.'));
+  // A daily job normally emails families once a closure is 7 days out — but if this one's
+  // already inside that window, don't make them wait for tomorrow's run.
+  if(cancelled>0 && daysUntil(simNow(), date)<=7){ notifyClosureReminders(); }
 }
 function removeClosedDay(id){
   closedDays=closedDays.filter(function(c){ return c.id!==id; });
@@ -3644,7 +3659,10 @@ function renderParent(){
   if(!parentId) return supabaseClient? '<div class="card"><p class="small muted">Your login isn\'t linked to a parent record — ask front desk to check your account.</p></div>' : renderParentLogin();
   const parent=parents.find(function(p){ return p.id===parentId; });
   let html='<div class="card"><div class="card-head"><h2>Welcome, '+parent.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'parentLogout()')+'">Log out</button></div>'
-    +'<p>You can view and book make-up sessions here. You\'ll only ever see open times — never other families\' bookings or which instructor works which day.</p></div>';
+    +'<p>MATHQ is your home for managing your child’s Mathnasium sessions. Here you can view upcoming sessions, make changes to your permanent session times, cancel a session and manage or book make-up sessions using the live availability calendar.</p>'
+    +'<p>You’ll only ever see times that are available to book, never other families’ bookings or private centre information.</p>'
+    +'<p>To help us keep everything accurate and up to date, all session cancellations, permanent session changes and make-up bookings are managed through MATHQ rather than by email, SMS or phone. This means your request is updated straight away and you’ll always have the most current information at your fingertips.</p>'
+    +'<p>Easy, quick, and all in one place.</p></div>';
 
   parent.studentIds.forEach(function(sid){
     const student=findStudent(sid);
