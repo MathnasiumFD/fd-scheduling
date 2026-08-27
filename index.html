@@ -3777,14 +3777,17 @@ if(supabaseClient){
   // signed-in result is treated as final and always wins, whenever it arrives.
   var routedToApp = false; // true once we've acted on an actual session — later events can't undo it
   supabaseClient.auth.onAuthStateChange(function(event, session){
-    if(event==='PASSWORD_RECOVERY'){ routedToApp=true; showSetPasswordScreen(); return; }
-    if(session && (event==='SIGNED_IN' || event==='INITIAL_SESSION') && !routedToApp){
+    // PASSWORD_RECOVERY is supposedly Supabase's dedicated event for this, but it isn't firing
+    // reliably for this project's link format — so both invite and recovery links are now decided
+    // purely from the link's own type (captured synchronously from the URL at the very top of this
+    // script, and independently confirmed correct), on whichever session-bearing event fires first.
+    if(session && (event==='SIGNED_IN' || event==='INITIAL_SESSION' || event==='PASSWORD_RECOVERY') && !routedToApp){
       routedToApp=true;
-      // An invite link also lands here with a session already established (Supabase's SDK parses
-      // the token from the URL on its own) — but they still need to actually choose a password
-      // before going any further, so this takes priority over the normal "already signed in, skip
-      // straight to the app" path. (Password-reset links get their own dedicated event above.)
-      if(AUTH_REDIRECT_TYPE==='invite'){ showSetPasswordScreen(); } else { afterLogin(); }
+      // An invite or password-reset link lands here with a session already established (Supabase's
+      // SDK parses the token from the URL on its own) — but they still need to actually choose a
+      // password before going any further, so this takes priority over the normal "already signed
+      // in, skip straight to the app" path.
+      if(AUTH_REDIRECT_TYPE==='invite' || AUTH_REDIRECT_TYPE==='recovery'){ showSetPasswordScreen(); } else { afterLogin(); }
       return;
     }
     if(!session && event==='INITIAL_SESSION' && !routedToApp){
