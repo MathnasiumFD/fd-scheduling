@@ -328,6 +328,15 @@ function notifyClosureReminders(){
     if(r && r.error) console.error('Closure reminder email failed:', r.error);
   }).catch(function(err){ console.error('Closure reminder email failed:', err); });
 }
+// Front desk gets emailed the moment a parent submits a hold or cancel-enrolment request (5.20),
+// so it doesn't just sit quietly until someone happens to open the Parent Requests panel.
+var ENROLLMENT_REQUEST_EMAIL_ENABLED=true;
+function notifyFrontDeskOfEnrollmentRequest(requestId){
+  if(!ENROLLMENT_REQUEST_EMAIL_ENABLED || !supabaseClient || !currentUser) return;
+  supabaseClient.functions.invoke('send-enrollment-request-email', {body:{requestId:requestId}}).then(function(r){
+    if(r && r.error) console.error('Enrollment request email failed:', r.error);
+  }).catch(function(err){ console.error('Enrollment request email failed:', err); });
+}
 // One-click account setup (front desk only): creates the real Supabase Auth login and emails an
 // invite the person uses to set their own password — replacing the old two-step "add them in the
 // Supabase dashboard, then paste SQL to link their role" process. Unlike dbWrite(), this isn't
@@ -1210,6 +1219,7 @@ function submitHoldRequest(){
     id:req.id, student_id:req.studentId, type:req.type, start_date:toKey(req.start), end_date:toKey(req.end), effective_from:null, note:req.note, status:req.status, created_at:req.createdAt.toISOString()
   }); });
   state.holdRequestForm=null;
+  notifyFrontDeskOfEnrollmentRequest(req.id);
   toast('Hold request sent to front desk — you\'ll see it reflected here once it\'s reviewed.');
 }
 function openCancelRequestForm(studentId){
@@ -1232,6 +1242,7 @@ function submitCancelRequest(){
     id:req.id, student_id:req.studentId, type:req.type, start_date:null, end_date:null, effective_from:toKey(req.effectiveFrom), note:req.note, status:req.status, created_at:req.createdAt.toISOString()
   }); });
   state.cancelRequestForm=null;
+  notifyFrontDeskOfEnrollmentRequest(req.id);
   toast('Cancellation request sent to front desk.');
 }
 
@@ -3049,7 +3060,12 @@ function saveNewParent(){
   const newParent={id:newId()||('p'+(nextParentId++)), name:f.name.trim(), email:f.email.trim(), studentIds:[]};
   parents.push(newParent);
   dbWrite('adding a new parent', function(){ return supabaseClient.from('parents').insert({id:newParent.id, name:newParent.name, email:newParent.email}); });
-  toast(newParent.name+' added. Link their child from the student\'s enrollment or edit screen.');
+  // Straight on to adding their first child, this parent already selected — a parent record on
+  // its own isn't useful for anything else in the app, so there's no reason to make this a
+  // separate trip back to the Students panel and having to find them in the dropdown.
+  const dur=90, spw=2;
+  state.newStudentForm={ parentMode:'existing', parentId:newParent.id, parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), error:'' };
+  toast(newParent.name+' added — now add their first child below.');
   state.newParentForm=null;
   render();
   if(f.inviteNow) inviteLogin(newParent.email, 'parent', newParent.id, newParent.name);
