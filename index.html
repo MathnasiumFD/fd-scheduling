@@ -251,6 +251,25 @@ function fmtShort(d){ return d.toLocaleDateString('en-AU',{weekday:'short',month
 function fmtLong(d){ return d.toLocaleDateString('en-AU',{weekday:'long',month:'long',day:'numeric',year:'numeric'}); }
 function getMonday(d){ const x=new Date(d); const day=x.getDay(); const diff = x.getDate()-day+(day===0?-6:1); x.setDate(diff); return x; }
 function daysUntil(from,to){ return Math.round((new Date(toKey(to))-new Date(toKey(from)))/86400000); }
+// Parent-submitted hold/cancel-enrolment requests (5.20) need at least a week's notice before the
+// 1st of whichever month the requested date falls in — billing runs at the start of the month, so
+// front desk needs that lead time to adjust it. A hold spanning multiple months only needs
+// checking against its START date: if that month's 1st is far enough out, every later month
+// touched by the hold is automatically fine too.
+var MONTH_NOTICE_DAYS=7;
+function monthNoticeOk(date, from){
+  const monthStart=new Date(date.getFullYear(), date.getMonth(), 1);
+  return daysUntil(from||simNow(), monthStart) >= MONTH_NOTICE_DAYS;
+}
+// The soonest date a parent-submitted request could legally take effect right now — used both to
+// validate a submission and to default the date picker to something that will actually be
+// accepted, rather than making them guess-and-check.
+function earliestMonthNoticeDate(){
+  const now=simNow();
+  let monthStart=new Date(now.getFullYear(), now.getMonth()+1, 1);
+  while(daysUntil(now, monthStart) < MONTH_NOTICE_DAYS){ monthStart=new Date(monthStart.getFullYear(), monthStart.getMonth()+1, 1); }
+  return monthStart;
+}
 function sameDay(a,b){ return toKey(a)===toKey(b); }
 
 // Which "school-year cohort" a date belongs to, for automatic year promotion. Approximates the
@@ -523,6 +542,13 @@ function removeClosedDay(id){
   toast('Closure removed — future regular sessions will fill back in automatically.');
 }
 
+// Parent-submitted "request a hold" / "request to cancel enrolment" (5.20) — parents propose,
+// front desk approves or declines. Approving a hold applies it exactly like a front-desk-placed
+// one (applyHold); approving a cancellation schedules a "stop attending" plan change from the
+// requested date, same mechanism front desk already uses for that (see applyStopEnrollment).
+var enrollmentRequests=[];
+var nextEnrollmentRequestId=1;
+
 function findPod(id){ return pods.find(p=>p.id===id); }
 function podCapacity(id){ const p=findPod(id); return p? p.capacity : CAPACITY; }
 function podBlocksForDay(podId, weekday){ return (podSchedule[podId] && podSchedule[podId][weekday]) || []; }
@@ -681,6 +707,8 @@ var state={
   studentPodForm:null,
   waitlistForm:null,
   closedDayForm:null,
+  holdRequestForm:null,
+  cancelRequestForm:null,
   toast:null,
 };
 
@@ -1106,6 +1134,105 @@ function cancelPlanChange(studentId, effectiveFromKey){
   const made=regenerateAllRecurring();
   toast('Scheduled plan change removed'+(made>0? ' — '+made+' standing session(s) re-booked.' : '.'));
   render();
+}
+
+// Same underlying mechanism as savePlanChange()'s "stop attending" mode, just invoked from
+// approving a parent's cancel-enrolment request rather than from front desk's own form.
+function applyStopEnrollment(student, effectiveFrom, note){
+  const effKey=toKey(effectiveFrom);
+  const change={id:newId()||('pc'+(nextPlanChangeId++)), effectiveFrom:effectiveFrom, stopped:true, sessionsPerWeek:0, recurring:[]};
+  student.planChanges=(student.planChanges||[]).filter(function(pc){ return toKey(pc.effectiveFrom)!==effKey; });
+  student.planChanges.push(change);
+  let movedCount=0;
+  sessions.forEach(function(s){
+    if(s.studentId!==student.id || !s.recurring || s.status!=='scheduled') return;
+    if(toKey(s.date) < effKey) return;
+    s.status='cancelled';
+    movedCount++;
+    dbWrite('cancelling a session for an ended enrolment', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+    if(s.creditId){
+      const cr=findCredit(s.creditId);
+      if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){
+        cr.status='available'; cr.redeemedSessionId=null;
+        dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', cr.id); });
+      }
+    }
+  });
+  dbWrite('scheduling enrolment end', function(){
+    return supabaseClient.from('student_plan_changes').delete().eq('student_id', student.id).eq('effective_from', effKey).then(function(){
+      return supabaseClient.from('student_plan_changes').insert({id:change.id, student_id:student.id, effective_from:effKey, stopped:true, sessions_per_week:0});
+    });
+  });
+  regenerateAllRecurring();
+  toast(student.name+' scheduled to stop attending from '+fmtShort(effectiveFrom)+(movedCount? ' — '+movedCount+' upcoming session(s) cancelled.' : '.')+(note? ' Parent\'s note: '+note : ''));
+  return change;
+}
+
+function approveEnrollmentRequest(id){
+  const req=enrollmentRequests.find(function(r){ return r.id===id; });
+  if(!req) return;
+  const student=findStudent(req.studentId);
+  if(req.type==='hold'){ applyHold(student, req.start, req.end, req.note); }
+  else { applyStopEnrollment(student, req.effectiveFrom, req.note); }
+  req.status='approved';
+  dbWrite('approving an enrolment request', function(){ return supabaseClient.from('enrollment_requests').update({status:'approved'}).eq('id', req.id); });
+  render();
+}
+function declineEnrollmentRequest(id){
+  const req=enrollmentRequests.find(function(r){ return r.id===id; });
+  if(!req) return;
+  req.status='declined';
+  dbWrite('declining an enrolment request', function(){ return supabaseClient.from('enrollment_requests').update({status:'declined'}).eq('id', req.id); });
+  toast('Request declined.');
+  render();
+}
+
+/* ---------- parent-submitted hold / cancel-enrolment requests (5.20) ---------- */
+function openHoldRequestForm(studentId){
+  const start=earliestMonthNoticeDate();
+  state.holdRequestForm={studentId, start:toKey(start), end:toKey(addDays(start,7)), note:'', error:''};
+  render();
+}
+function closeHoldRequestForm(){ state.holdRequestForm=null; render(); }
+function setHoldRequestField(field, value){ state.holdRequestForm[field]=value; state.holdRequestForm.error=''; render(); }
+function submitHoldRequest(){
+  const f=state.holdRequestForm;
+  if(!f.start || !f.end){ f.error='Choose a start and end date.'; render(); return; }
+  if(f.end<f.start){ f.error='End date must be on or after the start date.'; render(); return; }
+  const start=new Date(f.start);
+  if(!monthNoticeOk(start)){
+    f.error='Hold requests need at least a week\'s notice before the 1st of the month they start in — the earliest available start is '+fmtShort(earliestMonthNoticeDate())+'.';
+    render(); return;
+  }
+  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'hold', start:start, end:new Date(f.end), effectiveFrom:null, note:f.note.trim(), status:'open', createdAt:simNow()};
+  enrollmentRequests.push(req);
+  dbWrite('submitting a hold request', function(){ return supabaseClient.from('enrollment_requests').insert({
+    id:req.id, student_id:req.studentId, type:req.type, start_date:toKey(req.start), end_date:toKey(req.end), effective_from:null, note:req.note, status:req.status, created_at:req.createdAt.toISOString()
+  }); });
+  state.holdRequestForm=null;
+  toast('Hold request sent to front desk — you\'ll see it reflected here once it\'s reviewed.');
+}
+function openCancelRequestForm(studentId){
+  state.cancelRequestForm={studentId, effectiveFrom:toKey(earliestMonthNoticeDate()), note:'', error:''};
+  render();
+}
+function closeCancelRequestForm(){ state.cancelRequestForm=null; render(); }
+function setCancelRequestField(field, value){ state.cancelRequestForm[field]=value; state.cancelRequestForm.error=''; render(); }
+function submitCancelRequest(){
+  const f=state.cancelRequestForm;
+  if(!f.effectiveFrom){ f.error='Choose the date this should take effect from.'; render(); return; }
+  const effectiveFrom=new Date(f.effectiveFrom);
+  if(!monthNoticeOk(effectiveFrom)){
+    f.error='Cancellation requests need at least a week\'s notice before the 1st of the month they take effect in — the earliest available date is '+fmtShort(earliestMonthNoticeDate())+'.';
+    render(); return;
+  }
+  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'cancel', start:null, end:null, effectiveFrom:effectiveFrom, note:f.note.trim(), status:'open', createdAt:simNow()};
+  enrollmentRequests.push(req);
+  dbWrite('submitting a cancellation request', function(){ return supabaseClient.from('enrollment_requests').insert({
+    id:req.id, student_id:req.studentId, type:req.type, start_date:null, end_date:null, effective_from:toKey(req.effectiveFrom), note:req.note, status:req.status, created_at:req.createdAt.toISOString()
+  }); });
+  state.cancelRequestForm=null;
+  toast('Cancellation request sent to front desk.');
 }
 
 // Everything a parent should be told is changing about a child's schedule (5.20) — any front-desk-
@@ -2185,12 +2312,10 @@ function openHoldForm(studentId){
 }
 function closeHoldForm(){ state.holdForm=null; render(); }
 function setHoldField(field, value){ state.holdForm[field]=value; state.holdForm.error=''; render(); }
-function saveHold(){
-  const f=state.holdForm;
-  const student=findStudent(f.studentId);
-  if(!f.start || !f.end){ f.error='Choose a start and end date.'; render(); return; }
-  if(f.end<f.start){ f.error='End date must be on or after the start date.'; render(); return; }
-  const hold={id:newId()||('hold'+(nextSessionId++)), start:new Date(f.start), end:new Date(f.end), note:f.note.trim()};
+// Shared by front desk placing a hold directly (saveHold) and front desk approving a parent's
+// hold request (approveEnrollmentRequest) — same effect either way, just a different entry point.
+function applyHold(student, start, end, note){
+  const hold={id:newId()||('hold'+(nextSessionId++)), start:start, end:end, note:(note||'').trim()};
   student.holds=student.holds||[];
   student.holds.push(hold);
   dbWrite('placing a hold', function(){ return supabaseClient.from('student_holds').insert({
@@ -2217,6 +2342,14 @@ function saveHold(){
     }
   });
   toast(student.name+' placed on hold '+fmtShort(hold.start)+'–'+fmtShort(hold.end)+(cancelledCount>0? ' — '+cancelledCount+' session(s) freed up for one-off bookings.' : '.'));
+  return hold;
+}
+function saveHold(){
+  const f=state.holdForm;
+  const student=findStudent(f.studentId);
+  if(!f.start || !f.end){ f.error='Choose a start and end date.'; render(); return; }
+  if(f.end<f.start){ f.error='End date must be on or after the start date.'; render(); return; }
+  applyHold(student, new Date(f.start), new Date(f.end), f.note);
   state.holdForm=null;
   render();
 }
@@ -2363,6 +2496,7 @@ function renderStaff(){
   const closure=closedDayFor(selectedDate);
 
   let html=renderCoverageRequestsPanel();
+  html+=renderEnrollmentRequestsPanel();
   html+=renderCheckedInPanel();
   html+=renderAvailabilityLookup();
   html+=renderWaitlistPanel();
@@ -2529,6 +2663,27 @@ function renderCoverageRequestsPanel(){
         +'<button class="btn sm" style="margin-top:4px" onclick="assignCoverageManually(\''+r.id+'\', document.getElementById(\''+selId+'\').value)">Assign</button></td>';
     }
     html+='</tr>';
+  });
+  html+='</table></div>';
+  return html;
+}
+
+function renderEnrollmentRequestsPanel(){
+  const open=enrollmentRequests.filter(function(r){ return r.status==='open'; }).sort(function(a,b){ return a.createdAt-b.createdAt; });
+  if(open.length===0) return '';
+  let html=sectionOpen('enrollRequests','📋 Parent Requests','<span class="small muted">'+open.length+'</span>');
+  html+='<p>Hold and cancel-enrolment requests parents submitted from their own login — approving applies it immediately (same as placing a hold or scheduling a stop yourself); declining just clears it from this list.</p>';
+  html+='<table><tr><th>Student</th><th>Parent</th><th>Request</th><th>Note</th><th></th></tr>';
+  open.forEach(function(r){
+    const student=findStudent(r.studentId);
+    const parent=parents.find(function(p){ return p.id===student.parentId; });
+    const detail = r.type==='hold'
+      ? 'Hold: '+fmtShort(r.start)+'–'+fmtShort(r.end)
+      : '<span class="badge full">Cancel enrolment</span> from '+fmtShort(r.effectiveFrom);
+    html+='<tr><td>'+student.name+'</td><td class="small">'+(parent?parent.name:'—')+'</td>'
+      +'<td>'+detail+'</td>'
+      +'<td class="small muted">'+(r.note||'—')+'</td>'
+      +'<td><button class="btn sm primary" style="margin:2px" onclick="approveEnrollmentRequest(\''+r.id+'\')">Approve</button> <button class="btn sm ghost" style="margin:2px" onclick="declineEnrollmentRequest(\''+r.id+'\')">Decline</button></td></tr>';
   });
   html+='</table></div>';
   return html;
@@ -3671,9 +3826,15 @@ function renderParent(){
     const initials=student.name.split(' ').filter(Boolean).slice(0,2).map(function(w){ return w[0]; }).join('').toUpperCase();
 
     html+='<div class="card parent-card">';
+    const pendingHold=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='hold' && r.status==='open'; });
+    const pendingCancel=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='cancel' && r.status==='open'; });
     html+='<div class="parent-header"><div class="avatar-circle">'+initials+'</div>'
       +'<div><h2>'+student.name+'</h2><div class="small muted">'+yearLabel(student.year)+' · '+student.sessionsPerWeek+'x/week · '+student.duration+'-min sessions</div>'
-      +'<div class="small muted">Regular schedule: '+recurringSummary(student)+'</div></div></div>';
+      +'<div class="small muted">Regular schedule: '+recurringSummary(student)+'</div></div>'
+      +'<div style="margin-left:auto;display:flex;flex-direction:column;gap:4px;align-items:flex-end">'
+        +(pendingHold? '<span class="small muted">Hold request pending</span>' : '<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>')
+        +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>')
+      +'</div></div>';
 
     const changes=upcomingChangesForStudent(sid);
     if(changes.length>0){
@@ -3720,6 +3881,42 @@ function renderParent(){
     }
     html+='</div>';
   });
+  html+=renderHoldRequestModal();
+  html+=renderCancelRequestModal();
+  return html;
+}
+
+function renderHoldRequestModal(){
+  const f=state.holdRequestForm;
+  if(!f) return '';
+  const student=findStudent(f.studentId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeHoldRequestForm()"><div class="modal">';
+  html+='<h3>Request a hold for '+student.name+'</h3>';
+  html+='<p>Front desk will review this before anything changes. Hold requests need at least a week\'s notice before the 1st of the month they start in.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.start+'" onchange="setHoldRequestField(\'start\',this.value)"/></div>'
+    +'<div><label>End date</label><input type="date" value="'+f.end+'" onchange="setHoldRequestField(\'end\',this.value)"/></div></div>';
+  html+='<label>Note (optional)</label><input type="text" placeholder="e.g. family vacation" value="'+f.note+'" oninput="setHoldRequestField(\'note\',this.value)"/>';
+  html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeHoldRequestForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="submitHoldRequest()">Send request</button>'
+  +'</div></div></div>';
+  return html;
+}
+function renderCancelRequestModal(){
+  const f=state.cancelRequestForm;
+  if(!f) return '';
+  const student=findStudent(f.studentId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeCancelRequestForm()"><div class="modal">';
+  html+='<h3>Request to cancel '+student.name+'’s enrolment</h3>';
+  html+='<p>Front desk will review this before anything changes. Cancellation requests need at least a week\'s notice before the 1st of the month they take effect in.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<label>Effective from</label><input type="date" value="'+f.effectiveFrom+'" onchange="setCancelRequestField(\'effectiveFrom\',this.value)"/>';
+  html+='<label>Note (optional)</label><input type="text" placeholder="e.g. moving away, taking a break" value="'+f.note+'" oninput="setCancelRequestField(\'note\',this.value)"/>';
+  html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeCancelRequestForm()">Back</button>'
+    +'<button class="btn danger" onclick="submitCancelRequest()">Send request</button>'
+  +'</div></div></div>';
   return html;
 }
 
@@ -3921,8 +4118,9 @@ function loadAllData(){
     T('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
     T('waitlist_entries','id,student_id,name,year,weekday,start_min,duration,note,status,notified,date_added'),
     T('closed_days','id,the_date,label,recurring'),
+    T('enrollment_requests','id,student_id,type,start_date,end_date,effective_from,note,status,created_at'),
   ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows]=t;
+    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows]=t;
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
@@ -3994,6 +4192,14 @@ function loadAllData(){
 
     closedDays=closedDayRows.map(function(r){ return {
       id:r.id, date:new Date(r.the_date), label:r.label, recurring:r.recurring,
+    }; });
+
+    enrollmentRequests=enrollRequestRows.map(function(r){ return {
+      id:r.id, studentId:r.student_id, type:r.type,
+      start: r.start_date? new Date(r.start_date) : null,
+      end: r.end_date? new Date(r.end_date) : null,
+      effectiveFrom: r.effective_from? new Date(r.effective_from) : null,
+      note:r.note||'', status:r.status, createdAt:new Date(r.created_at),
     }; });
   });
 }
