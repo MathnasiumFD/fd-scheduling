@@ -974,6 +974,27 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
   return best;
 }
 
+// Diagnostic used right after enrolling a student or saving their regular schedule (5.10): a
+// selected day/time can be entered just fine but never actually produce a booked session if no
+// Pod has an instructor covering it yet (pickBestPod above returns null and generateRecurringSessions
+// silently skips that occurrence — by design, same as any other gap, but with zero feedback to
+// whoever just set the schedule). This checks each selected slot against every Pod's CURRENT
+// coverage (today's roster — a reasonable proxy for a weekly-recurring pattern) and returns the
+// slots where nobody is assigned anywhere, so the toast can name them and point to the fix
+// (Schedule tab -> Assign) instead of silently pre-booking 0 sessions.
+function slotsWithoutCoverage(slots, duration){
+  const date=simNow();
+  return (slots||[]).filter(function(slot){
+    return !pods.some(function(pod){
+      const cov=podCoverageBoundary(pod.id, slot.weekday, slot.start, duration, date);
+      return cov.instructorId && cov.boundary >= slot.start+duration;
+    });
+  });
+}
+function describeUncoveredSlots(slots){
+  return slots.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ');
+}
+
 function creditDisplayStatus(c){
   const now=simNow();
   if(c.status==='redeemed'){
@@ -988,7 +1009,7 @@ function creditDisplayStatus(c){
   return 'available';
 }
 
-function toast(msg){ state.toast=msg; render(); setTimeout(function(){ state.toast=null; render(); }, 3400); }
+function toast(msg, ms){ state.toast=msg; render(); setTimeout(function(){ state.toast=null; render(); }, ms||3400); }
 
 /* ---------- standing weekly schedule (pre-booking) ---------- */
 // Front-desk-only "hold": the student keeps their standing recurring pattern (it isn't touched),
@@ -2233,7 +2254,12 @@ function saveNewStudent(){
   const parent=parents.find(function(p){ return p.id===parentId; });
   parent.studentIds.push(newStudent.id);
   const made=generateRecurringSessions(newStudent, HORIZON_WEEKS);
-  toast(newStudent.name+' enrolled — '+f.sessionsPerWeek+'x/week, '+f.duration+' min, with '+parent.name+'. '+made+' standing session(s) pre-booked.');
+  const uncovered=slotsWithoutCoverage(newStudent.recurring, newStudent.duration);
+  if(uncovered.length){
+    toast(newStudent.name+' enrolled, but no instructor is currently assigned to any Pod for '+describeUncoveredSlots(uncovered)+' — 0 session(s) could be pre-booked for that time yet. Assign coverage on the Schedule tab, then reopen '+newStudent.name+'\'s regular schedule and save it again.', 9000);
+  } else {
+    toast(newStudent.name+' enrolled — '+f.sessionsPerWeek+'x/week, '+f.duration+' min, with '+parent.name+'. '+made+' standing session(s) pre-booked.');
+  }
   state.newStudentForm=null;
   render();
 }
@@ -2311,7 +2337,12 @@ function saveRecurringForm(){
   const student=findStudent(f.studentId);
   student.recurring = f.slots.map(function(s){ return {weekday:s.weekday, start:s.start}; });
   const made=generateRecurringSessions(student, HORIZON_WEEKS);
-  toast(student.name+'’s standing schedule saved — '+made+' upcoming session(s) pre-booked.');
+  const uncovered=slotsWithoutCoverage(student.recurring, student.duration);
+  if(uncovered.length){
+    toast(student.name+'’s regular schedule saved, but no instructor is currently assigned to any Pod for '+describeUncoveredSlots(uncovered)+' — those session(s) couldn\'t be pre-booked yet. Assign coverage on the Schedule tab, then reopen this schedule and save it again.', 9000);
+  } else {
+    toast(student.name+'’s regular schedule saved — '+made+' upcoming session(s) pre-booked.');
+  }
   state.recurringForm=null;
   render();
 }
