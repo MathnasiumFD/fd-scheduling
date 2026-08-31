@@ -1019,17 +1019,23 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
 // the ORDER decisions get made in, so the oldest kids get first claim on the senior Pods across
 // the whole schedule, and a student who already turns out to be in the best-available Pod for
 // their slot is left untouched (nothing to move).
+// Returns detailed counts (not just moved/skipped) so front desk — and anyone debugging a report
+// of "this button isn't doing anything" — can immediately see WHY: how many upcoming sessions
+// exist at all, how many are excluded because they carry an explicit Pod pin, how many were
+// already correctly seated (nothing to do), versus how many actually moved or failed to.
 function reseatByAge(){
   const now=simNow();
   const nowKey=toKey(now);
   const candidates=[];
+  let totalUpcoming=0, pinned=0;
   sessions.forEach(function(s){
     if(s.status!=='scheduled') return;
     const dateKey=toKey(s.date);
     if(dateKey<nowKey) return; // never touch the past
     const student=findStudent(s.studentId);
     if(!student) return;
-    if(studentAssignedPodOn(student.id, s.date)) return; // explicit pin — front desk's call, not ours
+    totalUpcoming++;
+    if(studentAssignedPodOn(student.id, s.date)){ pinned++; return; } // explicit pin — front desk's call, not ours
     candidates.push({student:student, session:s, dateKey:dateKey});
   });
   candidates.sort(function(a,b){
@@ -1037,7 +1043,7 @@ function reseatByAge(){
     if(a.dateKey!==b.dateKey) return a.dateKey<b.dateKey? -1 : 1; // then earliest date
     return a.session.start-b.session.start; // then earliest time that day
   });
-  let moved=0, skipped=0;
+  let moved=0, skipped=0, alreadyBest=0;
   candidates.forEach(function(c){
     const sess=c.session, student=c.student, dateKey=c.dateKey;
     const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
@@ -1050,11 +1056,12 @@ function reseatByAge(){
       if(peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration})>podCapacity(podId)) return false;
       target=podId; return true;
     });
-    if(!target || target===sess.podId) return; // no better (or no available) Pod for this one
+    if(!target){ skipped++; return; } // every Pod at this exact slot is either uncovered or full
+    if(target===sess.podId){ alreadyBest++; return; } // no better Pod exists for this one
     const r=movePodSession(sess.id, target);
     if(r.ok) moved++; else skipped++;
   });
-  return {moved:moved, skipped:skipped};
+  return {moved:moved, skipped:skipped, pinned:pinned, alreadyBest:alreadyBest, totalUpcoming:totalUpcoming, candidateCount:candidates.length};
 }
 
 // Diagnostic used right after enrolling a student or saving their regular schedule (5.10): a
@@ -3055,12 +3062,21 @@ function setWeek(w){ state.weekOffset=w; state.selectedDayKey=null; render(); }
 // kids around is disruptive enough that it should only happen when someone asks for it.
 function runReseatByAge(){
   const result=reseatByAge();
-  if(result.moved===0 && result.skipped===0){
-    toast('Everyone\'s already seated in the best-fitting Pod for their age — nothing to move.');
+  // Always spells out the full breakdown, not just "moved N" — a report of "this isn't doing
+  // anything" is usually actually one of: everyone's pinned, everyone's already best-seated, or
+  // there's nothing upcoming to look at at all. Surfacing the numbers directly here is a lot
+  // faster to debug from than guessing.
+  let msg='Checked '+result.totalUpcoming+' upcoming session(s). ';
+  if(result.totalUpcoming===0){
+    msg='No upcoming sessions to re-seat at all.';
+  } else if(result.pinned===result.totalUpcoming){
+    msg+='All '+result.pinned+' of them have an explicit Pod pin, so none are eligible for this rule — remove a pin (Students → that student → Pod) if you want it auto-managed by age instead.';
   } else {
-    toast('Re-seated by age: moved '+result.moved+' upcoming session(s) into a better-fitting Pod'
-      +(result.skipped>0? ', '+result.skipped+' couldn\'t move (Pod full or no coverage there that day)':'')+'.', 7000);
+    msg+=result.pinned+' pinned (skipped), '+result.alreadyBest+' already in their best-fitting Pod, '
+      +result.moved+' moved to a better Pod'
+      +(result.skipped>0? ', '+result.skipped+' couldn\'t move (Pod full or no coverage there that day)':'')+'.';
   }
+  toast(msg, 9000);
   render();
 }
 function selectDay(k){ state.selectedDayKey=k; render(); }
