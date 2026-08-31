@@ -887,6 +887,52 @@ function resolvePodCoverage(podId, weekday, start, duration, date){
   return {instructorId:seg1.instructorId, instructorId2:seg2.instructorId||null, handoff:seg2.instructorId? seg1.boundary : null};
 }
 
+// A child can sit at a Pod up to this many minutes before an instructor arrives, after one wraps
+// up, or between two assigned shifts, without the Pod counting as "uncovered" — anywhere in the
+// app that decides whether a Pod is staffed for a session (booking, auto-assignment, re-seat by
+// age, and the enrollment "no coverage" warnings) uses the same tolerance, so they never disagree
+// with each other. A Pod with no instructor anywhere near the window, or a gap bigger than this,
+// still isn't covered.
+var UNATTENDED_TOLERANCE_MIN = 15;
+
+// Walks every real (assigned) block overlapping [start, start+duration) on this Pod/weekday/date,
+// in order, and returns the full picture: how many minutes of the window nobody is actually there
+// (gapMinutes — 0 if fully covered, possibly by more than one instructor stitched together with no
+// hole), which instructor covers the largest share (primaryInstructorId — the one that should get
+// recorded as the session's own instructor, and whose "suited for" preference is checked), and, if
+// a second, different instructor immediately continues right where the first leaves off with no
+// gap between them, that instructor and the exact handoff minute (a genuine handoff — a different
+// concept from an unattended gap, and not subject to the tolerance above since nobody actually goes
+// unstaffed in that case).
+function podCoverageDetail(podId, weekday, start, duration, date){
+  const end=start+duration;
+  const segs=podBlocksForDay(podId, weekday)
+    .map(function(b){ return {start:Math.max(b.start,start), end:Math.min(b.end,end), instructorId:blockInstructorOn(b, date)}; })
+    .filter(function(s){ return s.instructorId && s.end>s.start; })
+    .sort(function(a,b){ return a.start-b.start; });
+  let cursor=start, gapMinutes=0;
+  let primaryInstructorId=null, primaryLen=-1;
+  segs.forEach(function(s){
+    if(s.start>cursor) gapMinutes+=s.start-cursor;
+    cursor=Math.max(cursor, s.end);
+    const len=s.end-s.start;
+    if(len>primaryLen){ primaryLen=len; primaryInstructorId=s.instructorId; }
+  });
+  if(cursor<end) gapMinutes+=end-cursor;
+  // A genuine back-to-back handoff: the first real segment doesn't reach the end, but a DIFFERENT
+  // instructor's segment picks up at exactly that boundary with no gap at all.
+  let secondaryInstructorId=null, handoffAt=null;
+  if(segs.length>=2){
+    for(let i=0;i<segs.length-1;i++){
+      if(segs[i].end<end && segs[i+1].start===segs[i].end && segs[i+1].instructorId!==segs[i].instructorId){
+        primaryInstructorId=segs[i].instructorId; secondaryInstructorId=segs[i+1].instructorId; handoffAt=segs[i+1].start;
+        break;
+      }
+    }
+  }
+  return {gapMinutes:gapMinutes, ok:gapMinutes<=UNATTENDED_TOLERANCE_MIN, primaryInstructorId:primaryInstructorId, secondaryInstructorId:secondaryInstructorId, handoffAt:handoffAt};
+}
+
 // Moves an already-booked/seated session to a different Pod — front desk can do this for any
 // student, and an instructor can do it for a student currently checked in at their own Pod.
 // Re-resolves instructor coverage for the new Pod at the same day/time; blocked if the target
@@ -913,11 +959,11 @@ function movePodSession(sessionId, newPodId){
     return {ok:false, error:newPod.name+' is already full at that time ('+cap+'/'+cap+') — pick another Pod.'};
   }
   const oldPod=findPod(sess.podId);
-  const cov=resolvePodCoverage(newPodId, weekday, sess.start, sess.duration, sess.date);
+  const cov=podCoverageDetail(newPodId, weekday, sess.start, sess.duration, sess.date); // tolerant of a short unattended gap, same as everywhere else (UNATTENDED_TOLERANCE_MIN)
   sess.podId=newPodId;
-  sess.instructorId=cov.instructorId;
-  sess.instructorId2=cov.instructorId2;
-  sess.handoff=cov.handoff;
+  sess.instructorId=cov.primaryInstructorId;
+  sess.instructorId2=cov.secondaryInstructorId;
+  sess.handoff=cov.handoffAt;
   dbWrite('moving a session to a different Pod', function(){ return supabaseClient.from('sessions').update({
     pod_id:sess.podId, instructor_id:sess.instructorId, instructor_id_2:sess.instructorId2, handoff_min:sess.handoff
   }).eq('id', sess.id); });
@@ -983,8 +1029,8 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
   if(preferredPodId){
     const pod=findPod(preferredPodId);
     if(!pod) return null;
-    const cov=podCoverageBoundary(pod.id, weekday, start, duration, date);
-    if(!cov.instructorId || cov.boundary < start+duration) return null;
+    const cov=podCoverageDetail(pod.id, weekday, start, duration, date);
+    if(!cov.primaryInstructorId || !cov.ok) return null; // no instructor nearby, or more than the tolerated unattended gap
     const cap=podCapacity(pod.id);
     const wouldBePeak=peakConcurrency(pod.id, dateKey, {start, duration});
     if(wouldBePeak>cap) return null;
@@ -995,9 +1041,9 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
     if(tierPods.length===0) continue; // student doesn't meet this tier's minimum at all
     let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
     tierPods.forEach(function(podId){
-      const cov=podCoverageBoundary(podId, weekday, start, duration, date);
-      if(!cov.instructorId || cov.boundary < start+duration) return; // needs full single-instructor coverage
-      const instr=findInstructor(cov.instructorId);
+      const cov=podCoverageDetail(podId, weekday, start, duration, date);
+      if(!cov.primaryInstructorId || !cov.ok) return; // no instructor nearby, or more than the tolerated unattended gap
+      const instr=findInstructor(cov.primaryInstructorId);
       const cap=podCapacity(podId);
       const wouldBePeak=peakConcurrency(podId, dateKey, {start, duration});
       if(wouldBePeak>cap) return;
@@ -1012,24 +1058,28 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
   return null;
 }
 
-// One-time batch fix-up for existing bookings (5.21): moves students who don't have an explicit
-// standing Pod pin into whichever Pod the age-band rule above says fits them best, for every
-// still-upcoming ('scheduled', today or later) session. A student with a front-desk-set Pod pin
-// (studentAssignedPodOn) is left completely alone — that's a deliberate placement (e.g. keeping
-// siblings together), and this age rule is a scheduling convenience, never a reason to override it.
+// One-time batch fix-up for existing bookings (5.21): takes every non-pinned upcoming session OUT
+// of its current Pod all at once, then re-seats every one of them from scratch into whichever Pod
+// the age rule above says fits best — oldest students first. A student with a front-desk-set Pod
+// pin (studentAssignedPodOn) is left completely alone throughout — that's a deliberate placement
+// (e.g. keeping siblings together), and this age rule is a scheduling convenience, never a reason
+// to override it.
 //
-// Every eligible session across the whole roster is processed in ONE global order — oldest
-// student first, then earliest date/time — exactly like front desk would work through it by hand,
-// rather than picking an arbitrary day/time to sort out first. Each session's own real coverage
-// and capacity (for its own exact date/start/duration) still governs whether a move is actually
-// possible, so this never overbooks a Pod or ignores date-specific coverage gaps — it only changes
-// the ORDER decisions get made in, so the oldest kids get first claim on the senior Pods across
-// the whole schedule, and a student who already turns out to be in the best-available Pod for
-// their slot is left untouched (nothing to move).
+// Pulling everyone out before anyone is re-seated (rather than moving students one at a time in
+// place) matters for a concrete reason: an older student's claim on a senior Pod must never be
+// blocked just because a younger student who hasn't been reprocessed yet is still sitting in that
+// seat. With everyone's old seat cleared first, an older student always sees the Pod as it will
+// really end up looking once the whole pass finishes, not as a half-updated snapshot. Every
+// session's own real coverage (with the same short-unattended-gap tolerance as everywhere else,
+// UNATTENDED_TOLERANCE_MIN) and capacity for its own exact date/start/duration still governs
+// whether a placement is actually possible, so this never overbooks a Pod or invents coverage that
+// isn't there — a session that ends up back in the Pod it started in (because that was genuinely
+// the best option) is simply restored, not written to the database as a no-op move.
 // Returns detailed counts (not just moved/skipped) so front desk — and anyone debugging a report
 // of "this button isn't doing anything" — can immediately see WHY: how many upcoming sessions
 // exist at all, how many are excluded because they carry an explicit Pod pin, how many were
-// already correctly seated (nothing to do), versus how many actually moved or failed to.
+// already correctly seated (nothing to do), versus how many actually moved or failed to — plus,
+// for anyone that couldn't move, exactly who and why (skippedDetails).
 function reseatByAge(){
   const now=simNow();
   const nowKey=toKey(now);
@@ -1050,29 +1100,38 @@ function reseatByAge(){
     if(a.dateKey!==b.dateKey) return a.dateKey<b.dateKey? -1 : 1; // then earliest date
     return a.session.start-b.session.start; // then earliest time that day
   });
+
+  // Phase 1 — take every candidate OUT of their current Pod at once (a plain in-memory clear, no
+  // dbWrite yet), so every capacity/coverage check below sees a clean slate: only non-candidate
+  // sessions (pinned, or otherwise not part of this pass) and already-re-seated candidates occupy
+  // any Pod while the loop runs. Original placements are kept here so anyone who can't be moved, or
+  // who ends up right back where they started, can be restored exactly rather than left seatless.
+  const originalById={};
+  candidates.forEach(function(c){
+    originalById[c.session.id]={podId:c.session.podId, instructorId:c.session.instructorId, instructorId2:c.session.instructorId2, handoff:c.session.handoff};
+    c.session.podId=null;
+  });
+
   let moved=0, skipped=0, alreadyBest=0;
   const skippedDetails=[]; // who couldn't move, and why — so "still wrong after re-seating" is diagnosable by name, not just a count
   candidates.forEach(function(c){
     const sess=c.session, student=c.student, dateKey=c.dateKey, year=student.year;
+    const orig=originalById[sess.id];
     const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
     let target=null;
     // Same tiers, same eligibility, same tie-breaks as pickBestPod — walked here directly rather
-    // than calling pickBestPod itself, because checking "is there room" for the Pod this student
-    // is ALREADY sitting in must use their REAL current occupancy (they're already legitimately
-    // counted in it), not add a second, phantom seat on top of the one they already occupy.
+    // than calling pickBestPod itself, since this needs the Phase-1-cleared occupancy counts above,
+    // not pickBestPod's own (real, un-cleared) view of who's sitting where right now.
     for(let t=0; t<POD_TIERS.length && !target; t++){
       const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
       if(tierPods.length===0) continue; // this student doesn't meet this tier's minimum year at all
       let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
       tierPods.forEach(function(podId){
-        const cov=podCoverageBoundary(podId, weekday, sess.start, sess.duration, sess.date);
-        if(!cov.instructorId || cov.boundary<sess.start+sess.duration) return;
-        const alreadyHere=(podId===sess.podId);
-        const peak=alreadyHere
-          ? peakConcurrency(podId, dateKey, null)
-          : peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration});
+        const cov=podCoverageDetail(podId, weekday, sess.start, sess.duration, sess.date);
+        if(!cov.primaryInstructorId || !cov.ok) return; // no instructor nearby, or more than the tolerated unattended gap
+        const peak=peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration});
         if(peak>podCapacity(podId)) return;
-        const instr=findInstructor(cov.instructorId);
+        const instr=findInstructor(cov.primaryInstructorId);
         const suited=instructorSuitedFor(instr, year)? 1 : 0;
         const sameYear=sameYearCount(podId, dateKey, sess.start, sess.duration, year);
         if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && peak>bestOccupancy)))){
@@ -1086,13 +1145,25 @@ function reseatByAge(){
       // often because the only staffed option that day/time is a senior-only Pod (e.g. Singles late
       // in the evening). Moving them requires either rescheduling this session to a time an eligible
       // Pod is actually covered, or getting coverage assigned to an eligible Pod for this slot.
+      // Restore them exactly as they were — can't leave a session with no Pod at all.
+      sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
       skipped++;
-      skippedDetails.push({studentName:student.name, weekday:weekday, start:sess.start, currentPod:(findPod(sess.podId)||{}).name||sess.podId});
+      skippedDetails.push({studentName:student.name, weekday:weekday, start:sess.start, currentPod:(findPod(orig.podId)||{}).name||orig.podId});
       return;
     }
-    if(target===sess.podId){ alreadyBest++; return; } // already the best-available option — nothing to do
-    const r=movePodSession(sess.id, target);
-    if(r.ok){ moved++; } else { skipped++; skippedDetails.push({studentName:student.name, weekday:weekday, start:sess.start, currentPod:(findPod(sess.podId)||{}).name||sess.podId, error:r.error}); }
+    if(target===orig.podId){
+      // Ends up back in the Pod they started in — genuinely the best option, so just restore
+      // in-place. No actual change, so no dbWrite either.
+      sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
+      alreadyBest++;
+      return;
+    }
+    const r=movePodSession(sess.id, target); // sess.podId is null right now, so this always runs the full reassignment, never the no-op early-return
+    if(r.ok){ moved++; } else {
+      sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
+      skipped++;
+      skippedDetails.push({studentName:student.name, weekday:weekday, start:sess.start, currentPod:(findPod(orig.podId)||{}).name||orig.podId, error:r.error});
+    }
   });
   return {moved:moved, skipped:skipped, pinned:pinned, alreadyBest:alreadyBest, totalUpcoming:totalUpcoming, candidateCount:candidates.length, skippedDetails:skippedDetails};
 }
@@ -1113,8 +1184,7 @@ function slotsWithoutCoverage(slots, duration, year){
   return (slots||[]).filter(function(slot){
     return !pods.some(function(pod){
       if(!podEligibleForYear(pod.id, year)) return false;
-      const cov=podCoverageBoundary(pod.id, slot.weekday, slot.start, duration, date);
-      return cov.instructorId && cov.boundary >= slot.start+duration;
+      return podCoverageDetail(pod.id, slot.weekday, slot.start, duration, date).ok;
     });
   });
 }
@@ -1532,11 +1602,12 @@ function generateRecurringSessions(student, weeksAhead){
       const pinnedPodId=studentAssignedPodOn(student.id, date); // front desk's standing Pod pin, if any (else auto-assign)
       const podId=pickBestPod(weekday, dateKey, slot.start, student.duration, student.year, pinnedPodId);
       if(!podId) return;
-      const cov=podCoverageBoundary(podId, weekday, slot.start, student.duration, date);
-      const recSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId, instructorId:cov.instructorId, date, start:slot.start, duration:student.duration, status:'scheduled', bookedBy:'staff', creditId:null, recurring:true};
+      const cov=podCoverageDetail(podId, weekday, slot.start, student.duration, date); // tolerant of a short unattended gap (UNATTENDED_TOLERANCE_MIN), same as pickBestPod just validated
+      const recSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId, instructorId:cov.primaryInstructorId, instructorId2:cov.secondaryInstructorId, handoff:cov.handoffAt, date, start:slot.start, duration:student.duration, status:'scheduled', bookedBy:'staff', creditId:null, recurring:true};
       sessions.push(recSess);
       dbWrite('pre-booking a standing session', function(){ return supabaseClient.from('sessions').insert({
         id:recSess.id, student_id:recSess.studentId, pod_id:recSess.podId, instructor_id:recSess.instructorId,
+        instructor_id_2:recSess.instructorId2, handoff_min:recSess.handoff,
         the_date:toKey(recSess.date), start_min:recSess.start, duration:recSess.duration, status:recSess.status,
         booked_by:recSess.bookedBy, credit_id:recSess.creditId, is_recurring:true
       }); });
@@ -1636,22 +1707,13 @@ function confirmBooking(){
     return;
   }
 
-  const seg1=podCoverageBoundary(pod.id, weekday, f.start, f.duration, date);
-  const totallyUnassigned = !seg1.instructorId;
-  const instr1 = seg1.instructorId? findInstructor(seg1.instructorId) : null;
-  const fullyCovered = !totallyUnassigned && seg1.boundary>=end;
-  const needsHandoff = !totallyUnassigned && !fullyCovered;
-  let seg2=null, instr2=null;
-  if(needsHandoff){
-    seg2=podCoverageBoundary(pod.id, weekday, seg1.boundary, end-seg1.boundary, date);
-    if(seg2.instructorId){ instr2=findInstructor(seg2.instructorId); }
-  }
-  // Which years an instructor is "best suited" for (5.3) is a preference, not a requirement —
-  // every instructor can actually teach any year — so it never factors into whether an override is
-  // needed. An override is only ever about actual staffing: nobody assigned at all, or a handoff
-  // that runs out before the session ends.
-  const gapAfterHandoff = needsHandoff && (!seg2.instructorId || seg2.boundary<end);
-  const needsOverride = totallyUnassigned || (needsHandoff && gapAfterHandoff);
+  // Which years an instructor is "best suited" for (5.3) is a preference, not a requirement — every
+  // instructor can actually teach any year — so it never factors into whether an override is
+  // needed. An override is only ever about actual staffing: no instructor anywhere near the window,
+  // or a real gap bigger than the tolerated 15 minutes unattended (UNATTENDED_TOLERANCE_MIN).
+  const cov=podCoverageDetail(pod.id, weekday, f.start, f.duration, date);
+  const totallyUnassigned = !cov.primaryInstructorId;
+  const needsOverride = !cov.ok; // covers both "nobody at all" and "gap bigger than the tolerance"
 
   if(needsOverride && !f.overrideOk) return; // needs explicit override checkbox
 
@@ -1662,19 +1724,17 @@ function confirmBooking(){
     return;
   }
 
-  const instructorId2 = (needsHandoff && seg2 && seg2.instructorId && !gapAfterHandoff)? seg2.instructorId : null;
-  const handoff = instructorId2? seg1.boundary : null;
-
-  const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:pod.id, instructorId: seg1.instructorId, instructorId2, handoff, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId:null};
+  const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:pod.id, instructorId: cov.primaryInstructorId, instructorId2: cov.secondaryInstructorId, handoff: cov.handoffAt, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId:null};
   sessions.push(newSess);
   dbWrite('booking a session', function(){ return supabaseClient.from('sessions').insert({
     id:newSess.id, student_id:newSess.studentId, pod_id:newSess.podId, instructor_id:newSess.instructorId,
     instructor_id_2:newSess.instructorId2, handoff_min:newSess.handoff, the_date:toKey(newSess.date),
     start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
   }); });
-  const handoffNote = instructorId2? (' with a handoff to '+findInstructor(instructorId2).name+' at '+minToLabel(handoff)) : '';
-  const withNote = seg1.instructorId? (' with '+instr1.name) : '';
-  toast(student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+'.');
+  const handoffNote = cov.secondaryInstructorId? (' with a handoff to '+findInstructor(cov.secondaryInstructorId).name+' at '+minToLabel(cov.handoffAt)) : '';
+  const withNote = cov.primaryInstructorId? (' with '+findInstructor(cov.primaryInstructorId).name) : '';
+  const gapNote = (cov.gapMinutes>0 && cov.ok)? (' ('+cov.gapMinutes+' min unattended — within the '+UNATTENDED_TOLERANCE_MIN+'-min tolerance)') : '';
+  toast(student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+gapNote+'.');
   state.booking=null;
   render();
 }
@@ -1914,8 +1974,8 @@ function openSlotsForCredit(credit){
         if(studentOverlapClash(student.id, dateKey, start, duration, null)) return;
         const podId=pickBestPod(weekday, dateKey, start, duration, student.year);
         if(podId){
-          const cov=podCoverageBoundary(podId, weekday, start, duration, date);
-          opts.push({date, start, duration, podId, instructorId:cov.instructorId});
+          const cov=podCoverageDetail(podId, weekday, start, duration, date); // tolerant of a short unattended gap, same as pickBestPod just validated
+          opts.push({date, start, duration, podId, instructorId:cov.primaryInstructorId});
         }
       });
     }
@@ -2206,9 +2266,9 @@ function pickBestPodWithClaims(weekday, dateKey, start, duration, year, claims){
     if(tierPods.length===0) continue;
     let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
     tierPods.forEach(function(podId){
-      const cov=podCoverageBoundary(podId, weekday, start, duration, date);
-      if(!cov.instructorId || cov.boundary < start+duration) return;
-      const instr=findInstructor(cov.instructorId);
+      const cov=podCoverageDetail(podId, weekday, start, duration, date);
+      if(!cov.primaryInstructorId || !cov.ok) return;
+      const instr=findInstructor(cov.primaryInstructorId);
       const cap=podCapacity(podId);
       const wouldBePeak=peakConcurrencyWithClaims(podId, dateKey, {start, duration}, claims);
       if(wouldBePeak>cap) return;
@@ -2717,7 +2777,7 @@ function renderStaff(){
         +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
         +'<button class="btn sm ghost" onclick="runReseatByAge()" title="Move already-booked students (who don\'t have a manual Pod pin) into whichever Pod best fits their age">Re-seat by age</button>'
       +'</div>');
-  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). Auto-assignment enforces a minimum year per Pod — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort. Use “Re-seat by age” above to bring already-booked students in line with this too.</p>';
+  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session (arriving a little late, wrapping up a little early, or a short gap between two shifts) still counts as covered — beyond that, it needs an explicit override to book anyway. A minimum year per Pod is enforced everywhere a Pod gets chosen — booking, auto-assignment, and moving a student — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort (a standing Pod pin is the only sanctioned exception). “Re-seat by age” takes every non-pinned upcoming student out of their Pod at once and re-seats everyone from scratch, oldest first, so an older student\'s claim on a senior Pod is never blocked by a younger student who simply hasn\'t been reprocessed yet.</p>';
   html+=renderCoverageGrid(weekDates);
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
@@ -3148,24 +3208,19 @@ function renderBookingModal(){
   const starts=possibleStarts(f.duration);
   const end=f.start!=null? f.start+f.duration : null;
 
-  let seg1=null, instr1=null, suited1=true, totallyUnassigned=false, fullyCovered=true, needsHandoff=false, seg2=null, instr2=null, suited2=true, gapAfterHandoff=false;
+  let cov=null, instr1=null, suited1=true, totallyUnassigned=false, instr2=null, suited2=true;
   if(student && f.start!=null){
-    seg1=podCoverageBoundary(pod.id, weekday, f.start, f.duration, date);
-    totallyUnassigned = !seg1.instructorId;
-    instr1 = seg1.instructorId? findInstructor(seg1.instructorId) : null;
+    cov=podCoverageDetail(pod.id, weekday, f.start, f.duration, date);
+    totallyUnassigned = !cov.primaryInstructorId;
+    instr1 = cov.primaryInstructorId? findInstructor(cov.primaryInstructorId) : null;
     suited1 = instr1? instructorSuitedFor(instr1, student.year) : true;
-    fullyCovered = !totallyUnassigned && seg1.boundary>=end;
-    needsHandoff = !totallyUnassigned && !fullyCovered;
-    if(needsHandoff){
-      seg2=podCoverageBoundary(pod.id, weekday, seg1.boundary, end-seg1.boundary, date);
-      instr2 = seg2.instructorId? findInstructor(seg2.instructorId) : null;
-      suited2 = instr2? instructorSuitedFor(instr2, student.year) : true;
-      gapAfterHandoff = !seg2.instructorId || seg2.boundary<end;
-    }
+    instr2 = cov.secondaryInstructorId? findInstructor(cov.secondaryInstructorId) : null;
+    suited2 = instr2? instructorSuitedFor(instr2, student.year) : true;
   }
   // "Best suited for" (5.3) is a preference, not a requirement — it never forces an override. An
-  // override is only ever about actual staffing: nobody assigned, or a handoff that runs out early.
-  const needsOverride = student && (totallyUnassigned || (needsHandoff && gapAfterHandoff));
+  // override is only ever about actual staffing: nobody assigned anywhere near the window, or a
+  // gap bigger than the tolerated 15 minutes unattended (UNATTENDED_TOLERANCE_MIN).
+  const needsOverride = student && cov && !cov.ok;
 
   const cap=podCapacity(pod.id);
   const wouldBePeak = (student && f.start!=null)? peakConcurrency(pod.id, b.dateKey, {start:f.start, duration:f.duration}) : 0;
@@ -3187,19 +3242,22 @@ function renderBookingModal(){
   if(student && isStudentOnHold(student.id, date)){
     html+='<div class="banner warn">⏸️ '+student.name+' is on hold for this date — booking them anyway is fine if they\'re actually coming in.</div>';
   }
-  if(student && !totallyUnassigned && needsHandoff && !gapAfterHandoff){
-    html+='<div class="banner accent">↔️ '+pod.name+' hands off partway through: '+instr1.name+' until '+minToLabel(seg1.boundary)+', then '+instr2.name+' until '+minToLabel(end)+'. This will book automatically across the handoff.</div>';
+  if(student && cov && cov.secondaryInstructorId){
+    html+='<div class="banner accent">↔️ '+pod.name+' hands off partway through: '+instr1.name+' until '+minToLabel(cov.handoffAt)+', then '+instr2.name+' until '+minToLabel(end)+'. This will book automatically across the handoff.</div>';
+  }
+  if(student && cov && cov.ok && cov.gapMinutes>0){
+    html+='<div class="banner info">ℹ️ '+cov.gapMinutes+' min of this session is unattended in '+pod.name+' — within the '+UNATTENDED_TOLERANCE_MIN+'-minute tolerance, so no override is needed.</div>';
   }
   if(student && needsOverride){
     const reason = totallyUnassigned
-      ? 'nobody is assigned to '+pod.name+' at that time'
-      : pod.name+' isn\'t staffed all the way to '+minToLabel(end)+' — it runs out at '+minToLabel(seg1.boundary);
+      ? 'nobody is assigned to '+pod.name+' anywhere near that time'
+      : pod.name+' is unattended for '+cov.gapMinutes+' min of this session — more than the '+UNATTENDED_TOLERANCE_MIN+'-minute tolerance';
     html+='<div class="banner warn">⚠️ '+reason+'. You can still book it, but confirm below — to fix this properly, adjust the Pod\'s assignment.</div>';
     html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" '+(f.overrideOk?'checked':'')+' onchange="toggleOverride()" style="width:auto;margin:0"/> Book anyway</label>';
   }
   // Purely informational, never blocking: every instructor can teach any year (5.3), so a mismatch
   // with their usual best-suited range is just a heads-up, not something that needs an override.
-  if(student && !totallyUnassigned && (!suited1 || (needsHandoff && !gapAfterHandoff && !suited2))){
+  if(student && !totallyUnassigned && (!suited1 || (instr2 && !suited2))){
     const who = !suited1? instr1.name+' ('+yearLabel(instr1.yearMin)+'–'+yearLabel(instr1.yearMax)+')' : instr2.name+' ('+yearLabel(instr2.yearMin)+'–'+yearLabel(instr2.yearMax)+')';
     html+='<div class="banner info">ℹ️ '+yearLabel(student.year)+' isn\'t '+who+'\'s usual focus, but they can teach any year — this books normally, no override needed.</div>';
   }
