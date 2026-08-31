@@ -898,6 +898,15 @@ function movePodSession(sessionId, newPodId){
   const newPod=findPod(newPodId);
   const dateKey=toKey(sess.date);
   const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
+  // Same age-floor gate as confirmBooking (5.21c) — reseatByAge() only ever passes a Pod it already
+  // validated as eligible via pickBestPod's own tier walk, so this never blocks that legitimate
+  // caller; it only stops a manual move (front desk drag, or the instructor reassign panel) from
+  // quietly landing a student below the target Pod's minimum. A standing Pod pin for that exact Pod
+  // is still the sanctioned way to make a deliberate exception.
+  const student=findStudent(sess.studentId);
+  if(student && !podEligibleForYear(newPodId, student.year) && studentAssignedPodOn(student.id, sess.date)!==newPodId){
+    return {ok:false, error:student.name+' ('+yearLabel(student.year)+') doesn\'t meet '+newPod.name+'\'s '+yearLabel(POD_MIN_YEAR[newPodId])+'+ minimum. Set a standing Pod pin first if this is a deliberate exception.'};
+  }
   const cap=podCapacity(newPodId);
   const wouldBePeak=peakConcurrency(newPodId, dateKey, {start:sess.start, duration:sess.duration});
   if(wouldBePeak>cap){
@@ -1042,6 +1051,7 @@ function reseatByAge(){
     return a.session.start-b.session.start; // then earliest time that day
   });
   let moved=0, skipped=0, alreadyBest=0;
+  const skippedDetails=[]; // who couldn't move, and why — so "still wrong after re-seating" is diagnosable by name, not just a count
   candidates.forEach(function(c){
     const sess=c.session, student=c.student, dateKey=c.dateKey, year=student.year;
     const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
@@ -1071,12 +1081,20 @@ function reseatByAge(){
       });
       if(best) target=best; // a real option exists in the most senior eligible tier available — stop here
     }
-    if(!target){ skipped++; return; } // no Pod this student is even eligible for has coverage/room right now
+    if(!target){
+      // No Pod this student is even eligible for has coverage/room at this exact day+time — most
+      // often because the only staffed option that day/time is a senior-only Pod (e.g. Singles late
+      // in the evening). Moving them requires either rescheduling this session to a time an eligible
+      // Pod is actually covered, or getting coverage assigned to an eligible Pod for this slot.
+      skipped++;
+      skippedDetails.push({studentName:student.name, weekday:weekday, start:sess.start, currentPod:(findPod(sess.podId)||{}).name||sess.podId});
+      return;
+    }
     if(target===sess.podId){ alreadyBest++; return; } // already the best-available option — nothing to do
     const r=movePodSession(sess.id, target);
-    if(r.ok) moved++; else skipped++;
+    if(r.ok){ moved++; } else { skipped++; skippedDetails.push({studentName:student.name, weekday:weekday, start:sess.start, currentPod:(findPod(sess.podId)||{}).name||sess.podId, error:r.error}); }
   });
-  return {moved:moved, skipped:skipped, pinned:pinned, alreadyBest:alreadyBest, totalUpcoming:totalUpcoming, candidateCount:candidates.length};
+  return {moved:moved, skipped:skipped, pinned:pinned, alreadyBest:alreadyBest, totalUpcoming:totalUpcoming, candidateCount:candidates.length, skippedDetails:skippedDetails};
 }
 
 // Diagnostic used right after enrolling a student or saving their regular schedule (5.10): a
@@ -1602,6 +1620,16 @@ function confirmBooking(){
   const pod=findPod(b.podId);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
   const end=f.start+f.duration;
+
+  // The age-floor rule (5.21c) is a hard gate for auto-assignment (pickBestPod/reseatByAge), but a
+  // manual booking never went through either of those — closing that gap here too, so a student
+  // can't quietly end up below a Pod's minimum just because staff picked the Pod directly. A
+  // standing Pod pin for this exact Pod is the sanctioned way to make a deliberate exception (e.g.
+  // keeping siblings together) — set one first via "Assign to Pod" if that's what this is.
+  if(!podEligibleForYear(pod.id, student.year) && studentAssignedPodOn(student.id, date)!==pod.id){
+    toast('Blocked — '+student.name+' ('+yearLabel(student.year)+') doesn\'t meet '+pod.name+'\'s '+yearLabel(POD_MIN_YEAR[pod.id])+'+ minimum. If this is a deliberate exception, set a standing Pod pin for '+student.name+' first (front desk → Assign to Pod).');
+    return;
+  }
 
   if(studentOverlapClash(student.id, dateKey, f.start, f.duration, null)){
     toast('Blocked — '+student.name+' already has an overlapping session that day.');
@@ -3096,9 +3124,16 @@ function runReseatByAge(){
   } else {
     msg+=result.pinned+' pinned (skipped), '+result.alreadyBest+' already in their best-fitting Pod, '
       +result.moved+' moved to a better Pod'
-      +(result.skipped>0? ', '+result.skipped+' couldn\'t move (Pod full or no coverage there that day)':'')+'.';
+      +(result.skipped>0? ', '+result.skipped+' couldn\'t move (no eligible Pod is staffed for them at that exact day/time)':'')+'.';
+    if(result.skippedDetails && result.skippedDetails.length){
+      const shown=result.skippedDetails.slice(0,5).map(function(d){
+        return d.studentName+' ('+d.weekday+' '+minToLabel(d.start)+', still in '+d.currentPod+')';
+      }).join('; ');
+      const more=result.skippedDetails.length>5? ' +'+(result.skippedDetails.length-5)+' more':'';
+      msg+=' Couldn\'t move: '+shown+more+'. Reschedule them to a time an eligible Pod is covered, or add coverage there.';
+    }
   }
-  toast(msg, 9000);
+  toast(msg, 12000);
   render();
 }
 function selectDay(k){ state.selectedDayKey=k; render(); }
