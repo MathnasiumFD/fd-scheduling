@@ -1148,7 +1148,7 @@ function reseatByAge(){
       // Restore them exactly as they were — can't leave a session with no Pod at all.
       sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
       skipped++;
-      skippedDetails.push({studentName:student.name, weekday:weekday, start:sess.start, currentPod:(findPod(orig.podId)||{}).name||orig.podId});
+      skippedDetails.push({studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||orig.podId});
       return;
     }
     if(target===orig.podId){
@@ -1162,10 +1162,29 @@ function reseatByAge(){
     if(r.ok){ moved++; } else {
       sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
       skipped++;
-      skippedDetails.push({studentName:student.name, weekday:weekday, start:sess.start, currentPod:(findPod(orig.podId)||{}).name||orig.podId, error:r.error});
+      skippedDetails.push({studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||orig.podId, error:r.error});
     }
   });
   return {moved:moved, skipped:skipped, pinned:pinned, alreadyBest:alreadyBest, totalUpcoming:totalUpcoming, candidateCount:candidates.length, skippedDetails:skippedDetails};
+}
+
+// Groups reseatByAge()'s skippedDetails by exact weekday+time, so a large number of stuck students
+// (easily hundreds at a centre where Pods aren't yet staffed with age tiers in mind) reads as a
+// short, actionable list of WHICH slots need an age-appropriate instructor added, instead of an
+// unusable wall of names. Sorted by how many students are stuck there, worst first — fixing the
+// coverage gap at the top slot or two usually clears the bulk of the backlog.
+function summarizeReseatGaps(skippedDetails){
+  const groups={};
+  (skippedDetails||[]).forEach(function(d){
+    const key=d.weekday+'|'+d.start+'|'+d.duration;
+    if(!groups[key]) groups[key]={weekday:d.weekday, start:d.start, duration:d.duration, count:0, minYear:d.year, maxYear:d.year, currentPods:{}};
+    const g=groups[key];
+    g.count++;
+    if(d.year<g.minYear) g.minYear=d.year;
+    if(d.year>g.maxYear) g.maxYear=d.year;
+    g.currentPods[d.currentPod]=(g.currentPods[d.currentPod]||0)+1;
+  });
+  return Object.keys(groups).map(function(k){ return groups[k]; }).sort(function(a,b){ return b.count-a.count; });
 }
 
 // Diagnostic used right after enrolling a student or saving their regular schedule (5.10): a
@@ -2776,6 +2795,7 @@ function renderStaff(){
         +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
         +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
         +'<button class="btn sm ghost" onclick="runReseatByAge()" title="Move already-booked students (who don\'t have a manual Pod pin) into whichever Pod best fits their age">Re-seat by age</button>'
+        +(state.reseatGapReport && state.reseatGapReport.length? '<button class="btn sm ghost" onclick="openReseatGapReport()" title="See which day/time slots account for the students Re-seat by age couldn\'t move">View gap report ('+state.reseatGapReport.reduce(function(sum,g){ return sum+g.count; },0)+')</button>':'')
       +'</div>');
   html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session (arriving a little late, wrapping up a little early, or a short gap between two shifts) still counts as covered — beyond that, it needs an explicit override to book anyway. A minimum year per Pod is enforced everywhere a Pod gets chosen — booking, auto-assignment, and moving a student — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort (a standing Pod pin is the only sanctioned exception). “Re-seat by age” takes every non-pinned upcoming student out of their Pod at once and re-seats everyone from scratch, oldest first, so an older student\'s claim on a senior Pod is never blocked by a younger student who simply hasn\'t been reprocessed yet.</p>';
   html+=renderCoverageGrid(weekDates);
@@ -2834,6 +2854,7 @@ function renderStaff(){
                    // that missing tag was making "Schedule" swallow everything after it.
 
   html+=renderBookingModal();
+  html+=renderReseatGapModal();
   html+=renderPodAssignModal();
   html+=renderCheckInModal();
   html+=renderMoveModal();
@@ -3185,16 +3206,49 @@ function runReseatByAge(){
     msg+=result.pinned+' pinned (skipped), '+result.alreadyBest+' already in their best-fitting Pod, '
       +result.moved+' moved to a better Pod'
       +(result.skipped>0? ', '+result.skipped+' couldn\'t move (no eligible Pod is staffed for them at that exact day/time)':'')+'.';
+    // At small counts, naming names inline is the fastest path to fixing it. At real scale — a
+    // centre whose Pod staffing doesn't cover the age tiers yet can easily see hundreds of
+    // skips — a flat name list is unreadable, so past a threshold we point at the grouped
+    // day/time report (state.reseatGapReport) instead, which is what actually tells you where to
+    // add coverage.
     if(result.skippedDetails && result.skippedDetails.length){
-      const shown=result.skippedDetails.slice(0,5).map(function(d){
-        return d.studentName+' ('+d.weekday+' '+minToLabel(d.start)+', still in '+d.currentPod+')';
-      }).join('; ');
-      const more=result.skippedDetails.length>5? ' +'+(result.skippedDetails.length-5)+' more':'';
-      msg+=' Couldn\'t move: '+shown+more+'. Reschedule them to a time an eligible Pod is covered, or add coverage there.';
+      state.reseatGapReport=summarizeReseatGaps(result.skippedDetails);
+      if(result.skippedDetails.length<=8){
+        const shown=result.skippedDetails.map(function(d){
+          return d.studentName+' ('+d.weekday+' '+minToLabel(d.start)+', still in '+d.currentPod+')';
+        }).join('; ');
+        msg+=' Couldn\'t move: '+shown+'. Reschedule them to a time an eligible Pod is covered, or add coverage there.';
+      } else {
+        msg+=' '+result.skipped+' couldn\'t move — click "View gap report" below to see exactly which day/time slots need coverage added.';
+      }
+    } else {
+      state.reseatGapReport=null;
     }
   }
   toast(msg, 12000);
   render();
+}
+function openReseatGapReport(){ if(state.reseatGapReport) { state.reseatGapReportOpen=true; render(); } }
+function closeReseatGapReport(){ state.reseatGapReportOpen=false; render(); }
+function renderReseatGapModal(){
+  if(!state.reseatGapReportOpen || !state.reseatGapReport) return '';
+  const groups=state.reseatGapReport;
+  const totalStuck=groups.reduce(function(sum,g){ return sum+g.count; },0);
+  let html='<div class="overlay" onclick="if(event.target===this) closeReseatGapReport()"><div class="modal" style="max-width:640px">';
+  html+='<h3>Where the coverage gaps are</h3>';
+  html+='<p>'+totalStuck+' upcoming session(s) across '+groups.length+' day/time slot(s) have no eligible, age-appropriate Pod staffed. Sorted by how many students are stuck there — adding coverage at the top slot(s) usually clears most of the backlog.</p>';
+  html+='<div style="max-height:60vh;overflow-y:auto"><table><tr><th>Day</th><th>Time</th><th>Stuck</th><th>Year range</th><th>Currently sitting in</th></tr>';
+  groups.forEach(function(g){
+    const yearRange=g.minYear===g.maxYear? ('Year '+g.minYear) : ('Year '+g.minYear+'–'+g.maxYear);
+    const podList=Object.keys(g.currentPods).map(function(p){ return p+' ('+g.currentPods[p]+')'; }).join(', ');
+    html+='<tr><td>'+g.weekday+'</td><td>'+rangeLabel(g.start,g.duration)+'</td><td>'+g.count+'</td><td>'+yearRange+'</td><td>'+podList+'</td></tr>';
+  });
+  html+='</table></div>';
+  html+='<div style="display:flex;justify-content:flex-end;margin-top:12px">'
+    +'<button class="btn primary" onclick="closeReseatGapReport()">Close</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
 }
 function selectDay(k){ state.selectedDayKey=k; render(); }
 
