@@ -1011,17 +1011,18 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
 // (studentAssignedPodOn) is left completely alone — that's a deliberate placement (e.g. keeping
 // siblings together), and this age rule is a scheduling convenience, never a reason to override it.
 //
-// Grouped by the exact date + start + duration (not just the weekday pattern), so each individual
-// day's real instructor coverage, holds, and capacity are respected — this almost always lands on
-// the same Pod week to week when nothing date-specific is going on, but won't force a move that
-// isn't actually possible on some particular day. Within one date's slot, students are placed
-// oldest-first down the same seniority-order fallback chain pickBestPod uses, so seats fill up
-// (efficiently) before spilling to the next Pod in the chain, and a student who already turns out
-// to be in the best-available Pod is left untouched (nothing to move).
+// Every eligible session across the whole roster is processed in ONE global order — oldest
+// student first, then earliest date/time — exactly like front desk would work through it by hand,
+// rather than picking an arbitrary day/time to sort out first. Each session's own real coverage
+// and capacity (for its own exact date/start/duration) still governs whether a move is actually
+// possible, so this never overbooks a Pod or ignores date-specific coverage gaps — it only changes
+// the ORDER decisions get made in, so the oldest kids get first claim on the senior Pods across
+// the whole schedule, and a student who already turns out to be in the best-available Pod for
+// their slot is left untouched (nothing to move).
 function reseatByAge(){
   const now=simNow();
   const nowKey=toKey(now);
-  const bySlot={}; // 'dateKey|start|duration' -> [{student, session}]
+  const candidates=[];
   sessions.forEach(function(s){
     if(s.status!=='scheduled') return;
     const dateKey=toKey(s.date);
@@ -1029,30 +1030,29 @@ function reseatByAge(){
     const student=findStudent(s.studentId);
     if(!student) return;
     if(studentAssignedPodOn(student.id, s.date)) return; // explicit pin — front desk's call, not ours
-    const key=dateKey+'|'+s.start+'|'+s.duration;
-    (bySlot[key]=bySlot[key]||[]).push({student:student, session:s});
+    candidates.push({student:student, session:s, dateKey:dateKey});
+  });
+  candidates.sort(function(a,b){
+    if(b.student.year!==a.student.year) return b.student.year-a.student.year; // oldest first
+    if(a.dateKey!==b.dateKey) return a.dateKey<b.dateKey? -1 : 1; // then earliest date
+    return a.session.start-b.session.start; // then earliest time that day
   });
   let moved=0, skipped=0;
-  Object.keys(bySlot).forEach(function(key){
-    const parts=key.split('|');
-    const dateKey=parts[0], start=Number(parts[1]), duration=Number(parts[2]);
-    const date=new Date(dateKey);
-    const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
-    const members=bySlot[key].slice().sort(function(a,b){ return b.student.year-a.student.year; }); // oldest first
-    members.forEach(function(m){
-      const ranked=POD_SENIORITY_ORDER.slice().sort(function(a,b){ return podAgeBandDistance(a,m.student.year)-podAgeBandDistance(b,m.student.year); });
-      let target=null;
-      ranked.some(function(podId){
-        if(podId===m.session.podId){ target=podId; return true; } // already validly seated here — stop looking
-        const cov=podCoverageBoundary(podId, weekday, start, duration, date);
-        if(!cov.instructorId || cov.boundary<start+duration) return false;
-        if(peakConcurrency(podId, dateKey, {start:start, duration:duration})>podCapacity(podId)) return false;
-        target=podId; return true;
-      });
-      if(!target || target===m.session.podId) return; // no better (or no available) Pod for this one
-      const r=movePodSession(m.session.id, target);
-      if(r.ok) moved++; else skipped++;
+  candidates.forEach(function(c){
+    const sess=c.session, student=c.student, dateKey=c.dateKey;
+    const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
+    const ranked=POD_SENIORITY_ORDER.slice().sort(function(a,b){ return podAgeBandDistance(a,student.year)-podAgeBandDistance(b,student.year); });
+    let target=null;
+    ranked.some(function(podId){
+      if(podId===sess.podId){ target=podId; return true; } // already validly seated here — stop looking
+      const cov=podCoverageBoundary(podId, weekday, sess.start, sess.duration, sess.date);
+      if(!cov.instructorId || cov.boundary<sess.start+sess.duration) return false;
+      if(peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration})>podCapacity(podId)) return false;
+      target=podId; return true;
     });
+    if(!target || target===sess.podId) return; // no better (or no available) Pod for this one
+    const r=movePodSession(sess.id, target);
+    if(r.ok) moved++; else skipped++;
   });
   return {moved:moved, skipped:skipped};
 }
