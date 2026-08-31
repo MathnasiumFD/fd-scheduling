@@ -2505,6 +2505,33 @@ function podCoverageSummary(podId, weekday, date){
   }).join(' → ');
 }
 
+// At-a-glance "who's covering what" — every Pod down the side, Mon-Fri across the top, for
+// whichever week the Schedule tab is currently showing (This week / Next week toggle). Reuses the
+// exact same podCoverageSummary() the day-by-day pod cards below already show one pod/day at a
+// time, just laid out so the whole week's coverage (or any gaps in it) is visible without clicking
+// through every day. A cell with no instructor assigned at all is called out in red, since that's
+// exactly the situation that leaves a regular-schedule slot unable to pre-book (see 5.10 fix).
+function renderCoverageGrid(weekDates){
+  let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Pod</th>'
+    + weekDates.map(function(d){
+        const wd=WEEKDAY_KEYS[(d.getDay()+6)%7];
+        return '<th>'+wd+'<br><span class="small muted" style="font-weight:400">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></th>';
+      }).join('')
+    + '</tr>';
+  pods.forEach(function(pod){
+    html+='<tr><td><b>'+pod.name+'</b></td>';
+    weekDates.forEach(function(d){
+      const wd=WEEKDAY_KEYS[(d.getDay()+6)%7];
+      const summary=podCoverageSummary(pod.id, wd, d);
+      const gap=summary==='Unassigned' || summary.indexOf('Unassigned')>=0;
+      html+='<td'+(gap?' style="color:var(--danger)"':'')+'>'+summary+'</td>';
+    });
+    html+='</tr>';
+  });
+  html+='</table></div>';
+  return html;
+}
+
 // Collapse state for front-desk sections lives on `state` (so it survives the full-page
 // re-render every action triggers) but isn't persisted anywhere beyond the current browser tab —
 // each section just remembers whether it's open or closed for the rest of this visit.
@@ -2550,6 +2577,7 @@ function renderStaff(){
         +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
       +'</div>');
   html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below).</p>';
+  html+=renderCoverageGrid(weekDates);
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
     return '<button class="daybtn'+(k===dayKey?' active':'')+'" onclick="selectDay(\''+k+'\')">'+WEEKDAY_KEYS[(d.getDay()+6)%7]+'<span class="d2">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
