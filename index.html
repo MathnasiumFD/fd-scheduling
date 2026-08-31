@@ -824,9 +824,10 @@ function peakInWindow(podId, dateKey, winStart, winEnd){
 // year — used to prefer grouping same-year students together when the system auto-assigns a Pod.
 function sameYearCount(podId, dateKey, start, duration, year){
   return sessions.filter(function(s){
-    return s.podId===podId && toKey(s.date)===dateKey && s.status!=='cancelled'
-      && s.start<start+duration && start<s.start+s.duration
-      && findStudent(s.studentId).year===year;
+    if(s.podId!==podId || toKey(s.date)!==dateKey || s.status==='cancelled') return false;
+    if(!(s.start<start+duration && start<s.start+s.duration)) return false;
+    const st=findStudent(s.studentId);
+    return !!st && st.year===year; // a session whose student no longer exists just doesn't count
   }).length;
 }
 
@@ -934,47 +935,40 @@ function possibleStarts(duration){
 // or auto-assignment gets blocked.
 function instructorSuitedFor(instr, year){ return year>=instr.yearMin && year<=instr.yearMax; }
 
-// Age-based Pod seating (5.21): the main factor auto-assignment now ranks on. Oldest students are
-// grouped toward Singles and the high-numbered Pods; youngest toward the low-numbered ones. Fixed
-// seniority order, most-senior (oldest-targeted) first — this doubles as the fallback chain when
-// the ideal Pod for a student's age has no coverage or room: a Year 11/12 who can't fit in Singles
-// tries Pod 6 next, then Pod 5, and so on, exactly as requested.
-var POD_SENIORITY_ORDER=['podS','pod6','pod5','pod4','pod3','pod2','pod1'];
-function podSeniorityIndex(podId){
-  const i=POD_SENIORITY_ORDER.indexOf(podId);
-  return i<0? POD_SENIORITY_ORDER.length-1 : i; // an unrecognised id falls back to "most junior"
+// Age-based Pod seating (5.21/5.21c): the main, HARD factor auto-assignment now ranks on, using
+// the centre's real per-Pod minimum-year policy rather than a soft preference. Each Pod has its
+// own minimum school year — a Pod can NEVER take a student below its minimum, full stop, no
+// fallback exception. Pod 4 and Pod 5 share the same minimum (Year 5+) and are genuinely
+// interchangeable parallel options at that tier, same for Pod 1 and Pod 2 (Pre-K+).
+var POD_MIN_YEAR={ podS:9, pod6:7, pod5:5, pod4:5, pod3:3, pod2:-1, pod1:-1 };
+function podEligibleForYear(podId, year){
+  const floor=POD_MIN_YEAR.hasOwnProperty(podId)? POD_MIN_YEAR[podId] : -1;
+  return Number(year) >= floor;
 }
-// Splits the full Pre-K(-1)-to-Year-12 range (YEARS, 14 possible values) evenly across the 7 Pods
-// in POD_SENIORITY_ORDER — 2 school years per Pod: Singles=Year 11-12, Pod 6=Year 9-10, Pod 5=Year
-// 7-8, Pod 4=Year 5-6, Pod 3=Year 3-4, Pod 2=Year 1-2, Pod 1=Pre-K/K. A fixed mapping (not based on
-// who's currently enrolled) so it stays predictable and explainable regardless of the current mix
-// of ages on the roster. Returns the matching seniority-order index.
-function targetSeniorityIndexForYear(year){
-  const yearIdx=Math.max(0, YEARS.indexOf(Number(year)));
-  const reversed=(YEARS.length-1)-yearIdx; // 0 for the oldest possible year, largest for the youngest
-  const perBand=YEARS.length/POD_SENIORITY_ORDER.length; // 2
-  return Math.min(POD_SENIORITY_ORDER.length-1, Math.floor(reversed/perBand));
-}
-// How far a Pod's fixed age band sits from where a student of this year "should" ideally be
-// (0 = perfect match) — pickBestPod's primary ranking factor (5.21).
-function podAgeBandDistance(podId, year){
-  return Math.abs(podSeniorityIndex(podId) - targetSeniorityIndexForYear(year));
-}
+// Tiers, most-senior first — this IS the fallback/preference order: a Year 9-12 student's first
+// choice is Singles; if that's not staffed or full, Pod 6 next; then Pod 5/Pod 4 (tied, whichever
+// is the better fit on the tie-breakers below); then Pod 3; then Pod 2/Pod 1. A younger student
+// simply doesn't qualify for the senior tiers at all (podEligibleForYear), so they never reach
+// them regardless of staffing — there's no "last resort" exception that seats a young child with
+// much older kids just because nothing else was open that day.
+var POD_TIERS=[['podS'],['pod6'],['pod5','pod4'],['pod3'],['pod2','pod1']];
 
 // Auto-assignment used wherever the system (not staff directly) needs to pick a Pod: parent
 // make-up booking and standing-schedule pre-booking. The Pod's assigned instructor for the full
 // window (a single instructor — auto-assignment never arranges a handoff; that's a staff judgment
-// call, see 5.1/5.8) must actually be staffed there, and the Pod must have room — that's the only
-// hard requirement. Among the options that pass, the MAIN factor is age (5.21): prefer whichever
-// eligible Pod's fixed age band is the closest match for this student's year. Only when two Pods
-// are equally good a fit on age do the older preferences break the tie — a Pod whose instructor is
-// best suited for the student's year (5.3), then whichever already has more same-year students in
-// that window — and if it's still tied after that, prefer whichever Pod is already fuller, so
-// Pods fill up one at a time instead of everyone getting spread thin across all seven.
+// call, see 5.1/5.8) must actually be staffed there, the Pod must have room, and the student must
+// meet that Pod's minimum year (5.21c) — those are the only hard requirements, and the age one is
+// never relaxed as a fallback. Tiers are tried most-senior first (POD_TIERS); the first tier with
+// a real, available option wins — there's no reason to keep checking a less senior tier once a
+// good one is found. Within a tier that has more than one Pod (Pod 4/5, Pod 1/2), a Pod whose
+// instructor is best suited for the student's year (5.3) is preferred, then whichever already has
+// more same-year students in that window, then whichever is already fuller — so Pods fill up one
+// at a time instead of everyone getting spread thin.
 // Picks an available, under-capacity Pod for a standing/auto-generated session. If `preferredPodId`
 // is given (a student's pinned standing Pod — see studentAssignedPodOn()), only that Pod is
-// considered — feasible-or-not, there's no falling back to a different Pod behind the family's
-// back; infeasible just means this occurrence is skipped, same as any other gap (5.8).
+// considered, with NO minimum-year check at all — a pin is front desk's own explicit call, feasible-
+// or-not there's no falling back to a different Pod behind the family's back; infeasible just means
+// this occurrence is skipped, same as any other gap (5.8).
 function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
   const date=new Date(dateKey);
   if(preferredPodId){
@@ -987,22 +981,26 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
     if(wouldBePeak>cap) return null;
     return pod.id;
   }
-  let best=null, bestBandDist=Infinity, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
-  pods.forEach(function(pod){
-    const cov=podCoverageBoundary(pod.id, weekday, start, duration, date);
-    if(!cov.instructorId || cov.boundary < start+duration) return; // needs full single-instructor coverage
-    const instr=findInstructor(cov.instructorId);
-    const cap=podCapacity(pod.id);
-    const wouldBePeak=peakConcurrency(pod.id, dateKey, {start, duration});
-    if(wouldBePeak>cap) return;
-    const bandDist=podAgeBandDistance(pod.id, year);
-    const suited=instructorSuitedFor(instr, year)? 1 : 0;
-    const sameYear=sameYearCount(pod.id, dateKey, start, duration, year);
-    if(bandDist<bestBandDist || (bandDist===bestBandDist && (suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))))){
-      best=pod.id; bestBandDist=bandDist; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
-    }
-  });
-  return best;
+  for(let t=0; t<POD_TIERS.length; t++){
+    const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
+    if(tierPods.length===0) continue; // student doesn't meet this tier's minimum at all
+    let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
+    tierPods.forEach(function(podId){
+      const cov=podCoverageBoundary(podId, weekday, start, duration, date);
+      if(!cov.instructorId || cov.boundary < start+duration) return; // needs full single-instructor coverage
+      const instr=findInstructor(cov.instructorId);
+      const cap=podCapacity(podId);
+      const wouldBePeak=peakConcurrency(podId, dateKey, {start, duration});
+      if(wouldBePeak>cap) return;
+      const suited=instructorSuitedFor(instr, year)? 1 : 0;
+      const sameYear=sameYearCount(podId, dateKey, start, duration, year);
+      if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))){
+        best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
+      }
+    });
+    if(best) return best; // a real option exists in the most senior eligible tier available — done
+  }
+  return null;
 }
 
 // One-time batch fix-up for existing bookings (5.21): moves students who don't have an explicit
@@ -1045,19 +1043,36 @@ function reseatByAge(){
   });
   let moved=0, skipped=0, alreadyBest=0;
   candidates.forEach(function(c){
-    const sess=c.session, student=c.student, dateKey=c.dateKey;
+    const sess=c.session, student=c.student, dateKey=c.dateKey, year=student.year;
     const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
-    const ranked=POD_SENIORITY_ORDER.slice().sort(function(a,b){ return podAgeBandDistance(a,student.year)-podAgeBandDistance(b,student.year); });
     let target=null;
-    ranked.some(function(podId){
-      if(podId===sess.podId){ target=podId; return true; } // already validly seated here — stop looking
-      const cov=podCoverageBoundary(podId, weekday, sess.start, sess.duration, sess.date);
-      if(!cov.instructorId || cov.boundary<sess.start+sess.duration) return false;
-      if(peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration})>podCapacity(podId)) return false;
-      target=podId; return true;
-    });
-    if(!target){ skipped++; return; } // every Pod at this exact slot is either uncovered or full
-    if(target===sess.podId){ alreadyBest++; return; } // no better Pod exists for this one
+    // Same tiers, same eligibility, same tie-breaks as pickBestPod — walked here directly rather
+    // than calling pickBestPod itself, because checking "is there room" for the Pod this student
+    // is ALREADY sitting in must use their REAL current occupancy (they're already legitimately
+    // counted in it), not add a second, phantom seat on top of the one they already occupy.
+    for(let t=0; t<POD_TIERS.length && !target; t++){
+      const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
+      if(tierPods.length===0) continue; // this student doesn't meet this tier's minimum year at all
+      let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
+      tierPods.forEach(function(podId){
+        const cov=podCoverageBoundary(podId, weekday, sess.start, sess.duration, sess.date);
+        if(!cov.instructorId || cov.boundary<sess.start+sess.duration) return;
+        const alreadyHere=(podId===sess.podId);
+        const peak=alreadyHere
+          ? peakConcurrency(podId, dateKey, null)
+          : peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration});
+        if(peak>podCapacity(podId)) return;
+        const instr=findInstructor(cov.instructorId);
+        const suited=instructorSuitedFor(instr, year)? 1 : 0;
+        const sameYear=sameYearCount(podId, dateKey, sess.start, sess.duration, year);
+        if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && peak>bestOccupancy)))){
+          best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=peak;
+        }
+      });
+      if(best) target=best; // a real option exists in the most senior eligible tier available — stop here
+    }
+    if(!target){ skipped++; return; } // no Pod this student is even eligible for has coverage/room right now
+    if(target===sess.podId){ alreadyBest++; return; } // already the best-available option — nothing to do
     const r=movePodSession(sess.id, target);
     if(r.ok) moved++; else skipped++;
   });
@@ -1069,13 +1084,17 @@ function reseatByAge(){
 // Pod has an instructor covering it yet (pickBestPod above returns null and generateRecurringSessions
 // silently skips that occurrence — by design, same as any other gap, but with zero feedback to
 // whoever just set the schedule). This checks each selected slot against every Pod's CURRENT
-// coverage (today's roster — a reasonable proxy for a weekly-recurring pattern) and returns the
-// slots where nobody is assigned anywhere, so the toast can name them and point to the fix
-// (Schedule tab -> Assign) instead of silently pre-booking 0 sessions.
-function slotsWithoutCoverage(slots, duration){
+// coverage (today's roster — a reasonable proxy for a weekly-recurring pattern), applying the same
+// minimum-year eligibility pickBestPod itself now enforces (5.21c) — a Pod that's staffed but below
+// this student's required minimum doesn't count as "covered" here either, since pickBestPod would
+// never actually use it. Returns the slots where nothing this student actually qualifies for is
+// assigned anywhere, so the toast can name them and point to the fix (Schedule tab -> Assign)
+// instead of silently pre-booking 0 sessions.
+function slotsWithoutCoverage(slots, duration, year){
   const date=simNow();
   return (slots||[]).filter(function(slot){
     return !pods.some(function(pod){
+      if(!podEligibleForYear(pod.id, year)) return false;
       const cov=podCoverageBoundary(pod.id, slot.weekday, slot.start, duration, date);
       return cov.instructorId && cov.boundary >= slot.start+duration;
     });
@@ -2147,30 +2166,33 @@ function peakConcurrencyWithClaims(podId, dateKey, extra, claims){
   events.forEach(function(e){ cur+=e[1]; if(cur>peak) peak=cur; });
   return peak;
 }
-// Same auto-pick logic as pickBestPod's no-preferred-Pod branch (5.8) — full single-instructor
-// coverage, under capacity, preferring an instructor best suited for the year (5.3, never a hard
-// requirement) — but capacity also counts any seats already virtually claimed by earlier waitlist
-// entries in this pass. Kept as its own function rather than changing pickBestPod itself, since
-// pickBestPod is relied on elsewhere (standing generation, 5.8) and has no reason to know about
-// the waitlist.
+// Same minimum-year-eligibility, tier-first logic as pickBestPod (5.21c) — kept as a separate
+// function only because it also has to account for other waitlist entries ahead of this one in
+// the queue that would already claim a seat (`claims`, via peakConcurrencyWithClaims) before this
+// entry ever gets to see it. Kept in sync with pickBestPod deliberately; if that ranking changes
+// again, this needs the same change.
 function pickBestPodWithClaims(weekday, dateKey, start, duration, year, claims){
   const date=new Date(dateKey);
-  let best=null, bestSuited=-1, bestSameYear=-1, bestRoom=-1;
-  pods.forEach(function(pod){
-    const cov=podCoverageBoundary(pod.id, weekday, start, duration, date);
-    if(!cov.instructorId || cov.boundary < start+duration) return;
-    const instr=findInstructor(cov.instructorId);
-    const cap=podCapacity(pod.id);
-    const wouldBePeak=peakConcurrencyWithClaims(pod.id, dateKey, {start, duration}, claims);
-    if(wouldBePeak>cap) return;
-    const room=cap-wouldBePeak;
-    const suited=instructorSuitedFor(instr, year)? 1 : 0;
-    const sameYear=sameYearCount(pod.id, dateKey, start, duration, year);
-    if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && room>bestRoom)))){
-      best=pod.id; bestSuited=suited; bestSameYear=sameYear; bestRoom=room;
-    }
-  });
-  return best;
+  for(let t=0; t<POD_TIERS.length; t++){
+    const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
+    if(tierPods.length===0) continue;
+    let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
+    tierPods.forEach(function(podId){
+      const cov=podCoverageBoundary(podId, weekday, start, duration, date);
+      if(!cov.instructorId || cov.boundary < start+duration) return;
+      const instr=findInstructor(cov.instructorId);
+      const cap=podCapacity(podId);
+      const wouldBePeak=peakConcurrencyWithClaims(podId, dateKey, {start, duration}, claims);
+      if(wouldBePeak>cap) return;
+      const suited=instructorSuitedFor(instr, year)? 1 : 0;
+      const sameYear=sameYearCount(podId, dateKey, start, duration, year);
+      if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))){
+        best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
+      }
+    });
+    if(best) return best;
+  }
+  return null;
 }
 // First-in-first-served (5.17): every waiting entry strictly older (by dateAdded) than this one
 // gets to "claim" its seat first. Walks the queue oldest-first, and for each entry ahead of this
@@ -2344,9 +2366,9 @@ function saveNewStudent(){
   const parent=parents.find(function(p){ return p.id===parentId; });
   parent.studentIds.push(newStudent.id);
   const made=generateRecurringSessions(newStudent, HORIZON_WEEKS);
-  const uncovered=slotsWithoutCoverage(newStudent.recurring, newStudent.duration);
+  const uncovered=slotsWithoutCoverage(newStudent.recurring, newStudent.duration, newStudent.year);
   if(uncovered.length){
-    toast(newStudent.name+' enrolled, but no instructor is currently assigned to any Pod for '+describeUncoveredSlots(uncovered)+' — 0 session(s) could be pre-booked for that time yet. Assign coverage on the Schedule tab, then reopen '+newStudent.name+'\'s regular schedule and save it again.', 9000);
+    toast(newStudent.name+' enrolled, but no Pod '+newStudent.name+' qualifies for (by age) is currently staffed for '+describeUncoveredSlots(uncovered)+' — 0 session(s) could be pre-booked for that time yet. Assign coverage on the Schedule tab, then reopen '+newStudent.name+'\'s regular schedule and save it again.', 9000);
   } else {
     toast(newStudent.name+' enrolled — '+f.sessionsPerWeek+'x/week, '+f.duration+' min, with '+parent.name+'. '+made+' standing session(s) pre-booked.');
   }
@@ -2427,9 +2449,9 @@ function saveRecurringForm(){
   const student=findStudent(f.studentId);
   student.recurring = f.slots.map(function(s){ return {weekday:s.weekday, start:s.start}; });
   const made=generateRecurringSessions(student, HORIZON_WEEKS);
-  const uncovered=slotsWithoutCoverage(student.recurring, student.duration);
+  const uncovered=slotsWithoutCoverage(student.recurring, student.duration, student.year);
   if(uncovered.length){
-    toast(student.name+'’s regular schedule saved, but no instructor is currently assigned to any Pod for '+describeUncoveredSlots(uncovered)+' — those session(s) couldn\'t be pre-booked yet. Assign coverage on the Schedule tab, then reopen this schedule and save it again.', 9000);
+    toast(student.name+'’s regular schedule saved, but no Pod '+student.name+' qualifies for (by age) is currently staffed for '+describeUncoveredSlots(uncovered)+' — those session(s) couldn\'t be pre-booked yet. Assign coverage on the Schedule tab, then reopen this schedule and save it again.', 9000);
   } else {
     toast(student.name+'’s regular schedule saved — '+made+' upcoming session(s) pre-booked.');
   }
@@ -2667,7 +2689,7 @@ function renderStaff(){
         +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
         +'<button class="btn sm ghost" onclick="runReseatByAge()" title="Move already-booked students (who don\'t have a manual Pod pin) into whichever Pod best fits their age">Re-seat by age</button>'
       +'</div>');
-  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). Auto-assignment seats students mostly by age — oldest toward Singles and Pod 6, youngest toward Pod 1 — while still filling each Pod efficiently; use “Re-seat by age” above to bring already-booked students in line with this too.</p>';
+  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). Auto-assignment enforces a minimum year per Pod — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort. Use “Re-seat by age” above to bring already-booked students in line with this too.</p>';
   html+=renderCoverageGrid(weekDates);
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
