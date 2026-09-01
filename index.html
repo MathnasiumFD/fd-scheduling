@@ -1038,6 +1038,39 @@ function podEligibleForYear(podId, year){
 // much older kids just because nothing else was open that day.
 var POD_TIERS=[['podS'],['pod6'],['pod5','pod4'],['pod3'],['pod2','pod1']];
 
+// A Pod's minimum year (POD_MIN_YEAR) sets a FLOOR, not a ceiling — Pod 1/2 (floor Pre-K) will
+// happily take a Year 10 student too, since nothing stops a senior student from sharing the most
+// junior Pod if that's genuinely all that's staffed. Left unchecked, that means a Year 3 and a
+// Year 10 student can end up sharing a room just because Pod 1/2 was the only option — workable in
+// a pinch, but not a normal outcome. MAX_YEAR_GAP_IN_POD caps how far apart two students sharing a
+// Pod at an overlapping time are allowed to be, on top of the per-Pod floor above. It is a SOFT
+// cap: every auto-assignment path (pickBestPod, pickBestPodWithClaims, reseatByAge) tries to
+// respect it first, but if literally no eligible+staffed+under-capacity Pod satisfies it, they fall
+// back to the older, wider-gap-tolerant search rather than leaving the student unplaced — mixing
+// ages is the absolute-last-resort, not the default.
+var MAX_YEAR_GAP_IN_POD = 4;
+// True if placing a `year` student in this Pod/window would put them more than
+// MAX_YEAR_GAP_IN_POD years apart from someone ALREADY scheduled there at an overlapping time.
+// Only real, non-cancelled sessions count; a Pod with nobody in it yet never violates this.
+// `extraOccupants` (optional, [{start,duration,year}]) lets a caller also check against seats not
+// yet in `sessions` — e.g. the waitlist's own queue of provisional claims ahead of this entry.
+function podYearGapViolation(podId, dateKey, start, duration, year, extraOccupants){
+  let violates=false;
+  sessions.forEach(function(s){
+    if(violates || s.podId!==podId || toKey(s.date)!==dateKey || s.status==='cancelled') return;
+    if(!(s.start<start+duration && start<s.start+s.duration)) return; // no time overlap, no shared room
+    const st=findStudent(s.studentId);
+    if(!st) return;
+    if(Math.abs(st.year-year)>MAX_YEAR_GAP_IN_POD) violates=true;
+  });
+  (extraOccupants||[]).forEach(function(o){
+    if(violates) return;
+    if(!(o.start<start+duration && start<o.start+o.duration)) return;
+    if(Math.abs(o.year-year)>MAX_YEAR_GAP_IN_POD) violates=true;
+  });
+  return violates;
+}
+
 // Auto-assignment used wherever the system (not staff directly) needs to pick a Pod: parent
 // make-up booking and standing-schedule pre-booking. The Pod's assigned instructor for the full
 // window (a single instructor — auto-assignment never arranges a handoff; that's a staff judgment
@@ -1064,28 +1097,36 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
     const cap=podCapacity(pod.id);
     const wouldBePeak=peakConcurrency(pod.id, dateKey, {start, duration});
     if(wouldBePeak>cap) return null;
-    return pod.id;
+    return pod.id; // a pin is front desk's own explicit call — MAX_YEAR_GAP_IN_POD doesn't apply here either
   }
-  for(let t=0; t<POD_TIERS.length; t++){
-    const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
-    if(tierPods.length===0) continue; // student doesn't meet this tier's minimum at all
-    let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
-    tierPods.forEach(function(podId){
-      const cov=podCoverageDetail(podId, weekday, start, duration, date);
-      if(!cov.primaryInstructorId || !cov.ok) return; // no instructor nearby, or more than the tolerated unattended gap
-      const instr=findInstructor(cov.primaryInstructorId);
-      const cap=podCapacity(podId);
-      const wouldBePeak=peakConcurrency(podId, dateKey, {start, duration});
-      if(wouldBePeak>cap) return;
-      const suited=instructorSuitedFor(instr, year)? 1 : 0;
-      const sameYear=sameYearCount(podId, dateKey, start, duration, year);
-      if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))){
-        best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
-      }
-    });
-    if(best) return best; // a real option exists in the most senior eligible tier available — done
+  // Two passes: first honoring MAX_YEAR_GAP_IN_POD (don't seat this student somewhere that would
+  // put them more than that many years from someone already there), then — only if that finds
+  // nothing anywhere across every tier — the original, wider search with no age-mixing limit at
+  // all. That makes mixing ages a genuine last resort rather than a routine outcome.
+  function search(enforceYearGap){
+    for(let t=0; t<POD_TIERS.length; t++){
+      const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
+      if(tierPods.length===0) continue; // student doesn't meet this tier's minimum at all
+      let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
+      tierPods.forEach(function(podId){
+        const cov=podCoverageDetail(podId, weekday, start, duration, date);
+        if(!cov.primaryInstructorId || !cov.ok) return; // no instructor nearby, or more than the tolerated unattended gap
+        const cap=podCapacity(podId);
+        const wouldBePeak=peakConcurrency(podId, dateKey, {start, duration});
+        if(wouldBePeak>cap) return;
+        if(enforceYearGap && podYearGapViolation(podId, dateKey, start, duration, year)) return;
+        const instr=findInstructor(cov.primaryInstructorId);
+        const suited=instructorSuitedFor(instr, year)? 1 : 0;
+        const sameYear=sameYearCount(podId, dateKey, start, duration, year);
+        if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))){
+          best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
+        }
+      });
+      if(best) return best; // a real option exists in the most senior eligible tier available — done
+    }
+    return null;
   }
-  return null;
+  return search(true) || search(false);
 }
 
 // One-time batch fix-up for existing bookings (5.21): takes every non-pinned upcoming session OUT
@@ -1148,28 +1189,35 @@ function reseatByAge(){
     const sess=c.session, student=c.student, dateKey=c.dateKey, year=student.year;
     const orig=originalById[sess.id];
     const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
-    let target=null;
     // Same tiers, same eligibility, same tie-breaks as pickBestPod — walked here directly rather
     // than calling pickBestPod itself, since this needs the Phase-1-cleared occupancy counts above,
-    // not pickBestPod's own (real, un-cleared) view of who's sitting where right now.
-    for(let t=0; t<POD_TIERS.length && !target; t++){
-      const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
-      if(tierPods.length===0) continue; // this student doesn't meet this tier's minimum year at all
-      let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
-      tierPods.forEach(function(podId){
-        const cov=podCoverageDetail(podId, weekday, sess.start, sess.duration, sess.date);
-        if(!cov.primaryInstructorId || !cov.ok) return; // no instructor nearby, or more than the tolerated unattended gap
-        const peak=peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration});
-        if(peak>podCapacity(podId)) return;
-        const instr=findInstructor(cov.primaryInstructorId);
-        const suited=instructorSuitedFor(instr, year)? 1 : 0;
-        const sameYear=sameYearCount(podId, dateKey, sess.start, sess.duration, year);
-        if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && peak>bestOccupancy)))){
-          best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=peak;
-        }
-      });
-      if(best) target=best; // a real option exists in the most senior eligible tier available — stop here
+    // not pickBestPod's own (real, un-cleared) view of who's sitting where right now. Two passes,
+    // same as pickBestPod: first honoring MAX_YEAR_GAP_IN_POD, then — only if that finds nothing
+    // anywhere — the wider search with no age-mixing limit, so mixing ages during a re-seat is a
+    // last resort, not something a routine run reaches for.
+    function searchTiers(enforceYearGap){
+      for(let t=0; t<POD_TIERS.length; t++){
+        const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
+        if(tierPods.length===0) continue; // this student doesn't meet this tier's minimum year at all
+        let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
+        tierPods.forEach(function(podId){
+          const cov=podCoverageDetail(podId, weekday, sess.start, sess.duration, sess.date);
+          if(!cov.primaryInstructorId || !cov.ok) return; // no instructor nearby, or more than the tolerated unattended gap
+          const peak=peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration});
+          if(peak>podCapacity(podId)) return;
+          if(enforceYearGap && podYearGapViolation(podId, dateKey, sess.start, sess.duration, year)) return;
+          const instr=findInstructor(cov.primaryInstructorId);
+          const suited=instructorSuitedFor(instr, year)? 1 : 0;
+          const sameYear=sameYearCount(podId, dateKey, sess.start, sess.duration, year);
+          if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && peak>bestOccupancy)))){
+            best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=peak;
+          }
+        });
+        if(best) return best; // a real option exists in the most senior eligible tier available — stop here
+      }
+      return null;
     }
+    const target=searchTiers(true) || searchTiers(false);
     if(!target){
       // No Pod this student is even eligible for has coverage/room at this exact day+time — most
       // often because the only staffed option that day/time is a senior-only Pod (e.g. Singles late
@@ -1775,11 +1823,16 @@ function confirmBooking(){
 
   // Which years an instructor is "best suited" for (5.3) is a preference, not a requirement — every
   // instructor can actually teach any year — so it never factors into whether an override is
-  // needed. An override is only ever about actual staffing: no instructor anywhere near the window,
-  // or a real gap bigger than the tolerated 15 minutes unattended (UNATTENDED_TOLERANCE_MIN).
+  // needed. An override is needed for either of two reasons: actual staffing (no instructor
+  // anywhere near the window, or a real gap bigger than the tolerated 15 minutes unattended —
+  // UNATTENDED_TOLERANCE_MIN), or seating this student more than MAX_YEAR_GAP_IN_POD years apart
+  // from someone else already booked into this Pod at an overlapping time — a manual booking is
+  // staff explicitly choosing this Pod, so it gets a warning rather than pickBestPod's silent
+  // narrower-gap-first search.
   const cov=podCoverageDetail(pod.id, weekday, f.start, f.duration, date);
   const totallyUnassigned = !cov.primaryInstructorId;
-  const needsOverride = !cov.ok; // covers both "nobody at all" and "gap bigger than the tolerance"
+  const yearGapViolation = podYearGapViolation(pod.id, dateKey, f.start, f.duration, student.year);
+  const needsOverride = !cov.ok || yearGapViolation;
 
   if(needsOverride && !f.overrideOk) return; // needs explicit override checkbox
 
@@ -1944,18 +1997,29 @@ function confirmCheckIn(){
 
 function openMoveForm(sessionId){ state.moveForm={sessionId, podId:''}; render(); }
 function closeMoveForm(){ state.moveForm=null; render(); }
-function setMoveFormPod(v){ state.moveForm.podId=v; render(); }
+function setMoveFormPod(v){ state.moveForm.podId=v; state.moveForm.gapWarning=false; state.moveForm.overrideOk=false; render(); }
 function confirmMovePod(){
   const f=state.moveForm;
   if(!f || !f.podId) return;
   const sess=findSession(f.sessionId);
   const student=findStudent(sess.studentId);
+  // MAX_YEAR_GAP_IN_POD is a soft cap everywhere the SYSTEM picks a Pod (pickBestPod/reseatByAge
+  // already try the narrower-gap option first) — but a manual move is front desk explicitly
+  // choosing a Pod, so it gets a plain warning instead of a silent fallback. "Move anyway" is
+  // there for the genuinely-necessary case; a standing Pod pin is the way to make it permanent.
+  const dateKey=toKey(sess.date);
+  if(!f.overrideOk && podYearGapViolation(f.podId, dateKey, sess.start, sess.duration, student.year)){
+    state.moveForm.gapWarning=true;
+    render();
+    return;
+  }
   const result=movePodSession(f.sessionId, f.podId);
   if(!result.ok){ toast(result.error); return; }
   if(result.oldPod){ toast(student.name+' moved from '+result.oldPod.name+' to '+result.newPod.name+'.'); }
   state.moveForm=null;
   render();
 }
+function toggleMoveOverride(){ state.moveForm.overrideOk=!state.moveForm.overrideOk; render(); }
 
 function renderMoveModal(){
   const f=state.moveForm;
@@ -1976,9 +2040,13 @@ function renderMoveModal(){
       return '<option value="'+p.id+'"'+(p.id===f.podId?' selected':'')+(full?' disabled':'')+'>'+p.name+(full?' — full':' — '+peak+'/'+cap+' after move')+'</option>';
     }).join('')
   +'</select>';
+  if(f.gapWarning){
+    html+='<div class="banner warn">⚠️ This would seat '+student.name+' ('+yearLabel(student.year)+') more than '+MAX_YEAR_GAP_IN_POD+' years apart from someone already booked in '+findPod(f.podId).name+' at that time. Mixing ages this widely should only happen if there\'s truly no other option — confirm below if that\'s the case here.</div>';
+    html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" '+(f.overrideOk?'checked':'')+' onchange="toggleMoveOverride()" style="width:auto;margin:0"/> Move anyway</label>';
+  }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeMoveForm()">Cancel</button>'
-    +'<button class="btn primary" '+(!f.podId?'disabled':'')+' onclick="confirmMovePod()">Move</button>'
+    +'<button class="btn primary" '+((!f.podId || (f.gapWarning && !f.overrideOk))?'disabled':'')+' onclick="confirmMovePod()">Move</button>'
   +'</div>';
   html+='</div></div>';
   return html;
@@ -2328,26 +2396,32 @@ function peakConcurrencyWithClaims(podId, dateKey, extra, claims){
 // again, this needs the same change.
 function pickBestPodWithClaims(weekday, dateKey, start, duration, year, claims){
   const date=new Date(dateKey);
-  for(let t=0; t<POD_TIERS.length; t++){
-    const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
-    if(tierPods.length===0) continue;
-    let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
-    tierPods.forEach(function(podId){
-      const cov=podCoverageDetail(podId, weekday, start, duration, date);
-      if(!cov.primaryInstructorId || !cov.ok) return;
-      const instr=findInstructor(cov.primaryInstructorId);
-      const cap=podCapacity(podId);
-      const wouldBePeak=peakConcurrencyWithClaims(podId, dateKey, {start, duration}, claims);
-      if(wouldBePeak>cap) return;
-      const suited=instructorSuitedFor(instr, year)? 1 : 0;
-      const sameYear=sameYearCount(podId, dateKey, start, duration, year);
-      if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))){
-        best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
-      }
-    });
-    if(best) return best;
+  // Same two-pass strict-then-relaxed search as pickBestPod (see MAX_YEAR_GAP_IN_POD) — mixing
+  // ages is a last resort here too, not something the waitlist should reach for by default.
+  function search(enforceYearGap){
+    for(let t=0; t<POD_TIERS.length; t++){
+      const tierPods=POD_TIERS[t].filter(function(podId){ return podEligibleForYear(podId, year); });
+      if(tierPods.length===0) continue;
+      let best=null, bestSuited=-1, bestSameYear=-1, bestOccupancy=-1;
+      tierPods.forEach(function(podId){
+        const cov=podCoverageDetail(podId, weekday, start, duration, date);
+        if(!cov.primaryInstructorId || !cov.ok) return;
+        const cap=podCapacity(podId);
+        const wouldBePeak=peakConcurrencyWithClaims(podId, dateKey, {start, duration}, claims);
+        if(wouldBePeak>cap) return;
+        if(enforceYearGap && podYearGapViolation(podId, dateKey, start, duration, year, (claims||[]).filter(function(c){ return c.podId===podId && c.dateKey===dateKey; }))) return;
+        const instr=findInstructor(cov.primaryInstructorId);
+        const suited=instructorSuitedFor(instr, year)? 1 : 0;
+        const sameYear=sameYearCount(podId, dateKey, start, duration, year);
+        if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))){
+          best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
+        }
+      });
+      if(best) return best;
+    }
+    return null;
   }
-  return null;
+  return search(true) || search(false);
 }
 // First-in-first-served (5.17): every waiting entry strictly older (by dateAdded) than this one
 // gets to "claim" its seat first. Walks the queue oldest-first, and for each entry ahead of this
@@ -2363,7 +2437,7 @@ function waitlistClaimsBefore(entry){
     const year = w.studentId? findStudent(w.studentId).year : w.year;
     const dateKey = toKey(nextDateForWeekday(simNow(), w.weekday));
     const podId = pickBestPodWithClaims(w.weekday, dateKey, w.start, w.duration, year, claims);
-    if(podId) claims.push({podId, dateKey, start:w.start, duration:w.duration});
+    if(podId) claims.push({podId, dateKey, start:w.start, duration:w.duration, year:year});
   }
   return claims;
 }
@@ -2845,7 +2919,7 @@ function renderStaff(){
         +'<button class="btn sm ghost" onclick="runReseatByAge()" title="Move already-booked students (who don\'t have a manual Pod pin) into whichever Pod best fits their age">Re-seat by age</button>'
         +(state.reseatGapReport && state.reseatGapReport.length? '<button class="btn sm ghost" onclick="openReseatGapReport()" title="See which day/time slots account for the students Re-seat by age couldn\'t move">View gap report ('+state.reseatGapReport.reduce(function(sum,g){ return sum+g.count; },0)+')</button>':'')
       +'</div>');
-  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session (arriving a little late, wrapping up a little early, or a short gap between two shifts) still counts as covered — beyond that, it needs an explicit override to book anyway. A minimum year per Pod is enforced everywhere a Pod gets chosen — booking, auto-assignment, and moving a student — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort (a standing Pod pin is the only sanctioned exception). A Pod\'s 8-seat capacity allows up to '+STUDENT_OVERLAP_TOLERANCE_MIN+' minutes of overlap between an outgoing and incoming student for free — a brief handover at a cohort boundary doesn\'t need its own seat — beyond that, both students count toward the limit. “Re-seat by age” takes every non-pinned upcoming student out of their Pod at once and re-seats everyone from scratch, oldest first, so an older student\'s claim on a senior Pod is never blocked by a younger student who simply hasn\'t been reprocessed yet.</p>';
+  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session (arriving a little late, wrapping up a little early, or a short gap between two shifts) still counts as covered — beyond that, it needs an explicit override to book anyway. A minimum year per Pod is enforced everywhere a Pod gets chosen — booking, auto-assignment, and moving a student — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort (a standing Pod pin is the only sanctioned exception). A Pod\'s 8-seat capacity allows up to '+STUDENT_OVERLAP_TOLERANCE_MIN+' minutes of overlap between an outgoing and incoming student for free — a brief handover at a cohort boundary doesn\'t need its own seat — beyond that, both students count toward the limit. No two students sharing a Pod at the same time should be more than '+MAX_YEAR_GAP_IN_POD+' years apart — auto-assignment and re-seating always try that first, and only mix ages more widely than that when literally nothing narrower is staffed and available; a manual booking or move that would mix ages more widely needs an explicit override. “Re-seat by age” takes every non-pinned upcoming student out of their Pod at once and re-seats everyone from scratch, oldest first, so an older student\'s claim on a senior Pod is never blocked by a younger student who simply hasn\'t been reprocessed yet.</p>';
   html+=renderCoverageGrid(weekDates);
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
@@ -3327,10 +3401,13 @@ function renderBookingModal(){
     instr2 = cov.secondaryInstructorId? findInstructor(cov.secondaryInstructorId) : null;
     suited2 = instr2? instructorSuitedFor(instr2, student.year) : true;
   }
-  // "Best suited for" (5.3) is a preference, not a requirement — it never forces an override. An
-  // override is only ever about actual staffing: nobody assigned anywhere near the window, or a
-  // gap bigger than the tolerated 15 minutes unattended (UNATTENDED_TOLERANCE_MIN).
-  const needsOverride = student && cov && !cov.ok;
+  // "Best suited for" (5.3) is a preference, not a requirement — it never forces an override.
+  // Everything else that forces one is real: actual staffing (nobody assigned anywhere near the
+  // window, or a gap bigger than the tolerated 15 minutes unattended — UNATTENDED_TOLERANCE_MIN),
+  // or seating this student more than MAX_YEAR_GAP_IN_POD years apart from someone already booked
+  // into this Pod at an overlapping time.
+  const yearGapViolation = (student && f.start!=null) && podYearGapViolation(pod.id, b.dateKey, f.start, f.duration, student.year);
+  const needsOverride = student && ((cov && !cov.ok) || yearGapViolation);
 
   const cap=podCapacity(pod.id);
   const wouldBePeak = (student && f.start!=null)? peakConcurrency(pod.id, b.dateKey, {start:f.start, duration:f.duration}) : 0;
@@ -3359,10 +3436,16 @@ function renderBookingModal(){
     html+='<div class="banner info">ℹ️ '+cov.gapMinutes+' min of this session is unattended in '+pod.name+' — within the '+UNATTENDED_TOLERANCE_MIN+'-minute tolerance, so no override is needed.</div>';
   }
   if(student && needsOverride){
-    const reason = totallyUnassigned
-      ? 'nobody is assigned to '+pod.name+' anywhere near that time'
-      : pod.name+' is unattended for '+cov.gapMinutes+' min of this session — more than the '+UNATTENDED_TOLERANCE_MIN+'-minute tolerance';
-    html+='<div class="banner warn">⚠️ '+reason+'. You can still book it, but confirm below — to fix this properly, adjust the Pod\'s assignment.</div>';
+    const coverageReason = !cov.ok
+      ? (totallyUnassigned
+        ? 'nobody is assigned to '+pod.name+' anywhere near that time'
+        : pod.name+' is unattended for '+cov.gapMinutes+' min of this session — more than the '+UNATTENDED_TOLERANCE_MIN+'-minute tolerance')
+      : null;
+    const reasons=[];
+    if(coverageReason) reasons.push(coverageReason);
+    if(yearGapViolation) reasons.push('this would seat '+student.name+' ('+yearLabel(student.year)+') more than '+MAX_YEAR_GAP_IN_POD+' years apart from someone already booked into '+pod.name+' at that time');
+    const fixHint = coverageReason? ' — to fix this properly, adjust the Pod\'s assignment.' : ' — mixing ages this widely should only happen if there\'s truly no other option.';
+    html+='<div class="banner warn">⚠️ '+reasons.join('; and ')+'. You can still book it, but confirm below'+fixHint+'</div>';
     html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" '+(f.overrideOk?'checked':'')+' onchange="toggleOverride()" style="width:auto;margin:0"/> Book anyway</label>';
   }
   // Purely informational, never blocking: every instructor can teach any year (5.3), so a mismatch
