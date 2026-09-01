@@ -1038,6 +1038,36 @@ function podEligibleForYear(podId, year){
 // much older kids just because nothing else was open that day.
 var POD_TIERS=[['podS'],['pod6'],['pod5','pod4'],['pod3'],['pod2','pod1']];
 
+// POD_TIERS and POD_MIN_YEAR above are written against the fixed demo pod ids ('pod1'..'pod6',
+// 'podS') — fine for offline/demo mode, where the seed pods (see `var pods=[...]` above) actually
+// use those literal ids. Real pods loaded from Supabase get their own generated ids instead (e.g.
+// '75f9453a-...'), which never equal 'pod4' etc. Left unmapped, every tier walk (pickBestPod,
+// pickBestPodWithClaims, reseatByAge, the year-gap check) would look up coverage/eligibility under
+// an id no real Pod ever has — finding nothing, for every Pod, every time, regardless of actual
+// staffing (this was a real production bug: every re-seat/booking silently found zero eligible
+// Pods for every student). loadAllData() calls this once real pod ids are known, remapping both
+// structures from each Pod's NAME (still "Pod 1".."Pod 6"/"Singles", matched case-insensitively) to
+// its real id, so the exact same tier/eligibility logic that already works in demo mode also works
+// against live data.
+function remapPodTiersToRealIds(){
+  const realIdByFakeKey={};
+  pods.forEach(function(p){
+    const n=(p.name||'').trim().toUpperCase();
+    const singles=(n==='SINGLES');
+    const m=n.match(/^POD\s*([1-6])$/);
+    const fakeKey=singles? 'podS' : (m? ('pod'+m[1]) : null);
+    if(fakeKey) realIdByFakeKey[fakeKey]=p.id;
+  });
+  POD_TIERS=POD_TIERS.map(function(tier){
+    return tier.map(function(fakeKey){ return realIdByFakeKey[fakeKey]||fakeKey; });
+  });
+  const remappedMinYear={};
+  Object.keys(POD_MIN_YEAR).forEach(function(fakeKey){
+    remappedMinYear[realIdByFakeKey[fakeKey]||fakeKey]=POD_MIN_YEAR[fakeKey];
+  });
+  POD_MIN_YEAR=remappedMinYear;
+}
+
 // A Pod's minimum year (POD_MIN_YEAR) sets a FLOOR, not a ceiling — Pod 1/2 (floor Pre-K) will
 // happily take a Year 10 student too, since nothing stops a senior student from sharing the most
 // junior Pod if that's genuinely all that's staffed. Left unchecked, that means a Year 3 and a
@@ -4633,6 +4663,16 @@ function loadAllData(){
     }; });
 
     pods=podRows.map(function(r){ return {id:r.id, name:r.name, capacity:r.capacity}; });
+
+    // POD_TIERS and POD_MIN_YEAR are written against the fixed demo pod ids ('pod1'..'pod6','podS')
+    // — fine for offline/demo mode, where the seed pods actually use those literal ids, but real
+    // pods loaded from Supabase get their own generated ids (e.g. '75f9453a-...'), which never equal
+    // 'pod4' etc. Left unmapped, every tier walk (pickBestPod, reseatByAge, the year-gap check) would
+    // look up coverage/eligibility under an id no real pod ever has — finding nothing, for every Pod,
+    // every time, regardless of actual staffing. Remap both structures here, once real pod ids are
+    // known, from each pod's NAME (still "Pod 1".."Pod 6"/"Singles", case-insensitively) to its real
+    // id, so the exact same tier/eligibility logic that already works in demo mode also works live.
+    remapPodTiersToRealIds();
 
     podSchedule={};
     pods.forEach(function(p){ podSchedule[p.id]={}; });
