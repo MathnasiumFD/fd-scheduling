@@ -827,6 +827,9 @@ function tolerantOccupancyIntervals(list){
 function peakConcurrency(podId, dateKey, extra){
   const raw = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
   if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
+  return peakConcurrencyOf(raw);
+}
+function peakConcurrencyOf(raw){
   if(raw.length===0) return 0;
   const list=tolerantOccupancyIntervals(raw);
   const events=[];
@@ -835,6 +838,42 @@ function peakConcurrency(podId, dateKey, extra){
   let cur=0, peak=0;
   events.forEach(function(e){ cur+=e[1]; if(cur>peak) peak=cur; });
   return peak;
+}
+// A Pod running one seat over its stated capacity for just a few minutes — the tail of one
+// session overlapping the start of another beyond what STUDENT_OVERLAP_TOLERANCE_MIN alone
+// forgives — is a pinch front desk can live with, not a real double-booking. This allows exactly
+// that: up to POD_CAPACITY_OVERFLOW_SEATS extra seats at once, but only for stretches no longer
+// than POD_CAPACITY_OVERFLOW_TOLERANCE_MIN. Going over by more seats than that, or staying over
+// by the tolerated seat count for longer than that, is still a real capacity violation.
+var POD_CAPACITY_OVERFLOW_SEATS = 1;
+var POD_CAPACITY_OVERFLOW_TOLERANCE_MIN = 15;
+function capacityOverflowViolation(raw, cap){
+  if(raw.length===0) return false;
+  const list=tolerantOccupancyIntervals(raw);
+  const events=[];
+  list.forEach(function(iv){ events.push([iv.start,1]); events.push([iv.end,-1]); });
+  events.sort(function(a,b){ return a[0]-b[0] || a[1]-b[1]; });
+  let cur=0, overSince=null;
+  for(let i=0;i<events.length;i++){
+    cur+=events[i][1];
+    if(cur>cap+POD_CAPACITY_OVERFLOW_SEATS) return true; // more extra seats than ever tolerated
+    if(cur>cap){
+      if(overSince==null) overSince=events[i][0];
+    } else if(overSince!=null){
+      if(events[i][0]-overSince>POD_CAPACITY_OVERFLOW_TOLERANCE_MIN) return true;
+      overSince=null;
+    }
+  }
+  return false;
+}
+// The actual capacity gate every booking/move/auto-assign path should use — true if adding
+// `extra` would violate capacity beyond the tolerated overflow above. Prefer this over comparing
+// peakConcurrency to podCapacity directly, since a raw comparison doesn't know about the
+// tolerated one-seat/15-minute pinch.
+function podCapacityBlocked(podId, dateKey, extra){
+  const raw = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
+  if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
+  return capacityOverflowViolation(raw, podCapacity(podId));
 }
 // Peak concurrency restricted to a specific window (e.g. one hour) — used by the availability lookup.
 function peakInWindow(podId, dateKey, winStart, winEnd){
@@ -984,8 +1023,7 @@ function movePodSession(sessionId, newPodId){
     return {ok:false, error:student.name+' ('+yearLabel(student.year)+') doesn\'t meet '+newPod.name+'\'s '+yearLabel(POD_MIN_YEAR[newPodId])+'+ minimum. Set a standing Pod pin first if this is a deliberate exception.'};
   }
   const cap=podCapacity(newPodId);
-  const wouldBePeak=peakConcurrency(newPodId, dateKey, {start:sess.start, duration:sess.duration});
-  if(wouldBePeak>cap){
+  if(podCapacityBlocked(newPodId, dateKey, {start:sess.start, duration:sess.duration})){
     return {ok:false, error:newPod.name+' is already full at that time ('+cap+'/'+cap+') — pick another Pod.'};
   }
   const oldPod=findPod(sess.podId);
@@ -1124,9 +1162,7 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
     if(!pod) return null;
     const cov=podCoverageDetail(pod.id, weekday, start, duration, date);
     if(!cov.primaryInstructorId || !cov.ok) return null; // no instructor nearby, or more than the tolerated unattended gap
-    const cap=podCapacity(pod.id);
-    const wouldBePeak=peakConcurrency(pod.id, dateKey, {start, duration});
-    if(wouldBePeak>cap) return null;
+    if(podCapacityBlocked(pod.id, dateKey, {start, duration})) return null;
     return pod.id; // a pin is front desk's own explicit call — MAX_YEAR_GAP_IN_POD doesn't apply here either
   }
   // Two passes: first honoring MAX_YEAR_GAP_IN_POD (don't seat this student somewhere that would
@@ -1141,13 +1177,12 @@ function pickBestPod(weekday, dateKey, start, duration, year, preferredPodId){
       tierPods.forEach(function(podId){
         const cov=podCoverageDetail(podId, weekday, start, duration, date);
         if(!cov.primaryInstructorId || !cov.ok) return; // no instructor nearby, or more than the tolerated unattended gap
-        const cap=podCapacity(podId);
-        const wouldBePeak=peakConcurrency(podId, dateKey, {start, duration});
-        if(wouldBePeak>cap) return;
+        if(podCapacityBlocked(podId, dateKey, {start, duration})) return;
         if(enforceYearGap && podYearGapViolation(podId, dateKey, start, duration, year)) return;
         const instr=findInstructor(cov.primaryInstructorId);
         const suited=instructorSuitedFor(instr, year)? 1 : 0;
         const sameYear=sameYearCount(podId, dateKey, start, duration, year);
+        const wouldBePeak=peakConcurrency(podId, dateKey, {start, duration});
         if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))){
           best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
         }
@@ -1233,12 +1268,12 @@ function reseatByAge(){
         tierPods.forEach(function(podId){
           const cov=podCoverageDetail(podId, weekday, sess.start, sess.duration, sess.date);
           if(!cov.primaryInstructorId || !cov.ok) return; // no instructor nearby, or more than the tolerated unattended gap
-          const peak=peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration});
-          if(peak>podCapacity(podId)) return;
+          if(podCapacityBlocked(podId, dateKey, {start:sess.start, duration:sess.duration})) return;
           if(enforceYearGap && podYearGapViolation(podId, dateKey, sess.start, sess.duration, year)) return;
           const instr=findInstructor(cov.primaryInstructorId);
           const suited=instructorSuitedFor(instr, year)? 1 : 0;
           const sameYear=sameYearCount(podId, dateKey, sess.start, sess.duration, year);
+          const peak=peakConcurrency(podId, dateKey, {start:sess.start, duration:sess.duration});
           if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && peak>bestOccupancy)))){
             best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=peak;
           }
@@ -1917,8 +1952,8 @@ function confirmBooking(){
   if(needsOverride && !f.overrideOk) return; // needs explicit override checkbox
 
   const cap=podCapacity(pod.id);
-  const wouldBePeak = peakConcurrency(pod.id, dateKey, {start:f.start, duration:f.duration});
-  if(wouldBePeak > cap){
+  if(podCapacityBlocked(pod.id, dateKey, {start:f.start, duration:f.duration})){
+    const wouldBePeak = peakConcurrency(pod.id, dateKey, {start:f.start, duration:f.duration});
     toast('Blocked — this would put '+pod.name+' over capacity ('+wouldBePeak+'/'+cap+').');
     return;
   }
@@ -2116,7 +2151,7 @@ function renderMoveModal(){
     +pods.filter(function(p){ return p.id!==sess.podId; }).map(function(p){
       const peak=peakConcurrency(p.id, dateKey, {start:sess.start, duration:sess.duration});
       const cap=podCapacity(p.id);
-      const full=peak>cap;
+      const full=podCapacityBlocked(p.id, dateKey, {start:sess.start, duration:sess.duration});
       return '<option value="'+p.id+'"'+(p.id===f.podId?' selected':'')+(full?' disabled':'')+'>'+p.name+(full?' — full':' — '+peak+'/'+cap+' after move')+'</option>';
     }).join('')
   +'</select>';
@@ -2460,14 +2495,17 @@ function peakConcurrencyWithClaims(podId, dateKey, extra, claims){
     if(c.podId===podId && c.dateKey===dateKey) raw.push({start:c.start, end:c.start+c.duration});
   });
   if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
-  if(raw.length===0) return 0;
-  const list=tolerantOccupancyIntervals(raw); // same handover forgiveness as peakConcurrency (STUDENT_OVERLAP_TOLERANCE_MIN)
-  const events=[];
-  list.forEach(function(iv){ events.push([iv.start,1]); events.push([iv.end,-1]); });
-  events.sort(function(a,b){ return a[0]-b[0] || a[1]-b[1]; });
-  let cur=0, peak=0;
-  events.forEach(function(e){ cur+=e[1]; if(cur>peak) peak=cur; });
-  return peak;
+  return peakConcurrencyOf(raw); // same handover forgiveness as peakConcurrency (STUDENT_OVERLAP_TOLERANCE_MIN)
+}
+// Same tolerated one-seat/15-minute capacity pinch as podCapacityBlocked, but also accounting for
+// other waitlist entries ahead of this one in the queue (see peakConcurrencyWithClaims).
+function podCapacityBlockedWithClaims(podId, dateKey, extra, claims){
+  const raw = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
+  (claims||[]).forEach(function(c){
+    if(c.podId===podId && c.dateKey===dateKey) raw.push({start:c.start, end:c.start+c.duration});
+  });
+  if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
+  return capacityOverflowViolation(raw, podCapacity(podId));
 }
 // Same minimum-year-eligibility, tier-first logic as pickBestPod (5.21c) — kept as a separate
 // function only because it also has to account for other waitlist entries ahead of this one in
@@ -2486,13 +2524,12 @@ function pickBestPodWithClaims(weekday, dateKey, start, duration, year, claims){
       tierPods.forEach(function(podId){
         const cov=podCoverageDetail(podId, weekday, start, duration, date);
         if(!cov.primaryInstructorId || !cov.ok) return;
-        const cap=podCapacity(podId);
-        const wouldBePeak=peakConcurrencyWithClaims(podId, dateKey, {start, duration}, claims);
-        if(wouldBePeak>cap) return;
+        if(podCapacityBlockedWithClaims(podId, dateKey, {start, duration}, claims)) return;
         if(enforceYearGap && podYearGapViolation(podId, dateKey, start, duration, year, (claims||[]).filter(function(c){ return c.podId===podId && c.dateKey===dateKey; }))) return;
         const instr=findInstructor(cov.primaryInstructorId);
         const suited=instructorSuitedFor(instr, year)? 1 : 0;
         const sameYear=sameYearCount(podId, dateKey, start, duration, year);
+        const wouldBePeak=peakConcurrencyWithClaims(podId, dateKey, {start, duration}, claims);
         if(suited>bestSuited || (suited===bestSuited && (sameYear>bestSameYear || (sameYear===bestSameYear && wouldBePeak>bestOccupancy)))){
           best=podId; bestSuited=suited; bestSameYear=sameYear; bestOccupancy=wouldBePeak;
         }
@@ -3493,7 +3530,7 @@ function renderBookingModal(){
 
   const cap=podCapacity(pod.id);
   const wouldBePeak = (student && f.start!=null)? peakConcurrency(pod.id, b.dateKey, {start:f.start, duration:f.duration}) : 0;
-  const overCapacity = wouldBePeak>cap;
+  const overCapacity = (student && f.start!=null) && podCapacityBlocked(pod.id, b.dateKey, {start:f.start, duration:f.duration});
 
   let html='<div class="overlay" onclick="if(event.target===this) closeBooking()"><div class="modal">';
   html+='<h3>Book into '+pod.name+' — '+fmtShort(date)+'</h3>';
