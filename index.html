@@ -792,13 +792,43 @@ function studentAttendanceLog(studentId){
     .sort(function(a,b){ return b.date-a.date || b.start-a.start; });
 }
 
+// A brief handover between an outgoing and incoming student at a Pod's capacity boundary — e.g.
+// one cohort wrapping up at 5:00 while the next cohort's early arrivals trickle in from 4:50 — is
+// normal, not a real double-booking. STUDENT_OVERLAP_TOLERANCE_MIN forgives up to this many
+// minutes of overlap between two students' sessions for capacity/headcount purposes only: a
+// student whose session starts within this many minutes of another (different) session ending in
+// the same Pod doesn't need their own seat for that short overlap — they're folded into the
+// outgoing student's seat rather than counted as a second occupant. An overlap longer than this
+// still counts in full, exactly as before.
+var STUDENT_OVERLAP_TOLERANCE_MIN = 15;
+// Nudges each interval's effective start forward, past any short (<=tolerance) overlap with an
+// earlier-starting interval's end, before computing peak concurrency. Sorting by start first means
+// each interval is only ever nudged relative to intervals that were already "in the room" before
+// it arrived — matching the real handover direction (later arrival defers to the almost-finished
+// earlier one), not the other way around. Ends are never adjusted, only starts.
+function tolerantOccupancyIntervals(list){
+  const sorted=list.slice().sort(function(a,b){ return a.start-b.start; });
+  const adjusted=[];
+  sorted.forEach(function(iv){
+    let start=iv.start;
+    adjusted.forEach(function(prev){
+      if(prev.end>start && prev.end-start<=STUDENT_OVERLAP_TOLERANCE_MIN){
+        start=Math.max(start, Math.min(iv.end, prev.end));
+      }
+    });
+    adjusted.push({start:start, end:iv.end});
+  });
+  return adjusted;
+}
 // Peak simultaneous headcount in a Pod on a day — the real capacity question, since sessions of
 // different lengths starting at different times can overlap partially. Pass `extra`
-// ({start,duration}) to see what the peak WOULD be if that session were added.
+// ({start,duration}) to see what the peak WOULD be if that session were added. A short handover
+// overlap (see STUDENT_OVERLAP_TOLERANCE_MIN) doesn't count both students as occupying a seat.
 function peakConcurrency(podId, dateKey, extra){
-  const list = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
-  if(extra) list.push({start:extra.start, end:extra.start+extra.duration});
-  if(list.length===0) return 0;
+  const raw = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
+  if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
+  if(raw.length===0) return 0;
+  const list=tolerantOccupancyIntervals(raw);
   const events=[];
   list.forEach(iv=>{ events.push([iv.start,1]); events.push([iv.end,-1]); });
   events.sort((a,b)=> a[0]-b[0] || a[1]-b[1]); // an ending session frees its seat before a same-instant start fills it
@@ -2277,12 +2307,13 @@ function nextDateForWeekday(fromDate, weekday){
 // waitlistClaimsBefore) — so two families waiting for the same Pod/date don't both get told the
 // same single opening is theirs.
 function peakConcurrencyWithClaims(podId, dateKey, extra, claims){
-  const list = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
+  const raw = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
   (claims||[]).forEach(function(c){
-    if(c.podId===podId && c.dateKey===dateKey) list.push({start:c.start, end:c.start+c.duration});
+    if(c.podId===podId && c.dateKey===dateKey) raw.push({start:c.start, end:c.start+c.duration});
   });
-  if(extra) list.push({start:extra.start, end:extra.start+extra.duration});
-  if(list.length===0) return 0;
+  if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
+  if(raw.length===0) return 0;
+  const list=tolerantOccupancyIntervals(raw); // same handover forgiveness as peakConcurrency (STUDENT_OVERLAP_TOLERANCE_MIN)
   const events=[];
   list.forEach(function(iv){ events.push([iv.start,1]); events.push([iv.end,-1]); });
   events.sort(function(a,b){ return a[0]-b[0] || a[1]-b[1]; });
@@ -2814,7 +2845,7 @@ function renderStaff(){
         +'<button class="btn sm ghost" onclick="runReseatByAge()" title="Move already-booked students (who don\'t have a manual Pod pin) into whichever Pod best fits their age">Re-seat by age</button>'
         +(state.reseatGapReport && state.reseatGapReport.length? '<button class="btn sm ghost" onclick="openReseatGapReport()" title="See which day/time slots account for the students Re-seat by age couldn\'t move">View gap report ('+state.reseatGapReport.reduce(function(sum,g){ return sum+g.count; },0)+')</button>':'')
       +'</div>');
-  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session (arriving a little late, wrapping up a little early, or a short gap between two shifts) still counts as covered — beyond that, it needs an explicit override to book anyway. A minimum year per Pod is enforced everywhere a Pod gets chosen — booking, auto-assignment, and moving a student — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort (a standing Pod pin is the only sanctioned exception). “Re-seat by age” takes every non-pinned upcoming student out of their Pod at once and re-seats everyone from scratch, oldest first, so an older student\'s claim on a senior Pod is never blocked by a younger student who simply hasn\'t been reprocessed yet.</p>';
+  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session (arriving a little late, wrapping up a little early, or a short gap between two shifts) still counts as covered — beyond that, it needs an explicit override to book anyway. A minimum year per Pod is enforced everywhere a Pod gets chosen — booking, auto-assignment, and moving a student — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort (a standing Pod pin is the only sanctioned exception). A Pod\'s 8-seat capacity allows up to '+STUDENT_OVERLAP_TOLERANCE_MIN+' minutes of overlap between an outgoing and incoming student for free — a brief handover at a cohort boundary doesn\'t need its own seat — beyond that, both students count toward the limit. “Re-seat by age” takes every non-pinned upcoming student out of their Pod at once and re-seats everyone from scratch, oldest first, so an older student\'s claim on a senior Pod is never blocked by a younger student who simply hasn\'t been reprocessed yet.</p>';
   html+=renderCoverageGrid(weekDates);
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
