@@ -1256,7 +1256,7 @@ function reseatByAge(){
       // Restore them exactly as they were — can't leave a session with no Pod at all.
       sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
       skipped++;
-      skippedDetails.push({studentId:student.id, studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||orig.podId});
+      skippedDetails.push({studentId:student.id, studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||'Unassigned'});
       return;
     }
     if(target===orig.podId){
@@ -1270,7 +1270,7 @@ function reseatByAge(){
     if(r.ok){ moved++; } else {
       sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
       skipped++;
-      skippedDetails.push({studentId:student.id, studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||orig.podId, error:r.error});
+      skippedDetails.push({studentId:student.id, studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||'Unassigned', error:r.error});
     }
   });
   return {moved:moved, skipped:skipped, pinned:pinned, alreadyBest:alreadyBest, totalUpcoming:totalUpcoming, candidateCount:candidates.length, skippedDetails:skippedDetails};
@@ -1313,10 +1313,11 @@ function summarizeReseatGaps(skippedDetails){
 }
 
 // Diagnostic used right after enrolling a student or saving their regular schedule (5.10): a
-// selected day/time can be entered just fine but never actually produce a booked session if no
-// Pod has an instructor covering it yet (pickBestPod above returns null and generateRecurringSessions
-// silently skips that occurrence — by design, same as any other gap, but with zero feedback to
-// whoever just set the schedule). This checks each selected slot against every Pod's CURRENT
+// selected day/time can be entered just fine but never actually get seated anywhere if no Pod has
+// an instructor covering it yet (pickBestPod above returns null and generateRecurringSessions still
+// creates the occurrence, just unassigned — visible in the Schedule tab's "Unassigned" section, but
+// easy to miss right after enrolling with zero feedback in the moment). This checks each selected
+// slot against every Pod's CURRENT
 // coverage (today's roster — a reasonable proxy for a weekly-recurring pattern), applying the same
 // minimum-year eligibility pickBestPod itself now enforces (5.21c) — a Pod that's staffed but below
 // this student's required minimum doesn't count as "covered" here either, since pickBestPod would
@@ -1740,14 +1741,38 @@ function generateRecurringSessions(student, weeksAhead){
       const plan=studentPlanOn(student.id, date); // respects any scheduled stop/frequency change
       const slot=(plan.recurring||[]).find(function(r){ return r.weekday===weekday; });
       if(!slot) return; // this weekday isn't part of whichever plan governs this date
-      const dup=sessions.some(function(s){ return s.studentId===student.id && toKey(s.date)===dateKey && s.start===slot.start && s.status!=='cancelled'; });
-      if(dup) return;
+      const dup=sessions.find(function(s){ return s.studentId===student.id && toKey(s.date)===dateKey && s.start===slot.start && s.status!=='cancelled'; });
+      if(dup){
+        // Already exists — normally nothing to do. The one exception: a previously-unassigned
+        // occurrence (see below) is always worth trying again, since regenerateAllRecurring() runs
+        // on almost every write in this app — a pin changing, a new instructor being assigned, a
+        // Pod freeing up — so it's the natural place for an unassigned session to self-heal the
+        // moment something actually opens up, rather than sitting unassigned until someone happens
+        // to notice and fix it by hand.
+        if(dup.podId==null){
+          const pinnedPodId=studentAssignedPodOn(student.id, date);
+          const podId=pickBestPod(weekday, dateKey, slot.start, student.duration, student.year, pinnedPodId);
+          if(podId){
+            const cov=podCoverageDetail(podId, weekday, slot.start, student.duration, date);
+            dup.podId=podId; dup.instructorId=cov.primaryInstructorId; dup.instructorId2=cov.secondaryInstructorId; dup.handoff=cov.handoffAt;
+            dbWrite('filling a previously-unassigned standing session', function(){ return supabaseClient.from('sessions').update({
+              pod_id:dup.podId, instructor_id:dup.instructorId, instructor_id_2:dup.instructorId2, handoff_min:dup.handoff
+            }).eq('id', dup.id); });
+            created++;
+          }
+        }
+        return;
+      }
       if(studentOverlapClash(student.id, dateKey, slot.start, student.duration, null)) return;
       const pinnedPodId=studentAssignedPodOn(student.id, date); // front desk's standing Pod pin, if any (else auto-assign)
       const podId=pickBestPod(weekday, dateKey, slot.start, student.duration, student.year, pinnedPodId);
-      if(!podId) return;
-      const cov=podCoverageDetail(podId, weekday, slot.start, student.duration, date); // tolerant of a short unattended gap (UNATTENDED_TOLERANCE_MIN), same as pickBestPod just validated
-      const recSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId, instructorId:cov.primaryInstructorId, instructorId2:cov.secondaryInstructorId, handoff:cov.handoffAt, date, start:slot.start, duration:student.duration, status:'scheduled', bookedBy:'staff', creditId:null, recurring:true};
+      // No eligible Pod is staffed/available for this exact day+time. This USED to mean the
+      // occurrence was simply never created — a student's regular class could silently vanish for
+      // a day with nothing anywhere to show it. Instead, still create the session, just with no
+      // Pod/instructor — visible on the Schedule tab's "Unassigned" section so front desk can see
+      // and fix it directly (assign a Pod once one opens up), rather than it disappearing unnoticed.
+      const cov=podId? podCoverageDetail(podId, weekday, slot.start, student.duration, date) : {primaryInstructorId:null, secondaryInstructorId:null, handoffAt:null}; // tolerant of a short unattended gap (UNATTENDED_TOLERANCE_MIN), same as pickBestPod just validated
+      const recSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:podId||null, instructorId:cov.primaryInstructorId, instructorId2:cov.secondaryInstructorId, handoff:cov.handoffAt, date, start:slot.start, duration:student.duration, status:'scheduled', bookedBy:'staff', creditId:null, recurring:true};
       sessions.push(recSess);
       dbWrite('pre-booking a standing session', function(){ return supabaseClient.from('sessions').insert({
         id:recSess.id, student_id:recSess.studentId, pod_id:recSess.podId, instructor_id:recSess.instructorId,
@@ -1759,6 +1784,31 @@ function generateRecurringSessions(student, weeksAhead){
     });
   }
   return created;
+}
+// Sessions booked for a given day with no Pod at all (see generateRecurringSessions: nothing
+// eligible was staffed for this student's exact day/time when it was pre-booked). These never
+// occupy a seat anywhere, so they're invisible in every Pod's own roster below — this is the one
+// place they're surfaced, so front desk can see them and assign a Pod once one's available, rather
+// than a student's regular class silently going missing for the day.
+function unassignedSessionsForDay(dateKey){
+  return sessions.filter(function(s){ return s.podId==null && toKey(s.date)===dateKey && s.status==='scheduled'; })
+    .slice().sort(function(a,b){ return a.start-b.start; });
+}
+function renderUnassignedPanel(dateKey){
+  const list=unassignedSessionsForDay(dateKey);
+  if(list.length===0) return '';
+  let html='<div class="pod-card" style="border-color:var(--warning)">';
+  html+='<div class="card-head"><div><h3>Unassigned ('+list.length+')</h3><span class="small muted">No Pod was staffed/available for these when they were booked — assign one now, or use Re-seat by age once more capacity opens up.</span></div></div>';
+  html+='<table><tr><th>Student</th><th>Year</th><th>Time</th><th></th></tr>'
+    +list.map(function(s){
+      const student=findStudent(s.studentId);
+      if(!student) return '';
+      return '<tr><td>'+student.name+'</td><td>'+yearLabel(student.year)+'</td><td>'+rangeLabel(s.start,s.duration)+'</td>'
+        +'<td><button class="btn sm ghost" onclick="openMoveForm(\''+s.id+'\')">Assign Pod</button></td></tr>';
+    }).join('')
+    +'</table>';
+  html+='</div>';
+  return html;
 }
 function regenerateAllRecurring(){
   let total=0;
@@ -2045,7 +2095,7 @@ function confirmMovePod(){
   }
   const result=movePodSession(f.sessionId, f.podId);
   if(!result.ok){ toast(result.error); return; }
-  if(result.oldPod){ toast(student.name+' moved from '+result.oldPod.name+' to '+result.newPod.name+'.'); }
+  toast(result.oldPod? (student.name+' moved from '+result.oldPod.name+' to '+result.newPod.name+'.') : (student.name+' assigned to '+result.newPod.name+'.'));
   state.moveForm=null;
   render();
 }
@@ -2060,8 +2110,8 @@ function renderMoveModal(){
   const currentPod=findPod(sess.podId);
   const dateKey=toKey(sess.date);
   let html='<div class="overlay" onclick="if(event.target===this) closeMoveForm()"><div class="modal">';
-  html+='<h3>Move '+student.name+' to a different Pod</h3>';
-  html+='<p>Currently in '+currentPod.name+', '+rangeLabel(sess.start,sess.duration)+' on '+fmtShort(sess.date)+'. The instructor shown for this session updates automatically to whoever covers the new Pod at this time.</p>';
+  html+='<h3>'+(currentPod? 'Move '+student.name+' to a different Pod' : 'Assign '+student.name+' to a Pod')+'</h3>';
+  html+='<p>'+(currentPod? 'Currently in '+currentPod.name : 'Currently unassigned — no Pod could be found for this session when it was created')+', '+rangeLabel(sess.start,sess.duration)+' on '+fmtShort(sess.date)+'. The instructor shown for this session updates automatically to whoever covers the new Pod at this time.</p>';
   html+='<label>Move to</label><select onchange="setMoveFormPod(this.value)"><option value="">Choose…</option>'
     +pods.filter(function(p){ return p.id!==sess.podId; }).map(function(p){
       const peak=peakConcurrency(p.id, dateKey, {start:sess.start, duration:sess.duration});
@@ -2076,7 +2126,7 @@ function renderMoveModal(){
   }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeMoveForm()">Cancel</button>'
-    +'<button class="btn primary" '+((!f.podId || (f.gapWarning && !f.overrideOk))?'disabled':'')+' onclick="confirmMovePod()">Move</button>'
+    +'<button class="btn primary" '+((!f.podId || (f.gapWarning && !f.overrideOk))?'disabled':'')+' onclick="confirmMovePod()">'+(currentPod?'Move':'Assign')+'</button>'
   +'</div>';
   html+='</div></div>';
   return html;
@@ -2949,7 +2999,7 @@ function renderStaff(){
         +'<button class="btn sm ghost" onclick="runReseatByAge()" title="Move already-booked students (who don\'t have a manual Pod pin) into whichever Pod best fits their age">Re-seat by age</button>'
         +(state.reseatGapReport && state.reseatGapReport.length? '<button class="btn sm ghost" onclick="openReseatGapReport()" title="See which day/time slots account for the students Re-seat by age couldn\'t move">View gap report ('+state.reseatGapReport.reduce(function(sum,g){ return sum+g.count; },0)+')</button>':'')
       +'</div>');
-  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session (arriving a little late, wrapping up a little early, or a short gap between two shifts) still counts as covered — beyond that, it needs an explicit override to book anyway. A minimum year per Pod is enforced everywhere a Pod gets chosen — booking, auto-assignment, and moving a student — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort (a standing Pod pin is the only sanctioned exception). A Pod\'s 8-seat capacity allows up to '+STUDENT_OVERLAP_TOLERANCE_MIN+' minutes of overlap between an outgoing and incoming student for free — a brief handover at a cohort boundary doesn\'t need its own seat — beyond that, both students count toward the limit. No two students sharing a Pod at the same time should be more than '+MAX_YEAR_GAP_IN_POD+' years apart — auto-assignment and re-seating always try that first, and only mix ages more widely than that when literally nothing narrower is staffed and available; a manual booking or move that would mix ages more widely needs an explicit override. “Re-seat by age” takes every non-pinned upcoming student out of their Pod at once and re-seats everyone from scratch, oldest first, so an older student\'s claim on a senior Pod is never blocked by a younger student who simply hasn\'t been reprocessed yet.</p>';
+  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Assign an instructor to each Pod for the day (they can hand off to another instructor partway through); students are then booked into the Pod, not directly to a person. Regular weekly bookings pre-fill this calendar automatically from each student\'s set schedule (see Students below). A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session (arriving a little late, wrapping up a little early, or a short gap between two shifts) still counts as covered — beyond that, it needs an explicit override to book anyway. A minimum year per Pod is enforced everywhere a Pod gets chosen — booking, auto-assignment, and moving a student — Singles Year 9+, Pod 6 Year 7+, Pod 4/5 Year 5+, Pod 3 Year 3+, Pod 1/2 Pre-K+ — always preferring the most senior Pod a student qualifies for; a student below a Pod\'s minimum can never be seated there, even as a last resort (a standing Pod pin is the only sanctioned exception). A Pod\'s 8-seat capacity allows up to '+STUDENT_OVERLAP_TOLERANCE_MIN+' minutes of overlap between an outgoing and incoming student for free — a brief handover at a cohort boundary doesn\'t need its own seat — beyond that, both students count toward the limit. No two students sharing a Pod at the same time should be more than '+MAX_YEAR_GAP_IN_POD+' years apart — auto-assignment and re-seating always try that first, and only mix ages more widely than that when literally nothing narrower is staffed and available; a manual booking or move that would mix ages more widely needs an explicit override. “Re-seat by age” takes every non-pinned upcoming student out of their Pod at once and re-seats everyone from scratch, oldest first, so an older student\'s claim on a senior Pod is never blocked by a younger student who simply hasn\'t been reprocessed yet. If nothing eligible is staffed for a student\'s regular slot at all, their session still gets booked — just with no Pod — and shows up in an "Unassigned" section for that day below, so it\'s always visible rather than silently missing; assign a Pod from there as soon as one\'s available, or leave it for Re-seat by age or the next schedule change to fill in automatically.</p>';
   html+=renderCoverageGrid(weekDates);
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
@@ -2957,6 +3007,8 @@ function renderStaff(){
   }).join('')+'</div>';
 
   if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
+
+  html+=renderUnassignedPanel(dayKey);
 
   pods.forEach(function(pod){
     const roster=sessionsForDay(pod.id, dayKey).slice().sort(function(a,b){ return a.start-b.start; });
