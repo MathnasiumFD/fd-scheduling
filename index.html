@@ -1148,7 +1148,7 @@ function reseatByAge(){
       // Restore them exactly as they were — can't leave a session with no Pod at all.
       sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
       skipped++;
-      skippedDetails.push({studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||orig.podId});
+      skippedDetails.push({studentId:student.id, studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||orig.podId});
       return;
     }
     if(target===orig.podId){
@@ -1162,7 +1162,7 @@ function reseatByAge(){
     if(r.ok){ moved++; } else {
       sess.podId=orig.podId; sess.instructorId=orig.instructorId; sess.instructorId2=orig.instructorId2; sess.handoff=orig.handoff;
       skipped++;
-      skippedDetails.push({studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||orig.podId, error:r.error});
+      skippedDetails.push({studentId:student.id, studentName:student.name, year:year, weekday:weekday, start:sess.start, duration:sess.duration, currentPod:(findPod(orig.podId)||{}).name||orig.podId, error:r.error});
     }
   });
   return {moved:moved, skipped:skipped, pinned:pinned, alreadyBest:alreadyBest, totalUpcoming:totalUpcoming, candidateCount:candidates.length, skippedDetails:skippedDetails};
@@ -1171,20 +1171,37 @@ function reseatByAge(){
 // Groups reseatByAge()'s skippedDetails by exact weekday+time, so a large number of stuck students
 // (easily hundreds at a centre where Pods aren't yet staffed with age tiers in mind) reads as a
 // short, actionable list of WHICH slots need an age-appropriate instructor added, instead of an
-// unusable wall of names. Sorted by how many students are stuck there, worst first — fixing the
-// coverage gap at the top slot or two usually clears the bulk of the backlog.
+// unusable wall of names. Sorted by how many DISTINCT students are stuck there, worst first —
+// fixing the coverage gap at the top slot or two usually clears the bulk of the backlog.
+//
+// Standing/recurring bookings are pre-generated HORIZON_WEEKS (currently 6) weeks ahead as separate
+// session rows (see generateRecurringSessions) — so one real student stuck on a recurring Tuesday
+// slot shows up in skippedDetails once per pre-booked future week, up to 6 times. Counting those
+// raw entries would report "6 kids stuck" when it's really 1 kid stuck on 6 upcoming occurrences of
+// the same session — a ~6x inflation that makes an ordinary gap look like a crisis. `count` here is
+// deduplicated by studentId to reflect real distinct students; `occurrences` keeps the raw
+// session-instance total for anyone who wants to see how many pre-booked weeks are affected.
 function summarizeReseatGaps(skippedDetails){
   const groups={};
   (skippedDetails||[]).forEach(function(d){
     const key=d.weekday+'|'+d.start+'|'+d.duration;
-    if(!groups[key]) groups[key]={weekday:d.weekday, start:d.start, duration:d.duration, count:0, minYear:d.year, maxYear:d.year, currentPods:{}};
+    if(!groups[key]) groups[key]={weekday:d.weekday, start:d.start, duration:d.duration, occurrences:0, minYear:d.year, maxYear:d.year, studentIds:{}, currentPods:{}};
     const g=groups[key];
-    g.count++;
+    g.occurrences++;
     if(d.year<g.minYear) g.minYear=d.year;
     if(d.year>g.maxYear) g.maxYear=d.year;
-    g.currentPods[d.currentPod]=(g.currentPods[d.currentPod]||0)+1;
+    // Fall back to studentName when studentId isn't available (older/synthetic data) so this still
+    // dedupes sensibly rather than crediting every occurrence to one shared "undefined" bucket.
+    const studentKey=d.studentId!=null? d.studentId : d.studentName;
+    if(!g.studentIds[studentKey]){
+      g.studentIds[studentKey]=true;
+      g.currentPods[d.currentPod]=(g.currentPods[d.currentPod]||0)+1;
+    }
   });
-  return Object.keys(groups).map(function(k){ return groups[k]; }).sort(function(a,b){ return b.count-a.count; });
+  return Object.keys(groups).map(function(k){
+    const g=groups[k];
+    return {weekday:g.weekday, start:g.start, duration:g.duration, count:Object.keys(g.studentIds).length, occurrences:g.occurrences, minYear:g.minYear, maxYear:g.maxYear, currentPods:g.currentPods};
+  }).sort(function(a,b){ return b.count-a.count; });
 }
 
 // Diagnostic used right after enrolling a student or saving their regular schedule (5.10): a
@@ -3219,7 +3236,12 @@ function runReseatByAge(){
         }).join('; ');
         msg+=' Couldn\'t move: '+shown+'. Reschedule them to a time an eligible Pod is covered, or add coverage there.';
       } else {
-        msg+=' '+result.skipped+' couldn\'t move — click "View gap report" below to see exactly which day/time slots need coverage added.';
+        // Lead with the deduplicated student count, not result.skipped — a standing weekly booking
+        // is pre-booked several weeks ahead as separate sessions, so the same stuck student can
+        // account for several of those "couldn't move" session-instances at once. Quoting the raw
+        // instance count here reads as a much bigger problem than it actually is.
+        const distinctStuck=state.reseatGapReport.reduce(function(sum,g){ return sum+g.count; },0);
+        msg+=' '+distinctStuck+' student(s) ('+result.skipped+' pre-booked session(s) across their upcoming weeks) couldn\'t move — click "View gap report" below to see exactly which day/time slots need coverage added.';
       }
     } else {
       state.reseatGapReport=null;
@@ -3233,15 +3255,18 @@ function closeReseatGapReport(){ state.reseatGapReportOpen=false; render(); }
 function renderReseatGapModal(){
   if(!state.reseatGapReportOpen || !state.reseatGapReport) return '';
   const groups=state.reseatGapReport;
-  const totalStuck=groups.reduce(function(sum,g){ return sum+g.count; },0);
-  let html='<div class="overlay" onclick="if(event.target===this) closeReseatGapReport()"><div class="modal" style="max-width:640px">';
+  const totalStudents=groups.reduce(function(sum,g){ return sum+g.count; },0);
+  const totalOccurrences=groups.reduce(function(sum,g){ return sum+(g.occurrences||g.count); },0);
+  let html='<div class="overlay" onclick="if(event.target===this) closeReseatGapReport()"><div class="modal" style="max-width:680px">';
   html+='<h3>Where the coverage gaps are</h3>';
-  html+='<p>'+totalStuck+' upcoming session(s) across '+groups.length+' day/time slot(s) have no eligible, age-appropriate Pod staffed. Sorted by how many students are stuck there — adding coverage at the top slot(s) usually clears most of the backlog.</p>';
-  html+='<div style="max-height:60vh;overflow-y:auto"><table><tr><th>Day</th><th>Time</th><th>Stuck</th><th>Year range</th><th>Currently sitting in</th></tr>';
+  html+='<p>'+totalStudents+' distinct student(s) across '+groups.length+' day/time slot(s) have no eligible, age-appropriate Pod staffed'
+    +(totalOccurrences>totalStudents? ' ('+totalOccurrences+' pre-booked upcoming sessions in total, since a standing weekly booking is pre-booked several weeks ahead — the same stuck student can appear on more than one of those weeks)':'')
+    +'. Sorted by how many distinct students are stuck there — adding coverage at the top slot(s) usually clears most of the backlog.</p>';
+  html+='<div style="max-height:60vh;overflow-y:auto"><table><tr><th>Day</th><th>Time</th><th>Students stuck</th><th>Pre-booked weeks</th><th>Year range</th><th>Currently sitting in</th></tr>';
   groups.forEach(function(g){
     const yearRange=g.minYear===g.maxYear? ('Year '+g.minYear) : ('Year '+g.minYear+'–'+g.maxYear);
     const podList=Object.keys(g.currentPods).map(function(p){ return p+' ('+g.currentPods[p]+')'; }).join(', ');
-    html+='<tr><td>'+g.weekday+'</td><td>'+rangeLabel(g.start,g.duration)+'</td><td>'+g.count+'</td><td>'+yearRange+'</td><td>'+podList+'</td></tr>';
+    html+='<tr><td>'+g.weekday+'</td><td>'+rangeLabel(g.start,g.duration)+'</td><td>'+g.count+'</td><td>'+(g.occurrences||g.count)+'</td><td>'+yearRange+'</td><td>'+podList+'</td></tr>';
   });
   html+='</table></div>';
   html+='<div style="display:flex;justify-content:flex-end;margin-top:12px">'
