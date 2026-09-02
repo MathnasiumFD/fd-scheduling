@@ -1692,13 +1692,25 @@ function describeUpcomingChange(change){
 // effectiveFrom on or before the date wins. A null podId entry explicitly means "back to
 // auto-assign" from that date forward; no entries at all (the normal case) means auto-assign has
 // always applied — pickBestPod() picks freely among qualified, available, under-capacity Pods.
+//
+// A pin can optionally be scoped to a single weekday (a.weekday) — this is how a student who
+// genuinely sits in a different Pod on different days (e.g. Pod 6 Monday, Pod 2 Tuesday) is
+// represented, without one day's placement fighting the other's. A weekday-scoped pin always wins
+// over an every-day pin (a.weekday null/unset) covering the same date, regardless of which was set
+// more recently — it's the more specific instruction. Within the same specificity, whichever has
+// the latest effectiveFrom on or before this date wins, same as before.
 function studentAssignedPodOn(studentId, date){
   const student=findStudent(studentId);
   const dateKey=toKey(date);
-  const applicable=(student.podAssignments||[]).filter(function(a){ return toKey(a.effectiveFrom)<=dateKey; });
+  const weekday=WEEKDAY_KEYS[(new Date(date).getDay()+6)%7];
+  const applicable=(student.podAssignments||[]).filter(function(a){
+    return toKey(a.effectiveFrom)<=dateKey && (!a.weekday || a.weekday===weekday);
+  });
   if(applicable.length===0) return null;
-  applicable.sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); });
-  return applicable[applicable.length-1].podId;
+  const daySpecific=applicable.filter(function(a){ return !!a.weekday; });
+  const pool = daySpecific.length? daySpecific : applicable;
+  pool.sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); });
+  return pool[pool.length-1].podId;
 }
 function currentOrUpcomingPodAssignments(studentId){
   const student=findStudent(studentId);
@@ -1707,7 +1719,7 @@ function currentOrUpcomingPodAssignments(studentId){
 
 /* ---------- standing Pod pin (moving forward) ---------- */
 function openStudentPodForm(studentId){
-  state.studentPodForm={studentId, podId:'', effectiveFrom:toKey(simNow()), error:''};
+  state.studentPodForm={studentId, podId:'', effectiveFrom:toKey(simNow()), weekday:'', error:''};
   render();
 }
 function closeStudentPodForm(){ state.studentPodForm=null; render(); }
@@ -1719,12 +1731,20 @@ function setStudentPodField(field, value){
 function saveStudentPodAssignment(){
   const f=state.studentPodForm;
   if(!f.effectiveFrom){ f.error='Choose an effective date.'; render(); return; }
+  const weekday=f.weekday||null; // '' (or unset) means "every day"
   const student=findStudent(f.studentId);
-  student.podAssignments=(student.podAssignments||[]).filter(function(a){ return toKey(a.effectiveFrom)!==f.effectiveFrom; });
-  student.podAssignments.push({podId: f.podId || null, effectiveFrom:new Date(f.effectiveFrom)});
+  // Identity for "replacing" a prior pin is now (effectiveFrom, weekday) together, not just
+  // effectiveFrom alone — a Monday pin and a Tuesday pin sharing the same effective date are two
+  // separate, coexisting entries, not a conflict.
+  student.podAssignments=(student.podAssignments||[]).filter(function(a){
+    return !(toKey(a.effectiveFrom)===f.effectiveFrom && (a.weekday||null)===weekday);
+  });
+  student.podAssignments.push({podId: f.podId || null, effectiveFrom:new Date(f.effectiveFrom), weekday:weekday});
   dbWrite('pinning standing Pod', function(){
-    return supabaseClient.from('student_pod_assignments').delete().eq('student_id', student.id).eq('effective_from', f.effectiveFrom).then(function(){
-      return supabaseClient.from('student_pod_assignments').insert({student_id:student.id, pod_id:f.podId||null, effective_from:f.effectiveFrom});
+    let q=supabaseClient.from('student_pod_assignments').delete().eq('student_id', student.id).eq('effective_from', f.effectiveFrom);
+    q = weekday? q.eq('weekday', weekday) : q.is('weekday', null);
+    return q.then(function(){
+      return supabaseClient.from('student_pod_assignments').insert({student_id:student.id, pod_id:f.podId||null, effective_from:f.effectiveFrom, weekday:weekday});
     });
   });
 
@@ -1732,10 +1752,13 @@ function saveStudentPodAssignment(){
   // new pin actually takes hold for every upcoming standing session — not just ones not yet
   // generated — restoring any linked make-up credit first, same as any other cancellation (5.11).
   // One-off/staff-placed sessions are left alone; only the auto-generated standing ones regenerate.
+  // A weekday-scoped pin only touches sessions on that one weekday — every other day this student
+  // attends is left completely alone, which is the whole point of scoping it.
   let movedCount=0;
   sessions.forEach(function(s){
     if(s.studentId!==student.id || !s.recurring || s.status!=='scheduled') return;
     if(toKey(s.date) < f.effectiveFrom) return;
+    if(weekday && WEEKDAY_KEYS[(new Date(s.date).getDay()+6)%7]!==weekday) return;
     s.status='cancelled';
     movedCount++;
     dbWrite('cancelling a session for a Pod move', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
@@ -1749,15 +1772,22 @@ function saveStudentPodAssignment(){
   });
   regenerateAllRecurring();
   const podName=f.podId? findPod(f.podId).name : 'auto-assign';
-  toast(student.name+' moves to '+podName+' from '+fmtShort(new Date(f.effectiveFrom))+(movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match' : '')+'.');
+  const dayLabel=weekday? ' on '+weekday+'s' : '';
+  toast(student.name+' moves to '+podName+dayLabel+' from '+fmtShort(new Date(f.effectiveFrom))+(movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match' : '')+'.');
   state.studentPodForm=null;
   render();
 }
-function removeStudentPodAssignment(studentId, effectiveFromKey){
+function removeStudentPodAssignment(studentId, effectiveFromKey, weekday){
   const student=findStudent(studentId);
-  student.podAssignments=(student.podAssignments||[]).filter(function(a){ return toKey(a.effectiveFrom)!==effectiveFromKey; });
-  dbWrite('removing standing Pod pin', function(){ return supabaseClient.from('student_pod_assignments').delete()
-    .eq('student_id', studentId).eq('effective_from', effectiveFromKey); });
+  const wd=weekday||null;
+  student.podAssignments=(student.podAssignments||[]).filter(function(a){
+    return !(toKey(a.effectiveFrom)===effectiveFromKey && (a.weekday||null)===wd);
+  });
+  dbWrite('removing standing Pod pin', function(){
+    let q=supabaseClient.from('student_pod_assignments').delete().eq('student_id', studentId).eq('effective_from', effectiveFromKey);
+    q = wd? q.eq('weekday', wd) : q.is('weekday', null);
+    return q;
+  });
   regenerateAllRecurring();
   render();
 }
@@ -3884,15 +3914,18 @@ function renderStudentPodModal(){
   let html='<div class="overlay" onclick="if(event.target===this) closeStudentPodForm()"><div class="modal">';
   html+='<h3>Change '+student.name+'’s Pod</h3>';
   html+='<p>Sets which Pod '+student.name+'’s regular sessions land in from a chosen date forward — today\'s auto-generated sessions and any beyond it regenerate to match. For a one-off change to a single already-booked session instead, use “Move pod” on that session from the day\'s schedule.</p>';
-  html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+(currentPodId? findPod(currentPodId).name : 'Auto-assigned')+'</b></div>';
+  html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+(currentPodId? findPod(currentPodId).name : 'Auto-assigned')+'</b>'+(student.recurring&&student.recurring.length>1? ' <span class="muted">(today — may differ by day, see below)</span>':'')+'</div>';
   if(upcoming.length>0){
     html+='<div class="small muted" style="margin-bottom:8px">Scheduled changes: '+upcoming.map(function(a){
-      return (a.podId? findPod(a.podId).name : 'Auto-assign')+' from '+fmtShort(a.effectiveFrom)+' <a href="#" onclick="removeStudentPodAssignment(\''+student.id+'\',\''+toKey(a.effectiveFrom)+'\');return false;" style="color:var(--danger)">✕</a>';
+      return (a.podId? findPod(a.podId).name : 'Auto-assign')+(a.weekday? ' on '+a.weekday+'s' : ' every day')+' from '+fmtShort(a.effectiveFrom)+' <a href="#" onclick="removeStudentPodAssignment(\''+student.id+'\',\''+toKey(a.effectiveFrom)+'\',\''+(a.weekday||'')+'\');return false;" style="color:var(--danger)">✕</a>';
     }).join(', ')+'</div>';
   }
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<label>Pod</label><select onchange="setStudentPodField(\'podId\',this.value)"><option value=""'+(f.podId===''?' selected':'')+'>Auto-assign (default)</option>'
     +pods.map(function(p){ return '<option value="'+p.id+'"'+(p.id===f.podId?' selected':'')+'>'+p.name+'</option>'; }).join('')
+    +'</select>';
+  html+='<label>Applies to</label><select onchange="setStudentPodField(\'weekday\',this.value)"><option value=""'+(!f.weekday?' selected':'')+'>Every day</option>'
+    +WEEKDAY_KEYS.map(function(w){ return '<option value="'+w+'"'+(f.weekday===w?' selected':'')+'>'+w+'s only</option>'; }).join('')
     +'</select>';
   html+='<label>Effective from</label><input type="date" value="'+f.effectiveFrom+'" onchange="setStudentPodField(\'effectiveFrom\',this.value)"/>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
@@ -4726,7 +4759,7 @@ function loadAllData(){
     T('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes'),
     T('student_recurring_slots','student_id,weekday,start_min'),
     T('student_holds','id,student_id,start_date,end_date,note'),
-    T('student_pod_assignments','id,student_id,pod_id,effective_from'),
+    T('student_pod_assignments','id,student_id,pod_id,effective_from,weekday'),
     T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
     T('parents','id,name,email,auth_user_id'),
@@ -4783,7 +4816,7 @@ function loadAllData(){
       duration:r.duration, sessionsPerWeek:r.sessions_per_week,
       recurring: slotRows.filter(function(s){ return s.student_id===r.id; }).map(function(s){ return {weekday:s.weekday, start:s.start_min}; }),
       holds: holdRows.filter(function(h){ return h.student_id===r.id; }).map(function(h){ return {id:h.id, start:new Date(h.start_date), end:new Date(h.end_date), note:h.note||''}; }),
-      podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from)}; }),
+      podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from), weekday:a.weekday||null}; }),
       planChanges: planChangeRows.filter(function(pc){ return pc.student_id===r.id; }).map(function(pc){ return {
         id:pc.id, effectiveFrom:new Date(pc.effective_from), stopped:pc.stopped, sessionsPerWeek:pc.sessions_per_week,
         recurring: planChangeRecurRows.filter(function(rec){ return rec.plan_change_id===pc.id; }).map(function(rec){ return {weekday:rec.weekday, start:rec.start_min}; }),
