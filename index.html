@@ -310,9 +310,13 @@ var MAKEUP_SAME_DAY_CUTOFF=600; // 10:00am
 // you're ready for real families to start receiving these; the Edge Function itself being
 // undeployed is a second safety net either way.
 var CHECKIN_EMAIL_ENABLED=true;
-function notifyParentOfCheckIn(sessionId){
+// actualStartMin/actualEndMin are passed straight through from the just-confirmed check-in
+// (not re-read from the DB) because dbWrite() above is fire-and-forget — the Edge Function could
+// otherwise query the sessions row before that update has actually committed, and email out the
+// default 90-min time instead of the finish time the parent/front-desk just picked.
+function notifyParentOfCheckIn(sessionId, actualStartMin, actualEndMin){
   if(!CHECKIN_EMAIL_ENABLED || !supabaseClient || !currentUser) return;
-  supabaseClient.functions.invoke('send-checkin-email', {body:{sessionId}}).then(function(r){
+  supabaseClient.functions.invoke('send-checkin-email', {body:{sessionId, actualStartMin, actualEndMin}}).then(function(r){
     if(r && r.error) console.error('Check-in email failed:', r.error);
   }).catch(function(err){ console.error('Check-in email failed:', err); });
 }
@@ -2127,7 +2131,7 @@ function confirmCheckIn(){
   dbWrite('checking in', function(){ return supabaseClient.from('sessions').update({
     check_in_offset:sess.checkInOffset, actual_start_min:sess.actualStart, actual_end_min:sess.actualEnd, status:sess.status
   }).eq('id', sess.id); });
-  notifyParentOfCheckIn(sess.id);
+  notifyParentOfCheckIn(sess.id, sess.actualStart, sess.actualEnd);
   const adjusted = sess.actualEnd!==autoEnd;
   state.checkIn=null;
   if(adjusted){
