@@ -4465,10 +4465,10 @@ function renderParent(){
   if(!parentId) return supabaseClient? '<div class="card"><p class="small muted">Your login isn\'t linked to a parent record — ask front desk to check your account.</p></div>' : renderParentLogin();
   const parent=parents.find(function(p){ return p.id===parentId; });
   let html='<div class="card"><div class="card-head"><h2>Welcome, '+parent.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'parentLogout()')+'">Log out</button></div>'
-    +'<p>MATHQ is your home for managing your child’s Mathnasium sessions. Here you can view upcoming sessions, make changes to your permanent session times, cancel a session and manage or book make-up sessions using the live availability calendar.</p>'
-    +'<p>You’ll only ever see times that are available to book, never other families’ bookings or private centre information.</p>'
-    +'<p>To help us keep everything accurate and up to date, all session cancellations, permanent session changes and make-up bookings are managed through MATHQ rather than by email, SMS or phone. This means your request is updated straight away and you’ll always have the most current information at your fingertips.</p>'
-    +'<p>Easy, quick, and all in one place.</p></div>';
+    +'<p>This is your MATHQ hub for your child’s Mathnasium sessions — see what’s upcoming, update a permanent session time, cancel a session, or book a make-up using our live availability calendar.</p>'
+    +'<p>You’ll only ever see times that are actually available to book — never other families’ bookings or private centre information.</p>'
+    +'<p>Please make all cancellations, permanent time changes and make-up bookings here rather than by phone, email or text. It updates instantly, so we’re always working from the same up-to-date information.</p>'
+    +'<p>Quick, easy, all in one place.</p></div>';
 
   parent.studentIds.forEach(function(sid){
     const student=findStudent(sid);
