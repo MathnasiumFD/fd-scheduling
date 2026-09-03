@@ -3083,7 +3083,12 @@ function renderStaff(){
   html+=renderUnassignedPanel(dayKey);
 
   pods.forEach(function(pod){
-    const roster=sessionsForDay(pod.id, dayKey).slice().sort(function(a,b){ return a.start-b.start; });
+    const roster=sessionsForDay(pod.id, dayKey).slice().sort(function(a,b){
+      // Alphabetical by student name (per Allie, Sept 2026) rather than by start time — easier to
+      // scan a Pod's list and find a specific kid than to hunt across time slots.
+      const an=findStudent(a.studentId).name, bn=findStudent(b.studentId).name;
+      return an.localeCompare(bn, undefined, {sensitivity:'base'}) || a.start-b.start;
+    });
     const peak=peakConcurrency(pod.id, dayKey);
     const cap=podCapacity(pod.id);
     const coverage=podCoverageSummary(pod.id, weekday, selectedDate);
