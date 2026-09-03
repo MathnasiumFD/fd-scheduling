@@ -1062,15 +1062,16 @@ function possibleStarts(duration){
 // or auto-assignment gets blocked.
 function instructorSuitedFor(instr, year){ return year>=instr.yearMin && year<=instr.yearMax; }
 
-// Age-based Pod seating (5.21/5.21c): the main, HARD factor auto-assignment now ranks on, using
-// the centre's real per-Pod minimum-year policy rather than a soft preference. Each Pod has its
-// own minimum school year — a Pod can NEVER take a student below its minimum, full stop, no
-// fallback exception. Pod 4 and Pod 5 share the same minimum (Year 5+) and are genuinely
-// interchangeable parallel options at that tier, same for Pod 1 and Pod 2 (Pre-K+).
+// Age-based Pod seating (5.21/5.21c) — REMOVED as a hard block per Allie (Sept 2026): she needs to
+// be able to override it herself sometimes, and having to set up a standing Pod pin every time was
+// too much friction. POD_MIN_YEAR is kept around (still shown in the now-dead error strings below,
+// and still read by remapPodTiersToRealIds) purely so nothing else breaks, but podEligibleForYear
+// itself always returns true now — auto-assign, manual moves, the waitlist and re-seat can all
+// place any year in any Pod, no warning and no confirmation step. If a real hard floor is wanted
+// again later, restore the `Number(year) >= floor` check below.
 var POD_MIN_YEAR={ podS:9, pod6:7, pod5:5, pod4:5, pod3:3, pod2:-1, pod1:-1 };
 function podEligibleForYear(podId, year){
-  const floor=POD_MIN_YEAR.hasOwnProperty(podId)? POD_MIN_YEAR[podId] : -1;
-  return Number(year) >= floor;
+  return true;
 }
 // Tiers, most-senior first — this IS the fallback/preference order: a Year 9-12 student's first
 // choice is Singles; if that's not staffed or full, Pod 6 next; then Pod 5/Pod 4 (tied, whichever
@@ -4751,7 +4752,29 @@ function afterLogin(){
 // reads/writes — so every existing render/business-logic function keeps working completely
 // unchanged, whether its data came from the demo arrays or from a real database.
 function loadAllData(){
-  const T=function(name, sel){ return supabaseClient.from(name).select(sel).then(function(r){ if(r.error) throw r.error; return r.data||[]; }); };
+  // Supabase/PostgREST silently caps a plain .select() at 1000 rows (its default page size) — with
+  // well over 1000 real session rows once a centre's been running a few months, a plain select()
+  // here was quietly loading only an arbitrary ~1000-row slice of the sessions table and treating
+  // that as the whole schedule. Every "session per student per day" dedup check downstream then
+  // saw a huge blind spot: a real, already-booked session that just didn't happen to be in that
+  // slice looked exactly like "nothing booked yet" and got a brand-new duplicate row inserted for
+  // it — on every single page load, forever, since the new duplicate had no better a chance of
+  // landing in the next arbitrary 1000-row slice either. That's what actually produced the tens of
+  // thousands of duplicate rows discovered Sept 2026 (see the one-time cleanup script), and why the
+  // schedule looked like it was silently rewriting itself. Paginate every table in full via .range()
+  // so this can never truncate silently again, no matter how large any of them grow.
+  const PAGE=1000;
+  const T=function(name, sel){
+    return (function fetchPage(from, acc){
+      return supabaseClient.from(name).select(sel).range(from, from+PAGE-1).then(function(r){
+        if(r.error) throw r.error;
+        const rows=r.data||[];
+        const all=acc.concat(rows);
+        if(rows.length<PAGE) return all; // last page — fewer than a full page means nothing left
+        return fetchPage(from+PAGE, all);
+      });
+    })(0, []);
+  };
   return Promise.all([
     T('instructors','id,name,email,year_min,year_max,auth_user_id,active'),
     T('instructor_avail_rules','instructor_id,weekday,effective_from,off,start_min,end_min'),
