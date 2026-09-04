@@ -750,6 +750,19 @@ function autoExitTime(sess, offset){
   return sess.start+cappedOffset+sess.duration;
 }
 
+// Picks whichever value in a preset list (e.g. CHECKIN_OFFSETS, EXIT_TIME_OPTIONS) sits closest
+// to a target minute value, clamping to the list's own range rather than extrapolating past it —
+// used to default the check-in and check-out time pickers to "whatever's closest to right now"
+// instead of always landing on the scheduled time (5.24).
+function nearestOption(options, target){
+  let best=options[0], bestDiff=Math.abs(options[0]-target);
+  for(let i=1;i<options.length;i++){
+    const diff=Math.abs(options[i]-target);
+    if(diff<bestDiff){ best=options[i]; bestDiff=diff; }
+  }
+  return best;
+}
+
 // Real wall-clock minutes-since-midnight, "right now" — used only for the checked-in countdown.
 // Session/exit times are always real clock times (3–7pm), so this stays independent of the
 // simulated calendar date used everywhere else in this demo (see simNow()) — a countdown to
@@ -2225,9 +2238,14 @@ function removeCredit(id){
 function openAttendanceLog(studentId){ state.attendanceLogFor=studentId; render(); }
 function closeAttendanceLog(){ state.attendanceLogFor=null; render(); }
 
+// Defaults the arrival dropdown to whichever CHECKIN_OFFSETS value is closest to how late/early
+// it actually is right now relative to the scheduled start (5.24) — front desk is checking
+// someone in AS they arrive, so "on time" is a poor default the moment that's not true; this
+// saves having to manually correct it on every late (or early) check-in. Still fully overridable.
 function openCheckIn(sessionId){
   const sess=findSession(sessionId);
-  state.checkIn={sessionId, offset:0, exitTime:autoExitTime(sess,0)};
+  const offset=nearestOption(CHECKIN_OFFSETS, nowMinutesOfDay()-sess.start);
+  state.checkIn={sessionId, offset, exitTime:autoExitTime(sess, offset)};
   render();
 }
 function closeCheckIn(){ state.checkIn=null; render(); }
@@ -2326,6 +2344,55 @@ function setExitTime(sessionId, v){
   sess.actualEnd=Number(v);
   dbWrite('updating exit time', function(){ return supabaseClient.from('sessions').update({actual_end_min:sess.actualEnd}).eq('id', sess.id); });
   toast(findStudent(sess.studentId).name+'\'s exit time updated to '+minToLabel(sess.actualEnd)+'.');
+}
+// Corrects the check-in time recorded for an already-checked-in student (5.23) — lives in the
+// "Checked in today" table right next to exit time, which was already editable there; check-in
+// time wasn't, so a mistaken arrival time (or front desk simply checking someone in late after
+// they'd actually arrived on time) had no way to be fixed after the fact. Also refreshes
+// checkInOffset against the session's scheduled start, since that's what the "(capped)" flag
+// elsewhere (the Pod roster note, the attendance log) reads to know if the 15-min late-grace rule
+// kicked in — leaving it stale after a manual correction would show the wrong badge.
+function setActualStart(sessionId, v){
+  const sess=findSession(sessionId);
+  sess.actualStart=Number(v);
+  sess.checkInOffset=sess.actualStart-sess.start;
+  dbWrite('updating check-in time', function(){ return supabaseClient.from('sessions').update({actual_start_min:sess.actualStart, check_in_offset:sess.checkInOffset}).eq('id', sess.id); });
+  toast(findStudent(sess.studentId).name+'\'s check-in time updated to '+minToLabel(sess.actualStart)+'.');
+}
+
+// Today's checked-in students still present (not yet checked out) — shared by the "Checked in
+// today" panel and the check-out picker so the two always agree on who's still around.
+function checkedInTodayStillPresent(){
+  const todayKey=toKey(simNow());
+  return sessions.filter(function(s){ return s.status==='attended' && toKey(s.date)===todayKey && s.actualEnd!=null && !s.checkedOut; });
+}
+
+// Explicit "Check out" action (5.24) — separate from just editing the exit-time estimate above,
+// this actually records that a student has left and drops them off the live "Checked in today"
+// roster. Lives as one button at the top of that panel (not per-row) since front desk is usually
+// checking out whoever's leaving right now, not scrolling to find a specific row; the time picker
+// defaults to whatever's closest to the actual current clock — not the scheduled/estimated exit —
+// since "in case we signed them out late accidentally" is exactly the case where the estimate
+// isn't what actually happened. sessionId is optional — omit it to default to whoever's been
+// waiting longest (soonest exit time first), or pass one to preselect a specific student.
+function openCheckOut(sessionId){
+  const present=checkedInTodayStillPresent();
+  if(present.length===0) return;
+  const sess=sessionId? findSession(sessionId) : present.slice().sort(function(a,b){ return a.actualEnd-b.actualEnd; })[0];
+  state.checkOut={sessionId:sess.id, exitTime:nearestOption(EXIT_TIME_OPTIONS, nowMinutesOfDay())};
+  render();
+}
+function closeCheckOut(){ state.checkOut=null; render(); }
+function setCheckOutSession(sessionId){ state.checkOut.sessionId=sessionId; render(); }
+function setCheckOutExit(v){ state.checkOut.exitTime=Number(v); render(); }
+function confirmCheckOut(){
+  const sess=findSession(state.checkOut.sessionId);
+  sess.actualEnd=state.checkOut.exitTime;
+  sess.checkedOut=true;
+  dbWrite('checking out', function(){ return supabaseClient.from('sessions').update({actual_end_min:sess.actualEnd, checked_out:true}).eq('id', sess.id); });
+  toast(findStudent(sess.studentId).name+' checked out at '+minToLabel(sess.actualEnd)+'.');
+  state.checkOut=null;
+  render();
 }
 
 function parentLoginSubmit(email){
@@ -2629,7 +2696,12 @@ function openSeatsAt(dateKey, weekday, blockStart, year, blockLen){
   });
   return {seats, staffed};
 }
-function setAvailWeek(w){ state.availWeekOffset=w; render(); }
+// Same collapse-guard as setWeek() above, for the Availability lookup section's own toggle.
+function setAvailWeek(w){
+  state.availWeekOffset=w;
+  if(state.collapsedSections && state.collapsedSections.availability){ state.collapsedSections.availability=false; }
+  render();
+}
 
 /* ---------- waitlist for full day/time slots (5.17) ---------- */
 // The soonest upcoming date that falls on a given weekday, from a given date (inclusive) — used to
@@ -3257,6 +3329,7 @@ function renderStaff(){
   html+=renderReseatGapModal();
   html+=renderPodAssignModal();
   html+=renderCheckInModal();
+  html+=renderCheckOutModal();
   html+=renderMoveModal();
   html+=renderWaitlistModal();
   html+=renderClosedDayModal();
@@ -3385,11 +3458,13 @@ function renderEnrollmentRequestsPanel(){
 }
 
 function renderCheckedInPanel(){
-  const now=simNow();
-  const todays=sessions.filter(function(s){ return s.status==='attended' && toKey(s.date)===toKey(now) && s.actualEnd!=null; })
-    .sort(function(a,b){ return a.actualEnd-b.actualEnd; });
-  let html=sectionOpen('checkedin','Checked in today','<span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+'</span>');
-  html+='<p>Exit time defaults to check-in time plus their usual session length (90 min for most, per each student\'s plan), capped at 15 minutes late per the check-in rule. Adjust it here if a parent\'s pick-up plan changes. “Time left” counts down live against the actual clock, so it stays accurate even if you don\'t touch this page.</p>';
+  const todays=checkedInTodayStillPresent().slice().sort(function(a,b){ return a.actualEnd-b.actualEnd; });
+  let html=sectionOpen('checkedin','Checked in today',
+    '<div style="display:flex;gap:8px;align-items:center">'
+      +'<span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+'</span>'
+      +(todays.length? '<button class="btn sm" onclick="openCheckOut()">Check out</button>' : '')
+    +'</div>');
+  html+='<p>Exit time defaults to check-in time plus their usual session length (90 min for most, per each student\'s plan), capped at 15 minutes late per the check-in rule. Both the checked-in time and exit time can be corrected here if needed — say a parent\'s pick-up plan changes, or the arrival time recorded at check-in was wrong. "Time left" counts down live against the actual clock, so it stays accurate even if you don\'t touch this page. Once a student has actually left, use "Check out" above — it drops them off this list, defaulting to whichever preset time is closest to right now (adjust it if they were signed out earlier or later than that).</p>';
   if(todays.length===0){ html+='<div class="empty-note">Nobody checked in yet today.</div>'; }
   else{
     html+='<table><tr><th>Student</th><th>Pod</th><th>Checked in</th><th>Exit time</th><th>Time left</th></tr>';
@@ -3399,7 +3474,10 @@ function renderCheckedInPanel(){
       const instrLabel = s.instructorId2? (findInstructor(s.instructorId).name+' → '+findInstructor(s.instructorId2).name) : (s.instructorId? findInstructor(s.instructorId).name : '—');
       const adjusted = s.actualEnd!==s.defaultEnd;
       const cd=countdownInfo(s.actualEnd);
-      html+='<tr><td>'+student.name+'</td><td class="small">'+(pod?pod.name:'—')+' · '+instrLabel+'</td><td>'+minToLabel(s.actualStart)+'</td>'
+      html+='<tr><td>'+student.name+'</td><td class="small">'+(pod?pod.name:'—')+' · '+instrLabel+'</td>'
+        +'<td><select onchange="setActualStart(\''+s.id+'\',this.value)">'
+          +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===s.actualStart?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +'</select></td>'
         +'<td><select onchange="setExitTime(\''+s.id+'\',this.value)">'
           +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===s.actualEnd?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select>'
@@ -3587,7 +3665,43 @@ function renderCheckInModal(){
   return html;
 }
 
-function setWeek(w){ state.weekOffset=w; state.selectedDayKey=null; render(); }
+function renderCheckOutModal(){
+  const f=state.checkOut;
+  if(!f) return '';
+  const sess=findSession(f.sessionId);
+  if(!sess) return '';
+  const student=findStudent(sess.studentId);
+  const present=checkedInTodayStillPresent().slice().sort(function(a,b){
+    return findStudent(a.studentId).name.localeCompare(findStudent(b.studentId).name, undefined, {sensitivity:'base'});
+  });
+
+  let html='<div class="overlay" onclick="if(event.target===this) closeCheckOut()"><div class="modal">';
+  html+='<h3>Check out</h3>';
+  html+='<p>Who\'s leaving, and when. Defaults to whoever\'s exit time is soonest and the closest preset time to right now — adjust either if that\'s not quite right (say they were actually signed out a little earlier or later than this).</p>';
+  html+='<label>Student</label><select onchange="setCheckOutSession(this.value)">'
+    +present.map(function(s){ const st=findStudent(s.studentId); const pod=findPod(s.podId); return '<option value="'+s.id+'"'+(s.id===sess.id?' selected':'')+'>'+st.name+(pod? ' — '+pod.name : '')+'</option>'; }).join('')
+  +'</select>';
+  html+='<label>Time exited</label><select onchange="setCheckOutExit(this.value)">'
+    +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.exitTime?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+  +'</select>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeCheckOut()">Cancel</button>'
+    +'<button class="btn primary" onclick="confirmCheckOut()">Confirm check-out</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+
+// Also un-collapses the Schedule section if it's currently collapsed — collapsing hides
+// everything in the card except its header (see .card.collapsed CSS), which includes the day
+// picker and pod cards these buttons are meant to update. Without this, clicking "Next week"
+// while the section happens to be collapsed changes state.weekOffset correctly but produces no
+// visible change at all, which looks exactly like the button doing nothing.
+function setWeek(w){
+  state.weekOffset=w; state.selectedDayKey=null;
+  if(state.collapsedSections && state.collapsedSections.schedule){ state.collapsedSections.schedule=false; }
+  render();
+}
 
 // One-off manual trigger for the age-based re-seat batch job (5.21) — front desk runs this
 // whenever they want existing bookings brought in line with the age-band rule (e.g. right after
@@ -4996,7 +5110,7 @@ function loadAllData(){
     T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
     T('parents','id,name,email,auth_user_id'),
-    T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,booked_by,is_recurring,credit_id'),
+    T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id'),
     T('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note'),
     T('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
     T('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
@@ -5066,7 +5180,7 @@ function loadAllData(){
     sessions=sessionRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
-      actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset,
+      actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false,
       bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id,
     }; });
 
@@ -5146,3 +5260,4 @@ if(supabaseClient){
 </script>
 </body>
 </html>
+  
