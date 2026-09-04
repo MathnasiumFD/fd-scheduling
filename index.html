@@ -630,7 +630,14 @@ var parents=[
   {id:'p5', name:'Priya Singh', email:'priya.singh@example.com', studentIds:['s5']},
 ];
 
-var nextSessionId=100, nextCreditId=100, nextStudentId=100, nextParentId=100, nextInstructorId=10, nextPlanChangeId=1;
+// Named front-desk staff (5.22) — up to now every front-desk login shared one undifferentiated
+// 'staff' role with no individual identity tracked anywhere (unlike instructors/parents, each
+// their own named record). This is that same pattern for front desk itself: a name + email + own
+// login per person, e.g. Allie and "Five Dock Front Staff". Everyone here gets the SAME full
+// front-desk (staff-role) access — this is an identity list, not a separate permission tier.
+var staffMembers=[];
+
+var nextSessionId=100, nextCreditId=100, nextStudentId=100, nextParentId=100, nextInstructorId=10, nextPlanChangeId=1, nextStaffMemberId=1;
 
 // Sessions record podId (the bookable resource) plus the instructor(s) actually covering it,
 // snapshotted at booking time from the pod's schedule — so editing the pod schedule later never
@@ -1495,18 +1502,33 @@ function savePlanChange(){
   student.planChanges = (student.planChanges||[]).filter(function(pc){ return toKey(pc.effectiveFrom)!==f.effectiveFrom; });
   student.planChanges.push(change);
 
-  // Cancel already-generated future standing occurrences from the effective date forward — same
-  // as a standing Pod pin (saveStudentPodAssignment) — so a "stop" or a frequency change actually
-  // takes hold for every upcoming standing session, not just ones not yet generated. Restores any
-  // linked make-up credit first, same as any other cancellation (5.11). One-off/staff-placed
-  // sessions are left alone; only the auto-generated standing ones regenerate.
+  // Clear out already-generated future occurrences from the effective date forward — same as a
+  // standing Pod pin (saveStudentPodAssignment) — so a "stop" or a frequency change actually takes
+  // hold for every upcoming session, not just ones not yet generated. Restores any linked make-up
+  // credit first, same as any other cancellation (5.11).
+  //
+  // Stopping outright (per Allie, Sept 2026) REMOVES every upcoming STANDING session entirely —
+  // it was only ever an auto-generated placeholder, and deleting it frees up its Pod seat right
+  // away instead of leaving 'cancelled' clutter behind. A one-off/make-up session is a specific
+  // booking someone actually arranged, so even when the enrolment stops it's still soft-cancelled
+  // (kept, marked 'cancelled') rather than deleted — same as cancelling any other single session.
+  // A frequency/day-time change (not a full stop) is different again: only standing sessions are
+  // touched at all, and even those are just soft-cancelled, since regenerateAllRecurring()
+  // immediately replaces them with the new pattern — a one-off/staff-placed session is untouched.
   let movedCount=0;
+  const deleteIds=[];
   sessions.forEach(function(s){
-    if(s.studentId!==student.id || !s.recurring || s.status!=='scheduled') return;
+    if(s.studentId!==student.id || s.status!=='scheduled') return;
     if(toKey(s.date) < f.effectiveFrom) return;
-    s.status='cancelled';
+    if(!stopped && !s.recurring) return;
     movedCount++;
-    dbWrite('cancelling a session for a plan change', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+    if(stopped && s.recurring){
+      deleteIds.push(s.id);
+      dbWrite('deleting a standing session for an ended enrolment', function(){ return supabaseClient.from('sessions').delete().eq('id', s.id); });
+    } else {
+      s.status='cancelled';
+      dbWrite('cancelling a session for a plan change', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+    }
     if(s.creditId){
       const cr=findCredit(s.creditId);
       if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){
@@ -1515,6 +1537,7 @@ function savePlanChange(){
       }
     }
   });
+  if(deleteIds.length) sessions=sessions.filter(function(s){ return deleteIds.indexOf(s.id)===-1; });
 
   dbWrite('scheduling a plan change', function(){
     // Deleting any existing row for this exact date first (cascades its own recurring rows) keeps
@@ -1534,7 +1557,9 @@ function savePlanChange(){
   toast(student.name+(stopped
     ? ' scheduled to stop attending from '+fmtShort(new Date(f.effectiveFrom))+'.'
     : '’s schedule changing to '+change.sessionsPerWeek+'x/week from '+fmtShort(new Date(f.effectiveFrom))+'.')
-    +(movedCount? ' '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match.' : ''));
+    +(movedCount? (stopped
+      ? ' '+movedCount+' upcoming session'+(movedCount===1?'':'s')+' cleared (standing ones removed, any one-off bookings kept as cancelled).'
+      : ' '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match.') : ''));
   state.planChangeForm=null;
   render();
 }
@@ -1555,13 +1580,25 @@ function applyStopEnrollment(student, effectiveFrom, note){
   const change={id:newId()||('pc'+(nextPlanChangeId++)), effectiveFrom:effectiveFrom, stopped:true, sessionsPerWeek:0, recurring:[]};
   student.planChanges=(student.planChanges||[]).filter(function(pc){ return toKey(pc.effectiveFrom)!==effKey; });
   student.planChanges.push(change);
-  let movedCount=0;
+  // Stopping enrolment outright REMOVES every upcoming STANDING session from that date forward —
+  // deleted outright, not left as a 'cancelled' row, since it was only ever an auto-generated
+  // placeholder and the whole point is to free up its Pod seat immediately (per Allie, Sept 2026).
+  // A one-off/make-up session is different: it's a specific booking someone actually arranged, so
+  // it's still soft-cancelled (kept, marked 'cancelled') rather than deleted — same as cancelling
+  // any other single session. A linked make-up credit is restored first either way.
+  let deletedCount=0;
+  const deleteIds=[];
   sessions.forEach(function(s){
-    if(s.studentId!==student.id || !s.recurring || s.status!=='scheduled') return;
+    if(s.studentId!==student.id || s.status!=='scheduled') return;
     if(toKey(s.date) < effKey) return;
-    s.status='cancelled';
-    movedCount++;
-    dbWrite('cancelling a session for an ended enrolment', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+    deletedCount++;
+    if(s.recurring){
+      deleteIds.push(s.id);
+      dbWrite('deleting a standing session for an ended enrolment', function(){ return supabaseClient.from('sessions').delete().eq('id', s.id); });
+    } else {
+      s.status='cancelled';
+      dbWrite('cancelling a one-off session for an ended enrolment', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+    }
     if(s.creditId){
       const cr=findCredit(s.creditId);
       if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){
@@ -1570,13 +1607,52 @@ function applyStopEnrollment(student, effectiveFrom, note){
       }
     }
   });
+  sessions=sessions.filter(function(s){ return deleteIds.indexOf(s.id)===-1; });
   dbWrite('scheduling enrolment end', function(){
     return supabaseClient.from('student_plan_changes').delete().eq('student_id', student.id).eq('effective_from', effKey).then(function(){
       return supabaseClient.from('student_plan_changes').insert({id:change.id, student_id:student.id, effective_from:effKey, stopped:true, sessions_per_week:0});
     });
   });
   regenerateAllRecurring();
-  toast(student.name+' scheduled to stop attending from '+fmtShort(effectiveFrom)+(movedCount? ' — '+movedCount+' upcoming session(s) cancelled.' : '.')+(note? ' Parent\'s note: '+note : ''));
+  toast(student.name+' scheduled to stop attending from '+fmtShort(effectiveFrom)+(deletedCount? ' — '+deletedCount+' upcoming session(s) cleared (standing ones removed, any one-off bookings kept as cancelled).' : '.')+(note? ' Parent\'s note: '+note : ''));
+  return change;
+}
+
+// Same underlying mechanism as savePlanChange()'s "change frequency/day/time" mode (frequency
+// stays whatever it already was — a time-change request only ever touches which day(s)/time(s)),
+// just invoked from approving a parent's own request rather than front desk typing it in directly.
+function applyTimeChange(student, effectiveFrom, recurring, note){
+  const effKey=toKey(effectiveFrom);
+  const change={id:newId()||('pc'+(nextPlanChangeId++)), effectiveFrom:effectiveFrom, stopped:false, sessionsPerWeek:recurring.length, recurring:recurring};
+  student.planChanges=(student.planChanges||[]).filter(function(pc){ return toKey(pc.effectiveFrom)!==effKey; });
+  student.planChanges.push(change);
+  let movedCount=0;
+  sessions.forEach(function(s){
+    if(s.studentId!==student.id || !s.recurring || s.status!=='scheduled') return;
+    if(toKey(s.date) < effKey) return;
+    s.status='cancelled';
+    movedCount++;
+    dbWrite('cancelling a session for a schedule change', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+    if(s.creditId){
+      const cr=findCredit(s.creditId);
+      if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){
+        cr.status='available'; cr.redeemedSessionId=null;
+        dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', cr.id); });
+      }
+    }
+  });
+  dbWrite('scheduling a time change', function(){
+    return supabaseClient.from('student_plan_changes').delete().eq('student_id', student.id).eq('effective_from', effKey).then(function(){
+      return supabaseClient.from('student_plan_changes').insert({id:change.id, student_id:student.id, effective_from:effKey, stopped:false, sessions_per_week:change.sessionsPerWeek});
+    }).then(function(r){
+      if(r.error || !change.recurring.length) return r;
+      return supabaseClient.from('student_plan_change_recurring').insert(change.recurring.map(function(rec){
+        return {plan_change_id:change.id, weekday:rec.weekday, start_min:rec.start};
+      }));
+    });
+  });
+  regenerateAllRecurring();
+  toast(student.name+'\'s schedule changing to '+recurringSummary({recurring:recurring})+' from '+fmtShort(effectiveFrom)+(movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match.' : '.')+(note? ' Parent\'s note: '+note : ''));
   return change;
 }
 
@@ -1585,6 +1661,7 @@ function approveEnrollmentRequest(id){
   if(!req) return;
   const student=findStudent(req.studentId);
   if(req.type==='hold'){ applyHold(student, req.start, req.end, req.note); }
+  else if(req.type==='time_change'){ applyTimeChange(student, req.effectiveFrom, req.requestedRecurring||[], req.note); }
   else { applyStopEnrollment(student, req.effectiveFrom, req.note); }
   req.status='approved';
   dbWrite('approving an enrolment request', function(){ return supabaseClient.from('enrollment_requests').update({status:'approved'}).eq('id', req.id); });
@@ -1648,6 +1725,48 @@ function submitCancelRequest(){
   notifyFrontDeskOfEnrollmentRequest(req.id);
   toast('Cancellation request sent to front desk.');
 }
+function openTimeChangeRequestForm(studentId){
+  const student=findStudent(studentId);
+  state.timeChangeRequestForm={
+    studentId, effectiveFrom:toKey(earliestMonthNoticeDate()),
+    recurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
+    note:'', error:''
+  };
+  render();
+}
+function closeTimeChangeRequestForm(){ state.timeChangeRequestForm=null; render(); }
+function setTimeChangeRequestField(field, value){ state.timeChangeRequestForm[field]=value; state.timeChangeRequestForm.error=''; render(); }
+function setTimeChangeRecurringSlot(idx, field, value){
+  state.timeChangeRequestForm.recurring[idx][field] = field==='start'? Number(value) : value;
+  state.timeChangeRequestForm.error='';
+  render();
+}
+function submitTimeChangeRequest(){
+  const f=state.timeChangeRequestForm;
+  if(!f.effectiveFrom){ f.error='Choose the date this should take effect from.'; render(); return; }
+  const effectiveFrom=new Date(f.effectiveFrom);
+  if(!monthNoticeOk(effectiveFrom)){
+    f.error='Schedule change requests need at least a week\'s notice before the 1st of the month they take effect in — the earliest available date is '+fmtShort(earliestMonthNoticeDate())+'.';
+    render(); return;
+  }
+  if(!f.recurring || f.recurring.length===0){ f.error='Add at least one day/time.'; render(); return; }
+  const recurring=f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; });
+  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'time_change', start:null, end:null, effectiveFrom:effectiveFrom, requestedRecurring:recurring, note:f.note.trim(), status:'open', createdAt:simNow()};
+  enrollmentRequests.push(req);
+  dbWrite('submitting a schedule-change request', function(){
+    return supabaseClient.from('enrollment_requests').insert({
+      id:req.id, student_id:req.studentId, type:req.type, start_date:null, end_date:null, effective_from:toKey(req.effectiveFrom), note:req.note, status:req.status, created_at:req.createdAt.toISOString()
+    }).then(function(r){
+      if(r.error) return r;
+      return supabaseClient.from('enrollment_request_recurring').insert(recurring.map(function(rec){
+        return {request_id:req.id, weekday:rec.weekday, start_min:rec.start};
+      }));
+    });
+  });
+  state.timeChangeRequestForm=null;
+  notifyFrontDeskOfEnrollmentRequest(req.id);
+  toast('Schedule change request sent to front desk — you\'ll see it reflected here once it\'s reviewed.');
+}
 
 // Everything a parent should be told is changing about a child's schedule (5.20) — any front-desk-
 // scheduled hold, plan change (stop / frequency change), or standing Pod move that hasn't taken
@@ -1681,7 +1800,7 @@ function describeUpcomingChange(change){
     const pc=change.planChange;
     return pc.stopped
       ? '📋 Scheduled to stop attending from '+fmtShort(new Date(pc.effectiveFrom))+'.'
-      : '📋 Schedule changing to '+pc.sessionsPerWeek+'x/week from '+fmtShort(new Date(pc.effectiveFrom))+'.';
+      : '📋 Schedule changing to '+recurringSummary({recurring:pc.recurring})+' from '+fmtShort(new Date(pc.effectiveFrom))+'.';
   }
   if(change.type==='pod'){
     const a=change.podAssignment;
@@ -3144,6 +3263,7 @@ function renderStaff(){
   html+=renderStudentsPanel();
   html+=renderInstructorsPanel();
   html+=renderParentsPanel();
+  html+=renderFrontStaffPanel();
   html+=renderCreditsReport();
   return html;
 }
@@ -3245,13 +3365,15 @@ function renderEnrollmentRequestsPanel(){
   const open=enrollmentRequests.filter(function(r){ return r.status==='open'; }).sort(function(a,b){ return a.createdAt-b.createdAt; });
   if(open.length===0) return '';
   let html=sectionOpen('enrollRequests','📋 Parent Requests','<span class="small muted">'+open.length+'</span>');
-  html+='<p>Hold and cancel-enrolment requests parents submitted from their own login — approving applies it immediately (same as placing a hold or scheduling a stop yourself); declining just clears it from this list.</p>';
+  html+='<p>Hold, schedule-change, and cancel-enrolment requests parents submitted from their own login — approving applies it immediately (same as placing a hold or changing a student\'s schedule yourself); declining just clears it from this list.</p>';
   html+='<table><tr><th>Student</th><th>Parent</th><th>Request</th><th>Note</th><th></th></tr>';
   open.forEach(function(r){
     const student=findStudent(r.studentId);
     const parent=parents.find(function(p){ return p.id===student.parentId; });
     const detail = r.type==='hold'
       ? 'Hold: '+fmtShort(r.start)+'–'+fmtShort(r.end)
+      : r.type==='time_change'
+      ? 'Change to '+recurringSummary({recurring:r.requestedRecurring||[]})+' from '+fmtShort(r.effectiveFrom)
       : '<span class="badge full">Cancel enrolment</span> from '+fmtShort(r.effectiveFrom);
     html+='<tr><td>'+student.name+'</td><td class="small">'+(parent?parent.name:'—')+'</td>'
       +'<td>'+detail+'</td>'
@@ -3745,6 +3867,64 @@ function renderParentsPanel(){
   });
   html+='</table></div>';
   html+=renderNewParentModal();
+  return html;
+}
+
+/* ---------- Named front-desk staff (5.22) ---------- */
+function openNewStaffForm(){
+  state.newStaffForm={ name:'', email:'', inviteNow:true, error:'' };
+  render();
+}
+function closeNewStaffForm(){ state.newStaffForm=null; render(); }
+function setNewStaffField(field, value){ state.newStaffForm[field]=value; state.newStaffForm.error=''; render(); }
+function saveNewStaff(){
+  const f=state.newStaffForm;
+  if(!f.name.trim()){ f.error='Enter their name.'; render(); return; }
+  if(!f.email.trim()){ f.error='Enter an email address.'; render(); return; }
+  if(staffMembers.some(function(s){ return s.email.toLowerCase()===f.email.trim().toLowerCase(); })){
+    f.error='A staff member with that email already exists.'; render(); return;
+  }
+  const newStaff={id:newId()||('staff'+(nextStaffMemberId++)), name:f.name.trim(), email:f.email.trim(), authUserId:null};
+  staffMembers.push(newStaff);
+  dbWrite('adding a new staff member', function(){ return supabaseClient.from('staff_members').insert({id:newStaff.id, name:newStaff.name, email:newStaff.email}); });
+  toast(newStaff.name+' added to front desk staff.');
+  state.newStaffForm=null;
+  render();
+  if(f.inviteNow) inviteLogin(newStaff.email, 'staff', newStaff.id, newStaff.name);
+}
+function renderNewStaffModal(){
+  const f=state.newStaffForm;
+  if(!f) return '';
+  let html='<div class="overlay" onclick="if(event.target===this) closeNewStaffForm()"><div class="modal">';
+  html+='<h3>Add a front desk staff member</h3>';
+  html+='<label>Name</label><input type="text" value="'+f.name+'" oninput="setNewStaffField(\'name\', this.value)"/>';
+  html+='<label>Email</label><input type="text" value="'+f.email+'" oninput="setNewStaffField(\'email\', this.value)"/>';
+  if(supabaseClient){
+    html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;margin-top:10px"><input type="checkbox" style="width:auto;margin:0" '+(f.inviteNow?'checked':'')+' onchange="setNewStaffField(\'inviteNow\',this.checked)"/> Email them an invite to set up their login now</label>';
+  }
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeNewStaffForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveNewStaff()">Add staff member</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+function renderFrontStaffPanel(){
+  let html=sectionOpen('frontStaff','Front Desk Staff',
+    '<button class="btn sm primary" onclick="openNewStaffForm()">+ Add staff member</button>');
+  html+='<p>Everyone here gets the same full front-desk access as you — this is just a named list (rather than one shared, anonymous login) so it\'s clear who\'s who, e.g. yourself and "Five Dock Front Staff".</p>';
+  html+='<table><tr><th>Name</th><th>Email</th><th>Login</th><th></th></tr>';
+  staffMembers.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
+    const loginCell = !supabaseClient? '<span class="small muted">—</span>'
+      : s.authUserId==='pending'? '<span class="badge soon">Invited</span>'
+      : s.authUserId? '<span class="badge available">Active</span>'
+      : '<button class="btn sm ghost" onclick="inviteLogin(\''+s.email+'\',\'staff\',\''+s.id+'\',\''+s.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
+    html+='<tr><td>'+s.name+'</td><td class="small">'+s.email+'</td><td>'+loginCell+'</td><td></td></tr>';
+  });
+  if(staffMembers.length===0) html+='<tr><td colspan="4" class="small muted">No named staff yet — everyone currently signs in with a shared front-desk login.</td></tr>';
+  html+='</table></div>';
+  html+=renderNewStaffModal();
   return html;
 }
 
@@ -4475,9 +4655,9 @@ function renderParent(){
   if(!parentId) return supabaseClient? '<div class="card"><p class="small muted">Your login isn\'t linked to a parent record — ask front desk to check your account.</p></div>' : renderParentLogin();
   const parent=parents.find(function(p){ return p.id===parentId; });
   let html='<div class="card"><div class="card-head"><h2>Welcome, '+parent.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'parentLogout()')+'">Log out</button></div>'
-    +'<p>This is your MATHQ hub for your child’s Mathnasium sessions — see what’s upcoming, update a permanent session time, cancel a session, or book a make-up using our live availability calendar.</p>'
+    +'<p>This is your MATHQ hub for your child’s Mathnasium sessions — see what’s upcoming, request a permanent day/time change, cancel a session, or book a make-up using our live availability calendar.</p>'
     +'<p>You’ll only ever see times that are actually available to book — never other families’ bookings or private centre information.</p>'
-    +'<p>Please make all cancellations, permanent time changes and make-up bookings here rather than by phone, email or text. It updates instantly, so we’re always working from the same up-to-date information.</p>'
+    +'<p>Please make all cancellations, schedule-change requests and make-up bookings here rather than by phone, email or text. Cancellations and make-up bookings update instantly; a permanent day/time change is reviewed by front desk first, same as a hold or cancelling enrolment.</p>'
     +'<p>Quick, easy, all in one place.</p></div>';
 
   parent.studentIds.forEach(function(sid){
@@ -4488,12 +4668,14 @@ function renderParent(){
 
     html+='<div class="card parent-card">';
     const pendingHold=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='hold' && r.status==='open'; });
+    const pendingTimeChange=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='time_change' && r.status==='open'; });
     const pendingCancel=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='cancel' && r.status==='open'; });
     html+='<div class="parent-header"><div class="avatar-circle">'+initials+'</div>'
       +'<div><h2>'+student.name+'</h2><div class="small muted">'+yearLabel(student.year)+' · '+student.sessionsPerWeek+'x/week · '+student.duration+'-min sessions</div>'
       +'<div class="small muted">Regular schedule: '+recurringSummary(student)+'</div></div>'
       +'<div style="margin-left:auto;display:flex;flex-direction:column;gap:4px;align-items:flex-end">'
         +(pendingHold? '<span class="small muted">Hold request pending</span>' : '<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>')
+        +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Request a permanent day/time change</a>')
         +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>')
       +'</div></div>';
 
@@ -4543,6 +4725,7 @@ function renderParent(){
     html+='</div>';
   });
   html+=renderHoldRequestModal();
+  html+=renderTimeChangeRequestModal();
   html+=renderCancelRequestModal();
   return html;
 }
@@ -4561,6 +4744,24 @@ function renderHoldRequestModal(){
   html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeHoldRequestForm()">Cancel</button>'
     +'<button class="btn primary" onclick="submitHoldRequest()">Send request</button>'
+  +'</div></div></div>';
+  return html;
+}
+function renderTimeChangeRequestModal(){
+  const f=state.timeChangeRequestForm;
+  if(!f) return '';
+  const student=findStudent(f.studentId);
+  const starts=possibleStarts(student.duration);
+  let html='<div class="overlay" onclick="if(event.target===this) closeTimeChangeRequestForm()"><div class="modal">';
+  html+='<h3>Request a permanent day/time change for '+student.name+'</h3>';
+  html+='<p>Pick the new regular day(s)/time(s) — the number of sessions per week stays the same ('+f.recurring.length+'x/week). Front desk will review this before anything changes; schedule change requests need at least a week\'s notice before the 1st of the month they take effect in.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+=renderRecurringPickers(f.recurring, starts, 'setTimeChangeRecurringSlot');
+  html+='<label>Effective from</label><input type="date" value="'+f.effectiveFrom+'" onchange="setTimeChangeRequestField(\'effectiveFrom\',this.value)"/>';
+  html+='<label>Note (optional)</label><input type="text" placeholder="e.g. school sport moved to Tuesdays" value="'+f.note+'" oninput="setTimeChangeRequestField(\'note\',this.value)"/>';
+  html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeTimeChangeRequestForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="submitTimeChangeRequest()">Send request</button>'
   +'</div></div></div>';
   return html;
 }
@@ -4802,8 +5003,10 @@ function loadAllData(){
     T('waitlist_entries','id,student_id,name,year,weekday,start_min,duration,note,status,notified,date_added'),
     T('closed_days','id,the_date,label,recurring'),
     T('enrollment_requests','id,student_id,type,start_date,end_date,effective_from,note,status,created_at'),
+    T('enrollment_request_recurring','id,request_id,weekday,start_min'),
+    T('staff_members','id,name,email,auth_user_id'),
   ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows]=t;
+    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,staffMemberRows]=t;
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
@@ -4892,7 +5095,13 @@ function loadAllData(){
       start: r.start_date? new Date(r.start_date) : null,
       end: r.end_date? new Date(r.end_date) : null,
       effectiveFrom: r.effective_from? new Date(r.effective_from) : null,
+      requestedRecurring: enrollRequestRecurRows.filter(function(rr){ return rr.request_id===r.id; })
+        .map(function(rr){ return {weekday:rr.weekday, start:rr.start_min}; }),
       note:r.note||'', status:r.status, createdAt:new Date(r.created_at),
+    }; });
+
+    staffMembers=staffMemberRows.map(function(r){ return {
+      id:r.id, name:r.name, email:r.email, authUserId:r.auth_user_id,
     }; });
   });
 }
