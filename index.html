@@ -770,12 +770,17 @@ var CREDIT_EXPIRY_NOTICE_DAYS=28;
 // "nobody can cover this shift" alert (5.14), so the manager finds out even if front desk hasn't
 // checked the coverage-requests panel yet. Configurable per center in the real product.
 var MANAGER_EMAIL='manager@mathnasium-demo.example';
-// A full 5-minute grid (not the old sparse [-15,-10,-5,0,5,10,15,20,30,45,60] list, which had gaps
-// of up to 15 minutes past the +20 mark) — so openCheckIn()'s "default to whichever preset is
-// closest to right now" (below) always lands within 2.5 minutes of the real current time, for any
-// arrival from 15 min early to 2 hours late, instead of snapping to a coarse, far-off preset. Front
-// desk can still freely pick any other value from the same dropdown.
-var CHECKIN_OFFSETS=(function(){ const arr=[]; for(let v=-15;v<=120;v+=5) arr.push(v); return arr; })();
+// Arrival is picked as an absolute clock time (same grid as EXIT_TIME_OPTIONS — every 5 minutes
+// across the center's open hours), not an offset from the session's own scheduled start (5.27 fix).
+// The offset-based version (CHECKIN_OFFSETS, clamped to -15..+120 relative to sess.start) only gave
+// an accurate "closest to right now" default for a student whose OWN session happened to start
+// within about 2 hours of the real current time — anyone checking in well before or after their
+// scheduled start (a walk-in early, or catching up on a check-in from earlier in the shift) got a
+// default clamped near their own start time instead, which is what "only some of the kids are
+// checking in at the current time" turned out to mean. An absolute grid has no such blind spot,
+// exactly mirroring how the exit-time picker (openCheckOut(), below) already worked. Kept as its
+// own name for readability even though the values are identical to EXIT_TIME_OPTIONS.
+var CHECKIN_TIME_OPTIONS=EXIT_TIME_OPTIONS;
 // The exit time at check-in pre-fills automatically — arrival time plus the session's usual
 // length, capped at the 15-min-late rule. Staff can still override it, in 5-min steps.
 function autoExitTime(sess, offset){
@@ -783,7 +788,7 @@ function autoExitTime(sess, offset){
   return sess.start+cappedOffset+sess.duration;
 }
 
-// Picks whichever value in a preset list (e.g. CHECKIN_OFFSETS, EXIT_TIME_OPTIONS) sits closest
+// Picks whichever value in a preset list (e.g. CHECKIN_TIME_OPTIONS, EXIT_TIME_OPTIONS) sits closest
 // to a target minute value, clamping to the list's own range rather than extrapolating past it —
 // used to default the check-in and check-out time pickers to "whatever's closest to right now"
 // instead of always landing on the scheduled time (5.24).
@@ -2185,10 +2190,29 @@ function removeCredit(id){
 function openAttendanceLog(studentId){ state.attendanceLogFor=studentId; render(); }
 function closeAttendanceLog(){ state.attendanceLogFor=null; render(); }
 
-// Defaults the arrival dropdown to whichever CHECKIN_OFFSETS value is closest to how late/early
-// it actually is right now relative to the scheduled start (5.24) — front desk is checking
-// someone in AS they arrive, so "on time" is a poor default the moment that's not true; this
-// saves having to manually correct it on every late (or early) check-in. Still fully overridable.
+// A student can be checked in for right now, or backdated earlier (catching up on one missed
+// earlier in the shift), but never for a time that hasn't happened yet (5.29, per Allie) — so for a
+// session dated TODAY, the latest selectable arrival is the actual current clock; for one dated
+// before today, "the future" isn't a meaningful idea (the whole day is already over), so the full
+// center-hours range stays open, same as ever.
+function checkInMaxArrival(sess){
+  return toKey(sess.date)===toKey(simNow())? nowMinutesOfDay() : CENTER_CLOSE;
+}
+// The arrival dropdown's actual option list — CHECKIN_TIME_OPTIONS trimmed to whatever's not in the
+// future per checkInMaxArrival() above. Falls back to just the center's opening time in the (very
+// unlikely) case check-in is happening before the center has even opened for the day, so the list
+// is never empty.
+function checkInArrivalOptions(sess){
+  const cap=checkInMaxArrival(sess);
+  const options=CHECKIN_TIME_OPTIONS.filter(function(t){ return t<=cap; });
+  return options.length? options : [CHECKIN_TIME_OPTIONS[0]];
+}
+// Defaults the arrival dropdown to whichever CHECKIN_TIME_OPTIONS value is closest to the real
+// current clock (5.24, revised 5.27 to use an absolute time rather than an offset from this
+// session's own scheduled start — see the comment on CHECKIN_TIME_OPTIONS above for why) — front
+// desk is checking someone in AS they arrive, so "on time" is a poor default the moment that's not
+// true; this saves having to manually correct it on every late (or early) check-in. Still fully
+// overridable, down to any earlier time, but never a later one (5.29).
 function openCheckIn(sessionId){
   const sess=findSession(sessionId);
   // Belt-and-suspenders alongside the row-action button already being hidden for a future date
@@ -2199,7 +2223,7 @@ function openCheckIn(sessionId){
     toast("Can't check in "+findStudent(sess.studentId).name+" yet — that session is on "+fmtShort(sess.date)+', a future date.');
     return;
   }
-  const offset=nearestOption(CHECKIN_OFFSETS, nowMinutesOfDay()-sess.start);
+  const arrival=nearestOption(checkInArrivalOptions(sess), nowMinutesOfDay());
   // If the student walks in with no Pod chosen yet (booked as Unassigned, or auto-assignment never
   // found one), suggest one right away via pickBestPod() — same "pre-filled, editable" pattern used
   // everywhere else — so front desk isn't forced to check in first and go hunt them down in the
@@ -2211,14 +2235,18 @@ function openCheckIn(sessionId){
     const suggested=pickBestPod(weekday, toKey(sess.date), sess.start, sess.duration, student.year, studentAssignedPodOn(student.id, sess.date));
     if(suggested) movePodSession(sessionId, suggested);
   }
-  state.checkIn={sessionId, offset, exitTime:autoExitTime(sess, offset)};
+  state.checkIn={sessionId, arrival, exitTime:autoExitTime(sess, arrival-sess.start)};
   render();
 }
 function closeCheckIn(){ state.checkIn=null; render(); }
-function setCheckInOffset(v){
-  state.checkIn.offset=Number(v);
+function setCheckInArrival(v){
   const sess=findSession(state.checkIn.sessionId);
-  state.checkIn.exitTime=autoExitTime(sess, state.checkIn.offset);
+  // Re-clamped against checkInArrivalOptions() rather than trusted as-is — belt-and-suspenders
+  // against a value that was valid when the dropdown rendered but no longer is (the clock ticked
+  // forward past it while the modal sat open); nearestOption() is a no-op whenever v is still one
+  // of the allowed options, which is every ordinary click.
+  state.checkIn.arrival=nearestOption(checkInArrivalOptions(sess), Number(v));
+  state.checkIn.exitTime=autoExitTime(sess, state.checkIn.arrival-sess.start);
   render();
 }
 function setCheckInExit(v){ state.checkIn.exitTime=Number(v); render(); }
@@ -2231,10 +2259,14 @@ function confirmCheckIn(){
     render();
     return;
   }
-  const offset=state.checkIn.offset;
+  // Same belt-and-suspenders re-clamp as setCheckInArrival() — guards the rare case where the
+  // modal was left open long enough that the arrival it was last set to is now later than "right
+  // now" (only possible for a session dated today; checkInMaxArrival() never restricts a past date).
+  state.checkIn.arrival=nearestOption(checkInArrivalOptions(sess), state.checkIn.arrival);
+  const offset=state.checkIn.arrival-sess.start;
   const autoEnd=autoExitTime(sess, offset);
   sess.checkInOffset=offset;
-  sess.actualStart=sess.start+offset;
+  sess.actualStart=state.checkIn.arrival;
   sess.actualEnd=state.checkIn.exitTime;
   sess.status='attended';
   dbWrite('checking in', function(){ return supabaseClient.from('sessions').update({
@@ -3396,13 +3428,20 @@ function renderCoverageGrid(weekDates){
 // list, see scheduleListForDay()/renderStaff()). "Assign" here is about STAFFING the Pod (which
 // instructor runs it) — a different concern from which students sit in it, which now lives in each
 // student's own row via the Pod dropdown (podOptionLabel/setSessionPod).
-// Names of every student currently checked in (attended, not yet checked out) at each Pod on the
-// given day — front desk asked to see who's actually sitting in a Pod right from this strip,
-// without opening the "Checked in today" panel or scanning the full Schedule list below.
+// Names of every student sitting at each Pod on the given day — for TODAY that means "checked in
+// and not yet checked out" (a live, moment-to-moment roster: a name drops off the instant that
+// student is checked out, freeing the seat), which is what drives the live 1/8, 2/8... occupancy
+// badge in renderPodSummaryStrip() below (5.28). For any OTHER day — a day already past, whose
+// checked-in students have long since been checked out — dropping the "not checked out" filter
+// turns this into that day's actual historical seating record instead: everyone who ever attended
+// there that day, kept for training/adjustment reference (Sept 2026, per Allie). A future day
+// naturally comes back empty either way, since nobody's attended yet.
 function checkedInNamesByPod(dayKey){
+  const live = dayKey===toKey(simNow());
   const byPod={};
   sessions.forEach(function(s){
-    if(s.status!=='attended' || s.checkedOut || !s.podId || toKey(s.date)!==dayKey) return;
+    if(s.status!=='attended' || !s.podId || toKey(s.date)!==dayKey) return;
+    if(live && s.checkedOut) return;
     const student=findStudent(s.studentId);
     if(!student) return;
     (byPod[s.podId]=byPod[s.podId]||[]).push(student.name);
@@ -3410,12 +3449,14 @@ function checkedInNamesByPod(dayKey){
   Object.keys(byPod).forEach(function(podId){ byPod[podId].sort(function(a,b){ return a.localeCompare(b, undefined, {sensitivity:'base'}); }); });
   return byPod;
 }
-// Same idea, keyed by instructor instead of Pod, for whoever's currently checked in to that
-// instructor's Online group — the Online strip's own equivalent of checkedInNamesByPod.
+// Same idea, keyed by instructor instead of Pod, for whoever's sitting in that instructor's Online
+// group — the Online strip's own equivalent of checkedInNamesByPod, live-vs-historical the same way.
 function checkedInNamesByOnlineInstructor(dayKey){
+  const live = dayKey===toKey(simNow());
   const byInstr={};
   sessions.forEach(function(s){
-    if(s.status!=='attended' || s.checkedOut || !s.online || toKey(s.date)!==dayKey) return;
+    if(s.status!=='attended' || !s.online || toKey(s.date)!==dayKey) return;
+    if(live && s.checkedOut) return;
     const student=findStudent(s.studentId);
     if(!student) return;
     (byInstr[s.instructorId]=byInstr[s.instructorId]||[]).push(student.name);
@@ -3423,19 +3464,37 @@ function checkedInNamesByOnlineInstructor(dayKey){
   Object.keys(byInstr).forEach(function(id){ byInstr[id].sort(function(a,b){ return a.localeCompare(b, undefined, {sensitivity:'base'}); }); });
   return byInstr;
 }
+// The combined (physical + online) headcount an instructor is personally minding on a given day —
+// the number the 1:9 ratio caps — mirroring checkedInNamesByPod()'s live-vs-historical rule: live
+// (checked in, not yet checked out) for today, everyone who attended that day at all for any other
+// day. Deliberately independent of instructorCombinedPeak() (below), which stays schedule/peak-based
+// for booking-time capacity checks on a session that may not have happened yet — this is the
+// "how many are actually sitting with this instructor right now" figure for the summary strip badge.
+function instructorOccupantCount(instructorId, dayKey){
+  const live = dayKey===toKey(simNow());
+  return sessions.filter(function(s){
+    if(s.status!=='attended' || toKey(s.date)!==dayKey) return false;
+    if(live && s.checkedOut) return false;
+    return s.instructorId===instructorId || s.instructorId2===instructorId;
+  }).length;
+}
 
 function renderPodSummaryStrip(dayKey, weekday){
   const selectedDate=new Date(dayKey);
   const checkedInByPod=checkedInNamesByPod(dayKey);
   let html='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
   pods.forEach(function(pod){
-    const peak=peakConcurrency(pod.id, dayKey);
     const cap=podCapacity(pod.id);
     const coverage=podCoverageSummary(pod.id, weekday, selectedDate);
     const checkedIn=checkedInByPod[pod.id]||[];
+    // The badge counts who's actually sitting there (live today, the day's full record for any
+    // other day — see checkedInNamesByPod()) rather than the day's busiest scheduled overlap, so it
+    // climbs 1/8, 2/8, 3/8... as each student is checked in and assigned here, exactly the "seats
+    // filling up" view front desk watches through the day (5.28, per Allie).
+    const occupancy=checkedIn.length;
     html+='<div class="pill" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
       +'<b>'+pod.name+'</b><span class="small muted">'+coverage+'</span>'
-      +'<span class="badge '+(peak>=cap?'full':'available')+'">'+peak+'/'+cap+'</span>'
+      +'<span class="badge '+(occupancy>=cap?'full':'available')+'">'+occupancy+'/'+cap+'</span>'
       +(checkedIn.length? '<span class="small">✓ '+checkedIn.join(', ')+'</span>' : '')
       +'<button class="btn sm ghost" onclick="openPodAssignForm(\''+pod.id+'\',\''+weekday+'\')">Assign</button>'
     +'</div>';
@@ -3456,11 +3515,11 @@ function renderPodSummaryStrip(dayKey, weekday){
     onlineInstructorIds.forEach(function(instrId){
       const instr=findInstructor(instrId);
       if(!instr) return;
-      const peak=instructorCombinedPeak(instrId, dayKey); // combined (physical + online) — the number the 1:9 ratio actually caps
+      const occupancy=instructorOccupantCount(instrId, dayKey); // combined (physical + online) headcount actually sitting with this instructor — the number the 1:9 ratio caps
       const checkedIn=checkedInByOnlineInstructor[instrId]||[];
       html+='<div class="pill online" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
         +'<b>Online — '+instr.name+'</b>'
-        +'<span class="badge '+(peak>=ONLINE_COMBINED_CAP?'full':'available')+'">'+peak+'/'+ONLINE_COMBINED_CAP+'</span>'
+        +'<span class="badge '+(occupancy>=ONLINE_COMBINED_CAP?'full':'available')+'">'+occupancy+'/'+ONLINE_COMBINED_CAP+'</span>'
         +(checkedIn.length? '<span class="small">✓ '+checkedIn.join(', ')+'</span>' : '')
       +'</div>';
     });
@@ -3548,9 +3607,10 @@ function renderStaff(){
   html+=renderClosedDaysPanel();
 
   html+=sectionOpen('schedule','Schedule',
-      '<div style="display:flex;gap:6px">'
+      '<div style="display:flex;gap:6px;align-items:center">'
         +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
         +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
+        +'<input type="date" class="small" value="'+dayKey+'" max="'+toKey(addDays(now,365))+'" onchange="jumpToDate(this.value)" title="Jump to any date — including a past day, to see how it was seated"/>'
         +(isPast || closure? '' : '<button class="btn sm primary" onclick="openBooking(null,\''+dayKey+'\')">+ Book a session</button>')
       +'</div>');
   html+='<div class="daypicker">'+weekDates.map(function(d){
@@ -3928,7 +3988,8 @@ function renderCheckInModal(){
   if(!state.checkIn) return '';
   const sess=findSession(state.checkIn.sessionId);
   const student=findStudent(sess.studentId);
-  const offset=state.checkIn.offset;
+  const arrival=state.checkIn.arrival;
+  const offset=arrival-sess.start;
   const autoEnd=autoExitTime(sess, offset);
   const exitTime=state.checkIn.exitTime;
   const adjusted = exitTime!==autoEnd;
@@ -3941,8 +4002,8 @@ function renderCheckInModal(){
   html+='<label>Pod</label><select onchange="setSessionLocation(\''+sess.id+'\',this.value)"><option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
     +locationOptionsHtml(weekday, dateKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
   +'</select>';
-  html+='<label>Arrival</label><select onchange="setCheckInOffset(this.value)">'
-    +CHECKIN_OFFSETS.map(function(v){ return '<option value="'+v+'"'+(v===offset?' selected':'')+'>'+minToLabel(sess.start+v)+'</option>'; }).join('')
+  html+='<label>Arrival</label><select onchange="setCheckInArrival(this.value)">'
+    +checkInArrivalOptions(sess).map(function(t){ return '<option value="'+t+'"'+(t===arrival?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
     +'</select>';
   html+='<label>Exit time</label><select onchange="setCheckInExit(this.value)">'
     +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===exitTime?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
@@ -3952,7 +4013,7 @@ function renderCheckInModal(){
   } else if(offset>LATE_GRACE_MIN){
     html+='<div class="banner warn">⏰ Exit time capped at '+LATE_GRACE_MIN+' minutes late, not their full '+sess.duration+' minutes.</div>';
   } else {
-    html+='<div class="banner info">Session will run '+minToLabel(sess.start+offset)+'–'+minToLabel(exitTime)+'.</div>';
+    html+='<div class="banner info">Session will run '+minToLabel(arrival)+'–'+minToLabel(exitTime)+'.</div>';
   }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeCheckIn()">Cancel</button>'
@@ -4001,6 +4062,25 @@ function setWeek(w){
 }
 
 function selectDay(k){ state.selectedDayKey=k; render(); }
+
+// Jumps the Schedule section straight to any date — including one long past — rather than only
+// ever reaching "this week" or "next week" one click at a time (5.28, per Allie: front desk wants
+// to pull up how a past day was actually seated, for training/adjustment purposes). Works by
+// landing on that date's own week (so the existing Mon-Fri day picker and every day-driven render —
+// the Pod summary strip, the schedule list with its actual check-in/out times — just work exactly
+// as they already do for "this week"/"next week", no separate history view needed). A weekend date
+// has no matching day-picker button, so it silently falls back to that week's Monday, same as any
+// other selectedDayKey that doesn't land in the visible week.
+function jumpToDate(dateStr){
+  if(!dateStr) return;
+  const target=new Date(dateStr);
+  const mondayOfTarget=getMonday(target);
+  const mondayOfThisWeek=getMonday(simNow());
+  state.weekOffset=Math.round((mondayOfTarget-mondayOfThisWeek)/(7*86400000));
+  state.selectedDayKey=toKey(target);
+  if(state.collapsedSections && state.collapsedSections.schedule){ state.collapsedSections.schedule=false; }
+  render();
+}
 
 // Builds each Pod's <option> label for any dropdown that lets front desk choose a Pod directly —
 // this booking modal and the flat Schedule list's per-student picker (renderScheduleList) both use
