@@ -387,6 +387,12 @@ var EXIT_TIME_OPTIONS=(function(){ const arr=[]; for(let t=CENTER_OPEN;t<=CENTER
 var AVAIL_STEP=30; // availability lookup shows seats in half-hour columns
 var AVAIL_DISPLAY_END=1080; // ...and stops at 6:00pm, even though the center is open until 7pm
 var AVAIL_BLOCKS=(function(){ const arr=[]; for(let t=CENTER_OPEN;t<AVAIL_DISPLAY_END;t+=AVAIL_STEP) arr.push(t); return arr; })();
+// A seat only counts as genuinely "open" at a given column if it stays open for a real session's
+// length, not just that one 30-min sliver (bug flagged Sept 2026 by Allie: "3pm: 3 open" was
+// misleading when that pod fills up again by 3:30pm — nobody could actually book a session there).
+// 90 is the longer of the two standard lengths (60/90 min), so a column that clears this bar is
+// guaranteed open for either.
+var AVAIL_MIN_SESSION_LEN=90;
 
 var BASE = new Date(2026,7,21); // anchor "today" for the demo narrative — a Friday
 
@@ -3500,7 +3506,7 @@ function renderAvailabilityLookup(){
       +'<button class="btn sm'+(state.availWeekOffset===0?' primary':'')+'" onclick="setAvailWeek(0)">This week</button>'
       +'<button class="btn sm'+(state.availWeekOffset===1?' primary':'')+'" onclick="setAvailWeek(1)">Next week</button>'
     +'</div>');
-  html+='<p>Open seats in 30-minute columns, up to 6:00pm, summed across every Pod with an assigned instructor covering that half-hour — a quick reference for sales calls, so front desk can tell a parent on the spot whether there\'s room, for any year (every instructor can teach any year, 5.3). “No staff” means no Pod has an instructor assigned that half-hour; “Full” means staffed but at capacity. Click a full or unstaffed slot to add someone to the waitlist for it.</p>';
+  html+='<p>Open seats in 30-minute columns, up to 6:00pm, summed across every Pod with an assigned instructor covering that half-hour — a quick reference for sales calls, so front desk can tell a parent on the spot whether there\'s room, for any year (every instructor can teach any year, 5.3). A column only counts a seat as open if it stays open for at least '+AVAIL_MIN_SESSION_LEN+' minutes from that start time, not just that one half-hour — otherwise it could show "open" right before filling back up mid-session. “No staff” means no Pod has an instructor assigned that half-hour; “Full” means staffed but at capacity (for the full session length). Click a full or unstaffed slot to add someone to the waitlist for it.</p>';
   html+='<div class="avail-grid" style="grid-template-columns:90px repeat('+AVAIL_BLOCKS.length+',1fr)">';
   html+='<div></div>'+AVAIL_BLOCKS.map(function(hb){ return '<div class="cal-head">'+minToLabel(hb)+'</div>'; }).join('');
   days.forEach(function(d,i){
@@ -3508,7 +3514,7 @@ function renderAvailabilityLookup(){
     const dateKey=toKey(d);
     html+='<div class="cal-row-label">'+weekday+' <span class="small muted" style="font-weight:400">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></div>';
     AVAIL_BLOCKS.forEach(function(hb){
-      const r=openSeatsAt(dateKey, weekday, hb, '', AVAIL_STEP);
+      const r=openSeatsAt(dateKey, weekday, hb, '', AVAIL_MIN_SESSION_LEN);
       let cls='avail-cell', label;
       if(r.staffed===0){ cls+=' nostaff-cell'; label='No staff'; }
       else if(r.seats===0){ cls+=' full-cell'; label='Full'; }
