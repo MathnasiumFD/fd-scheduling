@@ -730,6 +730,12 @@ var state={
   holdRequestForm:null,
   cancelRequestForm:null,
   toast:null,
+  // Students/Instructors/Parents/Front Desk Staff are roster-management sections front desk dips
+  // into occasionally, not the day-to-day view (that's Schedule, above them) — collapsed by
+  // default so the page opens on the actual schedule instead of a wall of admin tables. Still just
+  // a plain key in this same collapsedSections map, so clicking any of these open (or the ones
+  // above closed) works exactly the same via toggleSection().
+  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true},
 };
 
 // how late (minutes) a student can arrive before the session's end time stops moving with them —
@@ -2958,16 +2964,34 @@ function renderCoverageGrid(weekDates){
 // list, see scheduleListForDay()/renderStaff()). "Assign" here is about STAFFING the Pod (which
 // instructor runs it) — a different concern from which students sit in it, which now lives in each
 // student's own row via the Pod dropdown (podOptionLabel/setSessionPod).
+// Names of every student currently checked in (attended, not yet checked out) at each Pod on the
+// given day — front desk asked to see who's actually sitting in a Pod right from this strip,
+// without opening the "Checked in today" panel or scanning the full Schedule list below.
+function checkedInNamesByPod(dayKey){
+  const byPod={};
+  sessions.forEach(function(s){
+    if(s.status!=='attended' || s.checkedOut || !s.podId || toKey(s.date)!==dayKey) return;
+    const student=findStudent(s.studentId);
+    if(!student) return;
+    (byPod[s.podId]=byPod[s.podId]||[]).push(student.name);
+  });
+  Object.keys(byPod).forEach(function(podId){ byPod[podId].sort(function(a,b){ return a.localeCompare(b, undefined, {sensitivity:'base'}); }); });
+  return byPod;
+}
+
 function renderPodSummaryStrip(dayKey, weekday){
   const selectedDate=new Date(dayKey);
+  const checkedInByPod=checkedInNamesByPod(dayKey);
   let html='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
   pods.forEach(function(pod){
     const peak=peakConcurrency(pod.id, dayKey);
     const cap=podCapacity(pod.id);
     const coverage=podCoverageSummary(pod.id, weekday, selectedDate);
-    html+='<div class="pill" style="display:flex;align-items:center;gap:8px">'
+    const checkedIn=checkedInByPod[pod.id]||[];
+    html+='<div class="pill" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
       +'<b>'+pod.name+'</b><span class="small muted">'+coverage+'</span>'
       +'<span class="badge '+(peak>=cap?'full':'available')+'">'+peak+'/'+cap+'</span>'
+      +(checkedIn.length? '<span class="small">✓ '+checkedIn.join(', ')+'</span>' : '')
       +'<button class="btn sm ghost" onclick="openPodAssignForm(\''+pod.id+'\',\''+weekday+'\')">Assign</button>'
     +'</div>';
   });
@@ -3059,8 +3083,6 @@ function renderStaff(){
         +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
         +(isPast || closure? '' : '<button class="btn sm primary" onclick="openBooking(null,\''+dayKey+'\')">+ Book a session</button>')
       +'</div>');
-  html+='<p>Up to 6 group Pods, plus a Singles pod for 1:1 work. Every student expected a given day is listed below in one place, oldest bookings and new ones alike — pick or change their Pod right from the dropdown on their row; it defaults to wherever they\'d land automatically, but nothing stops you from putting anyone anywhere there\'s room. The only real limit is each Pod\'s 8-seat capacity (1:8) — Pod capacity allows up to '+STUDENT_OVERLAP_TOLERANCE_MIN+' minutes of overlap between an outgoing and incoming student for free, a brief handover at a cohort boundary doesn\'t need its own seat. A Pod with an instructor covering all but '+UNATTENDED_TOLERANCE_MIN+' minutes or less of a session still counts as covered; beyond that, booking into it needs an explicit override. If nothing\'s picked for a student at all, their session still gets booked — just Unassigned — so it\'s always visible here rather than silently missing.</p>';
-  html+=renderCoverageGrid(weekDates);
   html+='<div class="daypicker">'+weekDates.map(function(d){
     const k=toKey(d);
     return '<button class="daybtn'+(k===dayKey?' active':'')+'" onclick="selectDay(\''+k+'\')">'+WEEKDAY_KEYS[(d.getDay()+6)%7]+'<span class="d2">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
@@ -3101,6 +3123,8 @@ function renderStaff(){
     });
     html+='</table>';
   }
+
+  html+=renderCoverageGrid(weekDates);
 
   html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above — the pod
                    // cards just rendered are the last thing that belongs inside it. This was
@@ -3243,14 +3267,11 @@ function renderEnrollmentRequestsPanel(){
 function renderCheckedInPanel(){
   const todays=checkedInTodayStillPresent().slice().sort(function(a,b){ return a.actualEnd-b.actualEnd; });
   let html=sectionOpen('checkedin','Checked in today',
-    '<div style="display:flex;gap:8px;align-items:center">'
-      +'<span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+'</span>'
-      +(todays.length? '<button class="btn sm" onclick="openCheckOut()">Check out</button>' : '')
-    +'</div>');
-  html+='<p>Exit time defaults to check-in time plus their usual session length (90 min for most, per each student\'s plan), capped at 15 minutes late per the check-in rule. Both the checked-in time and exit time can be corrected here if needed — say a parent\'s pick-up plan changes, or the arrival time recorded at check-in was wrong. "Time left" counts down live against the actual clock, so it stays accurate even if you don\'t touch this page. Once a student has actually left, use "Check out" above — it drops them off this list, defaulting to whichever preset time is closest to right now (adjust it if they were signed out earlier or later than that).</p>';
+    '<span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+'</span>');
+  html+='<p>Exit time defaults to check-in time plus their usual session length (90 min for most, per each student\'s plan), capped at 15 minutes late per the check-in rule. Both the checked-in time and exit time can be corrected here if needed — say a parent\'s pick-up plan changes, or the arrival time recorded at check-in was wrong. "Time left" counts down live against the actual clock, so it stays accurate even if you don\'t touch this page. Once a student actually leaves, use their own "Check out" button — it drops them off this list, defaulting to whichever preset time is closest to right now (adjust it if they were signed out earlier or later than that).</p>';
   if(todays.length===0){ html+='<div class="empty-note">Nobody checked in yet today.</div>'; }
   else{
-    html+='<table><tr><th>Student</th><th>Pod</th><th>Checked in</th><th>Exit time</th><th>Time left</th></tr>';
+    html+='<table><tr><th>Student</th><th>Pod</th><th>Checked in</th><th>Exit time</th><th>Time left</th><th></th></tr>';
     todays.forEach(function(s){
       const student=findStudent(s.studentId);
       const pod=findPod(s.podId);
@@ -3265,7 +3286,8 @@ function renderCheckedInPanel(){
           +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===s.actualEnd?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select>'
         +(adjusted? ' <span class="small muted">(usually '+minToLabel(s.defaultEnd)+')</span>' : '')
-        +'</td><td><span class="badge '+cd.cls+'">'+cd.label+'</span></td></tr>';
+        +'</td><td><span class="badge '+cd.cls+'">'+cd.label+'</span></td>'
+        +'<td><button class="btn sm" onclick="openCheckOut(\''+s.id+'\')">Check out</button></td></tr>';
     });
     html+='</table>';
   }
@@ -3628,7 +3650,6 @@ function renderStudentsPanel(){
 function renderInstructorsPanel(){
   let html=sectionOpen('instructors','Instructors',
     '<button class="btn sm primary" onclick="openNewInstructorForm()">+ Add instructor</button>');
-  html+='<p>Every instructor can teach any year — "best suited" is just a preference used to break ties when auto-picking a Pod (5.3); it never blocks a booking, a coverage assignment, or being assigned a shift. Set a new instructor\'s starting weekly hours here. Once they\'re on the roster, ongoing or one-off changes to their availability are self-service from their own login.</p>';
   html+='<table><tr><th>Instructor</th><th>Email</th><th>Best suited for</th><th>Working days</th><th>Login</th><th></th></tr>';
   instructors.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(instr){
     const pattern=instructorCurrentWeeklyPattern(instr.id);
