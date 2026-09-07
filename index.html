@@ -443,6 +443,15 @@ var pods=[
   {id:'podS', name:'Singles', capacity:8},
 ];
 
+// Online sessions (Sept 2026) — a student who joins by computer instead of sitting in a Pod. There's
+// no separate online-only instructor: an on-shift instructor already minding a physical Pod also
+// minds an Online group on the side. So online has no Pod, no capacity of its own, and no coverage
+// schedule to staff — it rides entirely on whichever instructor front desk picks, and that instructor
+// must already be on shift (see instructorsOnShift()). The only limit is per-instructor: their own
+// physical Pod headcount stays capped at the Pod's normal capacity (unchanged), but their COMBINED
+// headcount (physical + online, at any one moment) may run up to this higher ratio.
+var ONLINE_COMBINED_CAP=9;
+
 // Which instructor is assigned to run each Pod, and when — a weekly recurring pattern, just like
 // instructor availability. A Pod can have more than one shift block in a day (staff assign a
 // different instructor to cover later in the shift, e.g. a same-day pod handoff); blocks are
@@ -733,6 +742,7 @@ var state={
   attendanceLogFor:null,
   studentPodForm:null,
   waitlistForm:null,
+  parentWaitlistForm:null,
   closedDayForm:null,
   holdRequestForm:null,
   cancelRequestForm:null,
@@ -912,6 +922,59 @@ function podCapacityBlocked(podId, dateKey, extra){
   if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
   return capacityOverflowViolation(raw, podCapacity(podId));
 }
+
+/* ---------- online sessions (combined 1:9 ratio) ---------- */
+// An instructor's own physical (non-online) sessions that day — the same headcount that already
+// counts toward whichever Pod(s) they're covering, just keyed by instructor instead of Pod.
+function instructorPhysicalSessionsForDay(instructorId, dateKey){
+  return sessions.filter(function(s){
+    return (s.instructorId===instructorId || s.instructorId2===instructorId) && toKey(s.date)===dateKey && s.status!=='cancelled' && !s.online;
+  });
+}
+// An instructor's own Online-group sessions that day. Online sessions are never split across a
+// handoff (instructorId2/handoff stay null) — one instructor mans a given online student the whole
+// session, same as every other online student sitting in their group at that moment.
+function instructorOnlineSessionsForDay(instructorId, dateKey){
+  return sessions.filter(function(s){
+    return s.instructorId===instructorId && toKey(s.date)===dateKey && s.status!=='cancelled' && !!s.online;
+  });
+}
+// Peak simultaneous COMBINED (physical + online) headcount instructor X is personally minding at
+// once — the number that must stay <= ONLINE_COMBINED_CAP. `extra` ({start,duration}) tests a
+// hypothetical addition before committing it, same pattern as peakConcurrency/podCapacityBlocked.
+// `excludeSessionId` drops one session from the baseline first — needed when re-checking a session
+// that's ALREADY counted under this instructor (e.g. moving their own already-physical session of
+// theirs onto their own Online group), so it isn't counted once for real and again via `extra`.
+function instructorCombinedPeak(instructorId, dateKey, extra, excludeSessionId){
+  const raw = instructorPhysicalSessionsForDay(instructorId, dateKey)
+    .concat(instructorOnlineSessionsForDay(instructorId, dateKey))
+    .filter(function(s){ return s.id!==excludeSessionId; })
+    .map(function(s){ return {start:s.start, end:s.start+s.duration}; });
+  if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
+  return peakConcurrencyOf(raw);
+}
+// Would adding one more online student to instructor X at this window push their COMBINED headcount
+// over the ratio? This is the one thing that can ever refuse an online assignment — online has no
+// Pod, so there's no separate capacity check the way a physical booking has.
+function instructorOnlineBlocked(instructorId, dateKey, start, duration, excludeSessionId){
+  return instructorCombinedPeak(instructorId, dateKey, {start:start, duration:duration}, excludeSessionId) > ONLINE_COMBINED_CAP;
+}
+// Which instructors are actually on shift (covering some Pod, fully, per the same
+// UNATTENDED_TOLERANCE_MIN-tolerant rule as everywhere else) over this exact window — the only pool
+// eligible to also mind an Online group, since online is never staffed by a dedicated online-only
+// instructor. Checks every Pod's coverage for the window and dedupes; a handoff mid-window
+// contributes both the outgoing and incoming instructor, since either could reasonably take an
+// online student for their own portion of the coverage.
+function instructorsOnShift(weekday, start, duration, date){
+  const ids=[];
+  pods.forEach(function(pod){
+    const cov=podCoverageDetail(pod.id, weekday, start, duration, date);
+    if(!cov.ok) return;
+    if(cov.primaryInstructorId && ids.indexOf(cov.primaryInstructorId)===-1) ids.push(cov.primaryInstructorId);
+    if(cov.secondaryInstructorId && ids.indexOf(cov.secondaryInstructorId)===-1) ids.push(cov.secondaryInstructorId);
+  });
+  return ids.map(findInstructor).filter(Boolean);
+}
 // Peak concurrency restricted to a specific window (e.g. one hour) — used by the availability lookup.
 function peakInWindow(podId, dateKey, winStart, winEnd){
   const list = sessionsForDay(podId, dateKey)
@@ -1061,10 +1124,52 @@ function movePodSession(sessionId, newPodId){
   sess.instructorId=cov.primaryInstructorId;
   sess.instructorId2=cov.secondaryInstructorId;
   sess.handoff=cov.handoffAt;
+  sess.online=false; // moving into a physical Pod always leaves any prior Online assignment behind
   dbWrite('moving a session to a different Pod', function(){ return supabaseClient.from('sessions').update({
-    pod_id:sess.podId, instructor_id:sess.instructorId, instructor_id_2:sess.instructorId2, handoff_min:sess.handoff
+    pod_id:sess.podId, instructor_id:sess.instructorId, instructor_id_2:sess.instructorId2, handoff_min:sess.handoff, online:false
   }).eq('id', sess.id); });
   return {ok:true, oldPod:oldPod, newPod:newPod};
+}
+
+// Online equivalent of movePodSession() — puts an already-booked session onto an instructor's
+// Online group instead of a physical Pod. No coverage/handoff to resolve (the instructor is already
+// on shift running a Pod; online just piggybacks on that) — the only thing that can say no is the
+// combined 1:9 ratio (instructorOnlineBlocked). Used by every "location" picker (Schedule list row,
+// check-in modal, move modal) whenever "Online — [instructor]" is chosen for an existing session.
+function setSessionOnline(sessionId, instructorId){
+  const sess=findSession(sessionId);
+  if(!sess) return {ok:false, error:'Session not found.'};
+  if(sess.online && sess.instructorId===instructorId) return {ok:true};
+  const instr=findInstructor(instructorId);
+  const dateKey=toKey(sess.date);
+  if(instructorOnlineBlocked(instructorId, dateKey, sess.start, sess.duration, sess.id)){
+    const peak=instructorCombinedPeak(instructorId, dateKey, {start:sess.start, duration:sess.duration}, sess.id);
+    return {ok:false, error:'Blocked — this would put '+instr.name+"'s Online group over the combined ratio ("+peak+'/'+ONLINE_COMBINED_CAP+').'};
+  }
+  const oldPod=sess.podId? findPod(sess.podId) : null;
+  const wasOnline=sess.online;
+  sess.podId=null; sess.instructorId=instructorId; sess.instructorId2=null; sess.handoff=null; sess.online=true;
+  dbWrite('moving a session online', function(){ return supabaseClient.from('sessions').update({
+    pod_id:null, instructor_id:sess.instructorId, instructor_id_2:null, handoff_min:null, online:true
+  }).eq('id', sess.id); });
+  return {ok:true, oldPod:oldPod, wasOnline:wasOnline, instr:instr};
+}
+
+// The single onchange handler every Pod/Online <select> wires to (see locationOptionsHtml) — routes
+// to the physical-Pod path or the Online path depending on which the value encodes.
+function setSessionLocation(sessionId, value){
+  if(String(value).indexOf('online:')===0){
+    const sess=findSession(sessionId);
+    const student=findStudent(sess.studentId);
+    const result=setSessionOnline(sessionId, value.slice(7));
+    if(!result.ok){ toast(result.error); render(); return; }
+    toast(result.oldPod? (student.name+' moved from '+result.oldPod.name+' to Online — '+result.instr.name+'.')
+      : result.wasOnline? (student.name+' moved to Online — '+result.instr.name+'.')
+      : (student.name+' assigned to Online — '+result.instr.name+'.'));
+    render();
+  } else {
+    setSessionPod(sessionId, value);
+  }
 }
 
 function studentOverlapClash(studentId, dateKey, start, duration, excludeSessionId){
@@ -1821,28 +1926,31 @@ function openBooking(podId, dateKey){
   if(closure){ toast("The centre's marked closed that day (\""+closure.label+"\") — nothing can be booked onto it."); return; }
   const dur=90;
   state.booking={dateKey};
-  // podManual: true when a caller opened this with a specific Pod already in mind (e.g. the old
-  // per-pod entry point, or any future explicit caller) — suggestBookingPod() must never stomp on
-  // that as the student/time/duration are filled in, same as it never stomps on a manual pick made
-  // via setBookingPod() below.
-  state.bookingForm={studentId:'', duration:dur, start:possibleStarts(dur)[0], podId:podId||'', overrideOk:false, podManual:!!podId};
+  // locationManual: true when a caller opened this with a specific Pod already in mind (e.g. the
+  // old per-pod entry point, or any future explicit caller) — suggestBookingPod() must never stomp
+  // on that as the student/time/duration are filled in, same as it never stomps on a manual pick
+  // made via setBookingLocation() below. `location` is the same encoded value as everywhere else a
+  // Pod/Online picker appears (see sessionLocationValue) — a Pod's own id, '' for unassigned, or
+  // 'online:<instructorId>' for an Online group; pickBestPod (auto-suggest) only ever proposes a
+  // physical Pod, never Online — that's always a deliberate manual pick.
+  state.bookingForm={studentId:'', duration:dur, start:possibleStarts(dur)[0], location:podId||'', overrideOk:false, locationManual:!!podId};
   render();
 }
 function closeBooking(){ state.booking=null; render(); }
 
 // Re-suggests a Pod via pickBestPod() (first staffed, under-capacity Pod — no age consideration,
 // Sept 2026) whenever the student, start time, or duration changes — mirrors the "pre-filled,
-// editable" default used for check-in/check-out times. Never runs once a Pod has been chosen
-// manually — either via setBookingPod() below, or by opening the form with an explicit Pod
-// already in mind (podManual, set in openBooking()).
+// editable" default used for check-in/check-out times. Never runs once a location has been chosen
+// manually — either via setBookingLocation() below, or by opening the form with an explicit Pod
+// already in mind (locationManual, set in openBooking()).
 function suggestBookingPod(){
   const f=state.bookingForm;
-  if(f.podManual) return;
-  if(!f.studentId || f.start==null){ f.podId=''; return; }
+  if(f.locationManual) return;
+  if(!f.studentId || f.start==null){ f.location=''; return; }
   const student=findStudent(f.studentId);
   const date=new Date(state.booking.dateKey);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
-  f.podId = pickBestPod(weekday, state.booking.dateKey, f.start, f.duration, student.year) || '';
+  f.location = pickBestPod(weekday, state.booking.dateKey, f.start, f.duration, student.year) || '';
 }
 
 function setBookingStudent(sid){
@@ -1872,8 +1980,9 @@ function setBookingStart(v){
   render();
 }
 // Manual override (freely — no capacity/age blocking on the picker itself, Sept 2026) of the
-// suggested Pod. Left alone by suggestBookingPod() until the student/time/duration changes again.
-function setBookingPod(v){ state.bookingForm.podId=v; state.bookingForm.podManual=true; state.bookingForm.overrideOk=false; render(); }
+// suggested location. Left alone by suggestBookingPod() until the student/time/duration changes
+// again. Accepts either a Pod's own id or an 'online:<instructorId>' value (see locationOptionsHtml).
+function setBookingLocation(v){ state.bookingForm.location=v; state.bookingForm.locationManual=true; state.bookingForm.overrideOk=false; render(); }
 function toggleOverride(){ state.bookingForm.overrideOk=!state.bookingForm.overrideOk; render(); }
 
 function confirmBooking(){
@@ -1881,12 +1990,35 @@ function confirmBooking(){
   if(!f.studentId || f.start==null) return;
   const dateKey=b.dateKey, date=new Date(dateKey);
   const student=findStudent(f.studentId);
-  const pod=f.podId? findPod(f.podId) : null;
+  const isOnline = String(f.location).indexOf('online:')===0;
+  const onlineInstructorId = isOnline? f.location.slice(7) : null;
+  const pod = (!isOnline && f.location)? findPod(f.location) : null;
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
   const end=f.start+f.duration;
 
   if(studentOverlapClash(student.id, dateKey, f.start, f.duration, null)){
     toast('Blocked — '+student.name+' already has an overlapping session that day.');
+    return;
+  }
+
+  // Online — no Pod, no coverage/handoff to resolve (the instructor's already on shift running a
+  // Pod); the combined 1:9 ratio is the only thing that can say no.
+  if(isOnline){
+    const instr=findInstructor(onlineInstructorId);
+    if(instructorOnlineBlocked(onlineInstructorId, dateKey, f.start, f.duration)){
+      const peak=instructorCombinedPeak(onlineInstructorId, dateKey, {start:f.start, duration:f.duration});
+      toast('Blocked — this would put '+instr.name+"'s Online group over the combined ratio ("+peak+'/'+ONLINE_COMBINED_CAP+').');
+      return;
+    }
+    const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:null, instructorId:onlineInstructorId, instructorId2:null, handoff:null, online:true, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId:null};
+    sessions.push(newSess);
+    dbWrite('booking an online session', function(){ return supabaseClient.from('sessions').insert({
+      id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:newSess.instructorId, instructor_id_2:null, handoff_min:null, online:true,
+      the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
+    }); });
+    toast(student.name+' booked into Online — '+instr.name+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+'.');
+    state.booking=null;
+    render();
     return;
   }
 
@@ -2093,7 +2225,6 @@ function confirmCheckIn(){
   const autoEnd=autoExitTime(sess, offset);
   sess.checkInOffset=offset;
   sess.actualStart=sess.start+offset;
-  sess.defaultEnd=autoEnd;
   sess.actualEnd=state.checkIn.exitTime;
   sess.status='attended';
   dbWrite('checking in', function(){ return supabaseClient.from('sessions').update({
@@ -2112,19 +2243,27 @@ function confirmCheckIn(){
   render();
 }
 
-function openMoveForm(sessionId){ state.moveForm={sessionId, podId:''}; render(); }
+function openMoveForm(sessionId){ state.moveForm={sessionId, location:''}; render(); }
 function closeMoveForm(){ state.moveForm=null; render(); }
-function setMoveFormPod(v){ state.moveForm.podId=v; render(); }
+function setMoveFormLocation(v){ state.moveForm.location=v; render(); }
 function confirmMovePod(){
   const f=state.moveForm;
-  if(!f || !f.podId) return;
+  if(!f || !f.location) return;
   const sess=findSession(f.sessionId);
   const student=findStudent(sess.studentId);
-  // No age/year check (removed Sept 2026) — capacity is the only thing movePodSession itself can
-  // still say no to.
-  const result=movePodSession(f.sessionId, f.podId);
-  if(!result.ok){ toast(result.error); return; }
-  toast(result.oldPod? (student.name+' moved from '+result.oldPod.name+' to '+result.newPod.name+'.') : (student.name+' assigned to '+result.newPod.name+'.'));
+  if(String(f.location).indexOf('online:')===0){
+    const result=setSessionOnline(f.sessionId, f.location.slice(7));
+    if(!result.ok){ toast(result.error); return; }
+    toast(result.oldPod? (student.name+' moved from '+result.oldPod.name+' to Online — '+result.instr.name+'.')
+      : result.wasOnline? (student.name+' moved to Online — '+result.instr.name+'.')
+      : (student.name+' assigned to Online — '+result.instr.name+'.'));
+  } else {
+    // No age/year check (removed Sept 2026) — capacity is the only thing movePodSession itself can
+    // still say no to.
+    const result=movePodSession(f.sessionId, f.location);
+    if(!result.ok){ toast(result.error); return; }
+    toast(result.oldPod? (student.name+' moved from '+result.oldPod.name+' to '+result.newPod.name+'.') : (student.name+' assigned to '+result.newPod.name+'.'));
+  }
   state.moveForm=null;
   render();
 }
@@ -2136,21 +2275,31 @@ function renderMoveModal(){
   if(!sess) return '';
   const student=findStudent(sess.studentId);
   const currentPod=findPod(sess.podId);
+  const currentOnlineInstr=sess.online? findInstructor(sess.instructorId) : null;
+  const currentLabel = currentPod? currentPod.name : (currentOnlineInstr? 'Online — '+currentOnlineInstr.name : null);
   const dateKey=toKey(sess.date);
+  const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
   let html='<div class="overlay" onclick="if(event.target===this) closeMoveForm()"><div class="modal">';
-  html+='<h3>'+(currentPod? 'Move '+student.name+' to a different Pod' : 'Assign '+student.name+' to a Pod')+'</h3>';
-  html+='<p>'+(currentPod? 'Currently in '+currentPod.name : 'Currently unassigned — no Pod could be found for this session when it was created')+', '+rangeLabel(sess.start,sess.duration)+' on '+fmtShort(sess.date)+'. The instructor shown for this session updates automatically to whoever covers the new Pod at this time.</p>';
-  html+='<label>Move to</label><select onchange="setMoveFormPod(this.value)"><option value="">Choose…</option>'
+  html+='<h3>'+(currentLabel? 'Move '+student.name+' to a different Pod' : 'Assign '+student.name+' to a Pod')+'</h3>';
+  html+='<p>'+(currentLabel? 'Currently in '+currentLabel : 'Currently unassigned — no Pod could be found for this session when it was created')+', '+rangeLabel(sess.start,sess.duration)+' on '+fmtShort(sess.date)+'. The instructor shown for this session updates automatically to whoever covers the new Pod at this time.</p>';
+  const onlineChoices=instructorsOnShift(weekday, sess.start, sess.duration, sess.date).filter(function(instr){ return !(sess.online && instr.id===sess.instructorId); });
+  html+='<label>Move to</label><select onchange="setMoveFormLocation(this.value)"><option value="">Choose…</option>'
     +pods.filter(function(p){ return p.id!==sess.podId; }).map(function(p){
       const peak=peakConcurrency(p.id, dateKey, {start:sess.start, duration:sess.duration});
       const cap=podCapacity(p.id);
       const full=podCapacityBlocked(p.id, dateKey, {start:sess.start, duration:sess.duration});
-      return '<option value="'+p.id+'"'+(p.id===f.podId?' selected':'')+(full?' disabled':'')+'>'+p.name+(full?' — full':' — '+peak+'/'+cap+' after move')+'</option>';
+      return '<option value="'+p.id+'"'+(p.id===f.location?' selected':'')+(full?' disabled':'')+'>'+p.name+(full?' — full':' — '+peak+'/'+cap+' after move')+'</option>';
     }).join('')
+    + (onlineChoices.length? ('<optgroup label="Online">'+onlineChoices.map(function(instr){
+        const val='online:'+instr.id;
+        const peak=instructorCombinedPeak(instr.id, dateKey, {start:sess.start, duration:sess.duration}, sess.id);
+        const full=peak>ONLINE_COMBINED_CAP;
+        return '<option value="'+val+'"'+(val===f.location?' selected':'')+(full?' disabled':'')+'>Online — '+instr.name+(full?' — full':' — '+peak+'/'+ONLINE_COMBINED_CAP+' after move')+'</option>';
+      }).join('')+'</optgroup>') : '')
   +'</select>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeMoveForm()">Cancel</button>'
-    +'<button class="btn primary" '+(!f.podId?'disabled':'')+' onclick="confirmMovePod()">'+(currentPod?'Move':'Assign')+'</button>'
+    +'<button class="btn primary" '+(!f.location?'disabled':'')+' onclick="confirmMovePod()">'+(currentLabel?'Move':'Assign')+'</button>'
   +'</div>';
   html+='</div></div>';
   return html;
@@ -2513,6 +2662,26 @@ function openSeatsAt(dateKey, weekday, blockStart, year, blockLen){
   });
   return {seats, staffed};
 }
+// Combined (physical + online) peak headcount instructor X is minding, restricted to a window —
+// the Online counterpart to peakInWindow (used for Pods).
+function instructorCombinedPeakInWindow(instructorId, dateKey, winStart, winEnd){
+  const list = instructorPhysicalSessionsForDay(instructorId, dateKey).concat(instructorOnlineSessionsForDay(instructorId, dateKey))
+    .filter(function(s){ return s.start<winEnd && winStart<s.start+s.duration; })
+    .map(function(s){ return {start:Math.max(s.start,winStart), end:Math.min(s.start+s.duration,winEnd)}; });
+  return peakConcurrencyOf(list);
+}
+// Online seats available at a window, aggregated across every instructor on shift then — the
+// Online counterpart to openSeatsAt(), used by the availability lookup to show Online as its own
+// row rather than folding it into the Pod counts above.
+function onlineSeatsAt(dateKey, weekday, blockStart, blockLen){
+  const date=new Date(dateKey);
+  let seats=0;
+  instructorsOnShift(weekday, blockStart, blockLen, date).forEach(function(instr){
+    const peak=instructorCombinedPeakInWindow(instr.id, dateKey, blockStart, blockStart+blockLen);
+    seats += Math.max(0, ONLINE_COMBINED_CAP-peak);
+  });
+  return seats;
+}
 // Same collapse-guard as setWeek() above, for the Availability lookup section's own toggle.
 function setAvailWeek(w){
   state.availWeekOffset=w;
@@ -2660,6 +2829,58 @@ function notifyWaitlistEntry(id){
   dbWrite('marking waitlist entry notified', function(){ return supabaseClient.from('waitlist_entries').update({notified:true}).eq('id', id); });
   toast('Contacted '+w.name+' — a seat is open '+w.weekday+' '+fmtShort(seat.date)+' '+rangeLabel(w.start,w.duration)+'. Remove them from the waitlist once booked.');
   render();
+}
+
+// -- Parent self-service (Sept 2026, per Allie: "parents can place themselves on a waitlist, not
+// just a manual process") — the same waitlist array/schema front desk already uses, just entered
+// from the parent's own view and always scoped to one of their own children (no "new enquiry" mode
+// — a parent only ever manages their own kids here, unlike front desk logging demand for a
+// prospective family). Reuses removeWaitlistEntry() itself for actually leaving, so both sides stay
+// in perfect sync — a parent leaving the waitlist looks identical to front desk removing them.
+function currentParentRecord(){
+  const parentId = supabaseClient ? (currentUser && currentUser.parentId) : state.parentLoggedIn;
+  return parents.find(function(p){ return p.id===parentId; }) || null;
+}
+function openParentWaitlistForm(studentId){
+  const student=findStudent(studentId);
+  state.parentWaitlistForm={studentId:studentId, weekday:'Mon', start:AVAIL_BLOCKS[0], duration:student.duration, note:'', error:''};
+  render();
+}
+function closeParentWaitlistForm(){ state.parentWaitlistForm=null; render(); }
+function setParentWaitlistField(field, value){
+  const f=state.parentWaitlistForm;
+  f[field] = (field==='start'||field==='duration')? Number(value): value;
+  f.error='';
+  render();
+}
+function saveParentWaitlistForm(){
+  const f=state.parentWaitlistForm;
+  const student=findStudent(f.studentId);
+  const entry={
+    id:newId()||('wl'+(nextWaitlistId++)),
+    studentId:student.id, name:student.name, year:student.year,
+    weekday:f.weekday, start:f.start, duration:f.duration,
+    note:f.note, dateAdded:new Date(simNow()), notified:false, status:'waiting',
+  };
+  waitlist.push(entry);
+  dbWrite('adding to waitlist (parent)', function(){ return supabaseClient.from('waitlist_entries').insert({
+    id:entry.id, student_id:entry.studentId, name:entry.name, year:entry.year, weekday:entry.weekday,
+    start_min:entry.start, duration:entry.duration, note:entry.note, status:'waiting', notified:false,
+    date_added:entry.dateAdded.toISOString()
+  }); });
+  toast(student.name+' added to the waitlist for '+f.weekday+' '+rangeLabel(f.start,f.duration)+'.');
+  state.parentWaitlistForm=null;
+  render();
+}
+// A parent can only ever remove one of their OWN children's entries — checked against the
+// logged-in parent's own student list, same ownership boundary every other parent action respects.
+function parentRemoveWaitlistEntry(id){
+  const parent=currentParentRecord();
+  const w=waitlist.find(function(x){ return x.id===id; });
+  if(!parent || !w || !w.studentId || parent.studentIds.indexOf(w.studentId)===-1) return;
+  const name=w.name;
+  removeWaitlistEntry(id);
+  toast(name+' removed from the waitlist.');
 }
 
 /* ---------- enrollment: creating parent/student profiles ---------- */
@@ -3179,6 +3400,19 @@ function checkedInNamesByPod(dayKey){
   Object.keys(byPod).forEach(function(podId){ byPod[podId].sort(function(a,b){ return a.localeCompare(b, undefined, {sensitivity:'base'}); }); });
   return byPod;
 }
+// Same idea, keyed by instructor instead of Pod, for whoever's currently checked in to that
+// instructor's Online group — the Online strip's own equivalent of checkedInNamesByPod.
+function checkedInNamesByOnlineInstructor(dayKey){
+  const byInstr={};
+  sessions.forEach(function(s){
+    if(s.status!=='attended' || s.checkedOut || !s.online || toKey(s.date)!==dayKey) return;
+    const student=findStudent(s.studentId);
+    if(!student) return;
+    (byInstr[s.instructorId]=byInstr[s.instructorId]||[]).push(student.name);
+  });
+  Object.keys(byInstr).forEach(function(id){ byInstr[id].sort(function(a,b){ return a.localeCompare(b, undefined, {sensitivity:'base'}); }); });
+  return byInstr;
+}
 
 function renderPodSummaryStrip(dayKey, weekday){
   const selectedDate=new Date(dayKey);
@@ -3196,6 +3430,31 @@ function renderPodSummaryStrip(dayKey, weekday){
       +'<button class="btn sm ghost" onclick="openPodAssignForm(\''+pod.id+'\',\''+weekday+'\')">Assign</button>'
     +'</div>';
   });
+  // Online strips — one per instructor currently minding an Online group today, shown as its own
+  // distinct row rather than mixed in with the Pod pills above (Online is a separate concept, not
+  // just another Pod). Only instructors with at least one online student booked today get a strip;
+  // an on-shift instructor with nobody online yet doesn't clutter this up.
+  const onlineByInstructor={};
+  sessions.forEach(function(s){
+    if(s.status==='cancelled' || !s.online || toKey(s.date)!==dayKey) return;
+    (onlineByInstructor[s.instructorId]=onlineByInstructor[s.instructorId]||[]).push(s);
+  });
+  const checkedInByOnlineInstructor=checkedInNamesByOnlineInstructor(dayKey);
+  const onlineInstructorIds=Object.keys(onlineByInstructor);
+  if(onlineInstructorIds.length){
+    html+='</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
+    onlineInstructorIds.forEach(function(instrId){
+      const instr=findInstructor(instrId);
+      if(!instr) return;
+      const peak=instructorCombinedPeak(instrId, dayKey); // combined (physical + online) — the number the 1:9 ratio actually caps
+      const checkedIn=checkedInByOnlineInstructor[instrId]||[];
+      html+='<div class="pill" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+        +'<b>Online — '+instr.name+'</b>'
+        +'<span class="badge '+(peak>=ONLINE_COMBINED_CAP?'full':'available')+'">'+peak+'/'+ONLINE_COMBINED_CAP+'</span>'
+        +(checkedIn.length? '<span class="small">✓ '+checkedIn.join(', ')+'</span>' : '')
+      +'</div>';
+    });
+  }
   html+='</div>';
   return html;
 }
@@ -3223,9 +3482,9 @@ function setSessionPod(sessionId, podId){
   if(!sess) return;
   const student=findStudent(sess.studentId);
   if(!podId){
-    sess.podId=null; sess.instructorId=null; sess.instructorId2=null; sess.handoff=null;
+    sess.podId=null; sess.instructorId=null; sess.instructorId2=null; sess.handoff=null; sess.online=false;
     dbWrite('unassigning a session\'s Pod', function(){ return supabaseClient.from('sessions').update({
-      pod_id:null, instructor_id:null, instructor_id_2:null, handoff_min:null
+      pod_id:null, instructor_id:null, instructor_id_2:null, handoff_min:null, online:false
     }).eq('id', sess.id); });
     toast(student.name+' set to Unassigned.');
     render();
@@ -3305,12 +3564,12 @@ function renderStaff(){
       if(sess.instructorId2){
         handoffNote = ' · '+findInstructor(sess.instructorId).name+' until '+minToLabel(sess.handoff)+', then '+findInstructor(sess.instructorId2).name;
       } else if(sess.instructorId){
-        handoffNote = ' · with '+findInstructor(sess.instructorId).name;
+        handoffNote = ' · with '+findInstructor(sess.instructorId).name+(sess.online? ' (online)' : '');
       }
       html+='<tr><td><b>'+student.name+'</b></td><td>'+yearLabel(student.year)+'</td><td>'+rangeLabel(sess.start,sess.duration)+'</td>';
-      html+='<td><select onchange="setSessionPod(\''+sess.id+'\',this.value)">'
-        +'<option value=""'+(!sess.podId?' selected':'')+'>Unassigned</option>'
-        +pods.map(function(p){ return '<option value="'+p.id+'"'+(p.id===sess.podId?' selected':'')+'>'+podOptionLabel(p, weekday, dayKey, sess.start, sess.duration)+'</option>'; }).join('')
+      html+='<td><select onchange="setSessionLocation(\''+sess.id+'\',this.value)">'
+        +'<option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
+        +locationOptionsHtml(weekday, dayKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
       +'</select></td>';
       html+='<td class="small muted">'+sess.status+(sess.bookedBy==='parent'?' · 👪 parent':'')+(sess.recurring?' · regular':'')+handoffNote+actualNote+'</td>';
       let actions='';
@@ -3479,16 +3738,23 @@ function renderCheckedInPanel(){
       const student=findStudent(s.studentId);
       const pod=findPod(s.podId);
       const instrLabel = s.instructorId2? (findInstructor(s.instructorId).name+' → '+findInstructor(s.instructorId2).name) : (s.instructorId? findInstructor(s.instructorId).name : '—');
-      const adjusted = s.actualEnd!==s.defaultEnd;
+      // Recomputed fresh from the session's own (persisted) checkInOffset every render, rather than
+      // read off a separate stored "defaultEnd" field — that field was never written to Supabase
+      // (only ever held in memory), so after any page reload it came back undefined and every row
+      // showed "(usually NaN)" here, regardless of whether the exit time had actually been
+      // adjusted. Deriving it from checkInOffset + autoExitTime() is always correct, always
+      // available, and needs nothing extra saved.
+      const defaultEnd = autoExitTime(s, s.checkInOffset||0);
+      const adjusted = s.actualEnd!==defaultEnd;
       const cd=countdownInfo(s.actualEnd);
-      html+='<tr><td>'+student.name+'</td><td class="small">'+(pod?pod.name:'—')+' · '+instrLabel+'</td>'
+      html+='<tr><td>'+student.name+'</td><td class="small">'+(s.online?'Online':(pod?pod.name:'—'))+' · '+instrLabel+'</td>'
         +'<td><select onchange="setActualStart(\''+s.id+'\',this.value)">'
           +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===s.actualStart?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select></td>'
         +'<td><select onchange="setExitTime(\''+s.id+'\',this.value)">'
           +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===s.actualEnd?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select>'
-        +(adjusted? ' <span class="small muted">(usually '+minToLabel(s.defaultEnd)+')</span>' : '')
+        +(adjusted? ' <span class="small muted">(usually '+minToLabel(defaultEnd)+')</span>' : '')
         +'</td><td><span class="badge '+cd.cls+'">'+cd.label+'</span></td>'
         +'<td><button class="btn sm" onclick="openCheckOut(\''+s.id+'\')">Check out</button></td></tr>';
     });
@@ -3524,6 +3790,14 @@ function renderAvailabilityLookup(){
       } else {
         html+='<div class="'+cls+'">'+label+'</div>';
       }
+    });
+    // Online is its own distinct row per day — never merged into the Pod row above — reporting the
+    // aggregate seats available across every instructor on shift for that window (see onlineSeatsAt).
+    html+='<div class="cal-row-label small muted">↳ Online</div>';
+    AVAIL_BLOCKS.forEach(function(hb){
+      const seats=onlineSeatsAt(dateKey, weekday, hb, AVAIL_MIN_SESSION_LEN);
+      const cls='avail-cell small'+(seats===0?' full-cell':' on');
+      html+='<div class="'+cls+'">'+(seats===0?'Full':seats+' open')+'</div>';
     });
   });
   html+='</div></div>';
@@ -3654,8 +3928,8 @@ function renderCheckInModal(){
   let html='<div class="overlay" onclick="if(event.target===this) closeCheckIn()"><div class="modal">';
   html+='<h3>Check in '+student.name+'</h3>';
   html+='<p>Scheduled '+rangeLabel(sess.start,sess.duration)+'. Record when they actually arrived — the exit time below fills in automatically from that (capped at '+LATE_GRACE_MIN+' minutes late), but you can adjust it in 5-minute steps if needed.</p>';
-  html+='<label>Pod</label><select onchange="setSessionPod(\''+sess.id+'\',this.value)"><option value=""'+(!sess.podId?' selected':'')+'>Unassigned</option>'
-    +pods.map(function(p){ return '<option value="'+p.id+'"'+(p.id===sess.podId?' selected':'')+'>'+podOptionLabel(p, weekday, dateKey, sess.start, sess.duration)+'</option>'; }).join('')
+  html+='<label>Pod</label><select onchange="setSessionLocation(\''+sess.id+'\',this.value)"><option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
+    +locationOptionsHtml(weekday, dateKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
   +'</select>';
   html+='<label>Arrival</label><select onchange="setCheckInOffset(this.value)">'
     +CHECKIN_OFFSETS.map(function(v){ return '<option value="'+v+'"'+(v===offset?' selected':'')+'>'+minToLabel(sess.start+v)+'</option>'; }).join('')
@@ -3731,15 +4005,53 @@ function podOptionLabel(pod, weekday, dateKey, start, duration){
   return pod.name+' — '+who+' — '+peak+'/'+cap;
 }
 
+// Same idea as podOptionLabel, for an "Online — [instructor]" choice: shows that instructor's
+// COMBINED (physical + online) headcount against the higher online ratio, so front desk can see at
+// a glance whether picking them still leaves room. excludeSessionId (see instructorCombinedPeak)
+// keeps an already-online session's own current slot from double-counting against itself.
+function onlineOptionLabel(instr, dateKey, start, duration, excludeSessionId){
+  const peak=instructorCombinedPeak(instr.id, dateKey, {start:start, duration:duration}, excludeSessionId);
+  return 'Online — '+instr.name+' — '+peak+'/'+ONLINE_COMBINED_CAP;
+}
+// A session's current location, encoded as one value for a single Pod/Online <select>: a Pod's own
+// id, '' for unassigned, or 'online:<instructorId>' for an Online group — see setSessionLocation().
+function sessionLocationValue(sess){ return sess.online? ('online:'+sess.instructorId) : (sess.podId||''); }
+// The shared "which Pod, or which Online group" <option> list — every picker that lets front desk
+// choose a session's location (the flat Schedule list's row picker, the check-in modal, the booking
+// modal) renders from this, so all three always offer the exact same choices in the exact same
+// format. Online is deliberately its own <optgroup> — a distinct concept in the picker, not just
+// another Pod-shaped row — and only ever lists instructors actually on shift right now (see
+// instructorsOnShift()); nothing is ever disabled here (same "pick freely, capacity enforced on
+// confirm" convention pods already use), except where the caller wants otherwise (see renderMoveModal,
+// which does still disable a full choice).
+function locationOptionsHtml(weekday, dateKey, start, duration, selectedValue, excludeSessionId){
+  let html=pods.map(function(p){
+    return '<option value="'+p.id+'"'+(selectedValue===p.id?' selected':'')+'>'+podOptionLabel(p, weekday, dateKey, start, duration)+'</option>';
+  }).join('');
+  const onlineInstrs=instructorsOnShift(weekday, start, duration, new Date(dateKey));
+  if(onlineInstrs.length){
+    html+='<optgroup label="Online">'+onlineInstrs.map(function(instr){
+      const val='online:'+instr.id;
+      return '<option value="'+val+'"'+(selectedValue===val?' selected':'')+'>'+onlineOptionLabel(instr, dateKey, start, duration, excludeSessionId)+'</option>';
+    }).join('')+'</optgroup>';
+  }
+  return html;
+}
+
 function renderBookingModal(){
   if(!state.booking) return '';
   const b=state.booking, f=state.bookingForm;
-  const pod=f.podId? findPod(f.podId) : null;
+  const isOnline = String(f.location).indexOf('online:')===0;
+  const onlineInstr = isOnline? findInstructor(f.location.slice(7)) : null;
+  const pod = (!isOnline && f.location)? findPod(f.location) : null;
   const date=new Date(b.dateKey);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
   const student=f.studentId? findStudent(f.studentId): null;
   const starts=possibleStarts(f.duration);
   const end=f.start!=null? f.start+f.duration : null;
+
+  const onlinePeak = (student && f.start!=null && onlineInstr)? instructorCombinedPeak(onlineInstr.id, b.dateKey, {start:f.start, duration:f.duration}) : 0;
+  const onlineOverCapacity = (student && f.start!=null && onlineInstr) && onlinePeak>ONLINE_COMBINED_CAP;
 
   let cov=null, instr1=null, suited1=true, totallyUnassigned=false, instr2=null, suited2=true;
   if(student && f.start!=null && pod){
@@ -3773,9 +4085,9 @@ function renderBookingModal(){
       +'<div><label>Start time</label><select onchange="setBookingStart(this.value)">'
       +starts.map(function(t){ return '<option value="'+t+'"'+(t===f.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
       +'</select></div></div>';
-  html+='<label>Pod</label><select onchange="setBookingPod(this.value)">'
-      +'<option value="">Unassigned</option>'
-      +pods.map(function(p){ return '<option value="'+p.id+'"'+(p.id===f.podId?' selected':'')+'>'+podOptionLabel(p, weekday, b.dateKey, f.start||0, f.duration)+'</option>'; }).join('')
+  html+='<label>Pod</label><select onchange="setBookingLocation(this.value)">'
+      +'<option value=""'+(f.location===''?' selected':'')+'>Unassigned</option>'
+      +locationOptionsHtml(weekday, b.dateKey, f.start||0, f.duration, f.location)
       +'</select>';
 
   if(student && isStudentOnHold(student.id, date)){
@@ -3807,11 +4119,14 @@ function renderBookingModal(){
   if(student && pod && overCapacity){
     html+='<div class="banner danger">⛔ This would put '+pod.name+' over capacity ('+wouldBePeak+'/'+cap+') — not allowed, no override.</div>';
   }
-  if(student && !pod){
+  if(student && onlineInstr && onlineOverCapacity){
+    html+='<div class="banner danger">⛔ This would put '+onlineInstr.name+"'s Online group over the combined ratio ("+onlinePeak+'/'+ONLINE_COMBINED_CAP+') — not allowed, no override.</div>';
+  }
+  if(student && !pod && !isOnline){
     html+='<div class="banner info">ℹ️ No Pod chosen — this books '+student.name+' in, unassigned. Pick a Pod for them any time from the Schedule list.</div>';
   }
 
-  const confirmDisabled = !f.studentId || f.start==null || overCapacity || (needsOverride && !f.overrideOk);
+  const confirmDisabled = !f.studentId || f.start==null || overCapacity || onlineOverCapacity || (needsOverride && !f.overrideOk);
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
       +'<button class="btn ghost" onclick="closeBooking()">Cancel</button>'
       +'<button class="btn primary" '+(confirmDisabled?'disabled':'')+' onclick="confirmBooking()">Confirm booking</button>'
@@ -4340,7 +4655,7 @@ function renderAttendanceLogModal(){
         detail='Checked in '+minToLabel(s.actualStart)+', ran to '+minToLabel(s.actualEnd)+(s.checkInOffset>LATE_GRACE_MIN? ' (capped)':'');
       }
       detail += (detail?' · ':'') + (s.bookedBy==='parent'? '👪 booked by parent' : s.recurring? 'regular schedule' : 'booked by staff');
-      html+='<tr><td>'+fmtShort(s.date)+'</td><td>'+rangeLabel(s.start,s.duration)+'</td><td>'+(pod?pod.name:'—')+'</td><td class="small">'+instrLabel+'</td><td>'+statusBadge+'</td><td class="small muted">'+detail+'</td></tr>';
+      html+='<tr><td>'+fmtShort(s.date)+'</td><td>'+rangeLabel(s.start,s.duration)+'</td><td>'+(s.online?'Online':(pod?pod.name:'—'))+'</td><td class="small">'+instrLabel+'</td><td>'+statusBadge+'</td><td class="small muted">'+detail+'</td></tr>';
     });
     html+='</table></div>';
   }
@@ -4407,11 +4722,16 @@ function instructorPodIdsToday(instructorId){
     return podBlocksForDay(p.id, todayWeekday).some(function(b){ return blockInstructorOn(b, today)===instructorId; });
   }).map(function(p){ return p.id; });
 }
+// Includes both flavours of "checked in with me today": physically seated at one of my Pods, and
+// checked in to my own Online group — an instructor is on the hook for both at once, so both show
+// up together on their one "My Pod today" panel.
 function checkedInAtInstructorPodToday(instructorId){
   const todayKey=toKey(simNow());
   const myPodIds=instructorPodIdsToday(instructorId);
   return sessions.filter(function(s){
-    return s.status==='attended' && toKey(s.date)===todayKey && myPodIds.indexOf(s.podId)>-1;
+    if(s.status!=='attended' || toKey(s.date)!==todayKey) return false;
+    if(s.online) return s.instructorId===instructorId;
+    return myPodIds.indexOf(s.podId)>-1;
   }).sort(function(a,b){ return a.start-b.start; });
 }
 
@@ -4589,8 +4909,9 @@ function renderInstructor(){
       +checkedInAtMyPods.map(function(s){
         const student=findStudent(s.studentId);
         const pod=findPod(s.podId);
+        const locLabel=s.online? 'Online' : (pod? pod.name : '—');
         const cd=countdownInfo(s.actualEnd!=null? s.actualEnd : s.start+s.duration);
-        return '<tr><td>'+student.name+' <span class="small muted">'+yearLabel(student.year)+'</span></td><td>'+pod.name+'</td><td>'+rangeLabel(s.start,s.duration)+'</td>'
+        return '<tr><td>'+student.name+' <span class="small muted">'+yearLabel(student.year)+'</span></td><td>'+locLabel+'</td><td>'+rangeLabel(s.start,s.duration)+'</td>'
           +'<td><span class="badge '+cd.cls+'">'+cd.label+'</span></td>'
           +'<td><button class="btn sm ghost" onclick="openMoveForm(\''+s.id+'\')">Move pod</button></td></tr>';
       }).join('')
@@ -4826,7 +5147,25 @@ function renderParent(){
         +(pendingHold? '<span class="small muted">Hold request pending</span>' : '<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>')
         +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Request a permanent day/time change</a>')
         +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>')
+        +'<a href="#" class="small" onclick="openParentWaitlistForm(\''+sid+'\');return false;">Join the waitlist for another day/time</a>'
       +'</div></div>';
+
+    // -- This child's own waitlist entries (5.17, parent self-service Sept 2026) — a parent can see
+    // and leave whatever they've personally added, same as front desk sees the full queue. --
+    const myWaiting=waitlist.filter(function(w){ return w.studentId===sid && w.status==='waiting'; })
+      .sort(function(a,b){ return WEEKDAY_KEYS.indexOf(a.weekday)-WEEKDAY_KEYS.indexOf(b.weekday) || a.start-b.start; });
+    if(myWaiting.length>0){
+      html+='<div class="section-label">On the waitlist</div>';
+      html+='<div class="session-list">'+myWaiting.map(function(w){
+        const seat=waitlistOpenSeat(w);
+        const statusNote = seat
+          ? '<span class="badge available">Seat open — let front desk know you\'d like it</span>'
+          : '<span class="small muted">Still waiting</span>';
+        return '<div class="session-row"><div class="session-main"><b>'+w.weekday+' '+rangeLabel(w.start,w.duration)+'</b>'
+          +(w.note? '<div class="small muted">'+w.note+'</div>' : '')+'</div>'+statusNote
+          +'<button class="btn sm ghost" onclick="parentRemoveWaitlistEntry(\''+w.id+'\')">Leave waitlist</button></div>';
+      }).join('')+'</div>';
+    }
 
     const changes=upcomingChangesForStudent(sid);
     if(changes.length>0){
@@ -4855,7 +5194,7 @@ function renderParent(){
         const noMakeUpToday = toKey(s.date)===toKey(simNow()) && sameDayMakeUpCutoffPassed();
         return '<div class="session-row">'
           +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
-          +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(pod?pod.name:'—')+' · '+(instr?instr.name:'Unassigned')+'</div>'
+          +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(s.online?'Online':(pod?pod.name:'—'))+' · '+(instr?instr.name:'Unassigned')+'</div>'
             +(noMakeUpToday? '<div class="small" style="color:var(--danger)">Past 10am — cancelling now won\'t include a make-up credit</div>' : '')
           +'</div>'
           +typeBadge
@@ -4883,6 +5222,7 @@ function renderParent(){
   html+=renderHoldRequestModal();
   html+=renderTimeChangeRequestModal();
   html+=renderCancelRequestModal();
+  html+=renderParentWaitlistModal();
   return html;
 }
 
@@ -4935,6 +5275,32 @@ function renderCancelRequestModal(){
     +'<button class="btn ghost" onclick="closeCancelRequestForm()">Back</button>'
     +'<button class="btn danger" onclick="submitCancelRequest()">Send request</button>'
   +'</div></div></div>';
+  return html;
+}
+
+function renderParentWaitlistModal(){
+  const f=state.parentWaitlistForm;
+  if(!f) return '';
+  const student=findStudent(f.studentId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeParentWaitlistForm()"><div class="modal">';
+  html+='<h3>Join the waitlist for '+student.name+'</h3>';
+  html+='<p>Logs your interest in a day/time that\'s currently full or unstaffed — it doesn\'t book anything. Front desk will reach out the moment a seat opens up, first-come-first-served against anyone else already waiting for that same slot.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<label>Weekday</label><select onchange="setParentWaitlistField(\'weekday\',this.value)">'
+    +WEEKDAY_KEYS.map(function(wd){ return '<option value="'+wd+'"'+(wd===f.weekday?' selected':'')+'>'+wd+'</option>'; }).join('')
+    +'</select>';
+  html+='<label>Start time</label><select onchange="setParentWaitlistField(\'start\',this.value)">'
+    +AVAIL_BLOCKS.map(function(hb){ return '<option value="'+hb+'"'+(hb===f.start?' selected':'')+'>'+minToLabel(hb)+'</option>'; }).join('')
+    +'</select>';
+  html+='<label>Duration</label><select onchange="setParentWaitlistField(\'duration\',this.value)">'
+    +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===f.duration?' selected':'')+'>'+d+' min</option>'; }).join('')
+    +'</select>';
+  html+='<label>Note (optional)</label><input type="text" placeholder="e.g. flexible on 60 vs 90 min" value="'+f.note+'" oninput="setParentWaitlistField(\'note\',this.value)"/>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeParentWaitlistForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveParentWaitlistForm()">Add to waitlist</button>'
+  +'</div>';
+  html+='</div></div>';
   return html;
 }
 
@@ -5152,7 +5518,7 @@ function loadAllData(){
     T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
     T('parents','id,name,email,auth_user_id'),
-    T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id'),
+    T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online'),
     T('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note'),
     T('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
     T('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
@@ -5213,7 +5579,7 @@ function loadAllData(){
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
       actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false,
-      bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id,
+      bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false,
     }; });
 
     credits=creditRows.map(function(r){ return {
