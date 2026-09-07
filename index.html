@@ -1950,25 +1950,33 @@ function markStatus(sessionId, status){
   }
 }
 
-// Parent self-service cancellation (5.7-style rule): cancelling with notice — any day before today,
-// or same-day but before the 10:00am cutoff — frees the slot and automatically issues a make-up
-// credit, exactly like a front-desk no-show would, dated from the missed session and expiring 3
-// months later. Cancelling a same-day session after the cutoff isn't offered here at all — that's
-// the same cutoff already used for booking make-ups (5.7), so front desk can still record it as a
-// genuine no-show if the family doesn't call ahead.
+// Parent self-service cancellation (5.7-style rule, revised Sept 2026 per Allie): a parent can
+// always cancel an individual upcoming session themselves — cancelling with notice (any day
+// before today, or same-day but before the 10:00am cutoff) frees the slot and automatically
+// issues a make-up credit, exactly like a front-desk no-show would, dated from the missed session
+// and expiring 3 months later. Cancelling a same-day session AFTER the cutoff still goes through
+// (it was previously refused outright here, which just meant a family had to phone in instead) —
+// it just doesn't come with a make-up credit, since that's the same cutoff already used for
+// booking make-ups (5.7). Both the confirm dialog and the resulting toast say so explicitly, so
+// nobody cancels expecting a credit that isn't coming.
 function parentCancelSession(sessionId){
   const sess=findSession(sessionId);
   if(!sess || sess.status!=='scheduled') return;
   const now=simNow();
-  if(toKey(sess.date)===toKey(now) && sameDayMakeUpCutoffPassed()){
-    toast("It's past 10:00am, so today's session can no longer be cancelled here — please call the centre directly.");
-    return;
-  }
+  const pastCutoff = toKey(sess.date)===toKey(now) && sameDayMakeUpCutoffPassed();
   const student=findStudent(sess.studentId);
   const issued=sess.date, expiry=addMonths(issued,3);
-  if(!confirm('Cancel '+student.name+'\'s session?\n'+fmtLong(sess.date)+' at '+minToLabel(sess.start)+'\n\nThis will cancel this session only. '+student.name+'\'s regular session time will remain unchanged. You\'ll get a make-up credit valid until '+fmtShort(expiry)+'.')) return;
+  const confirmMsg = 'Cancel '+student.name+'\'s session?\n'+fmtLong(sess.date)+' at '+minToLabel(sess.start)+'\n\nThis will cancel this session only. '+student.name+'\'s regular session time will remain unchanged. '
+    + (pastCutoff
+      ? 'It\'s after the 10:00am same-day cutoff, so this cancellation will NOT come with a make-up credit.'
+      : 'You\'ll get a make-up credit valid until '+fmtShort(expiry)+'.');
+  if(!confirm(confirmMsg)) return;
   sess.status='cancelled';
-  dbWrite('cancelling session (parent, with notice)', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
+  dbWrite('cancelling session (parent'+(pastCutoff?', after same-day cutoff — no make-up':', with notice')+')', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
+  if(pastCutoff){
+    toast('Session cancelled — no make-up credit was issued since it\'s after the 10:00am same-day cutoff. Call the centre if you\'d like to discuss options.', 6000);
+    return;
+  }
   const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'parent-cancel', note:''};
   credits.push(c);
   dbWrite('issuing a make-up credit', function(){ return supabaseClient.from('credits').insert({
@@ -4834,9 +4842,16 @@ function renderParent(){
         const instr=s.instructorId? findInstructor(s.instructorId) : null;
         const isMakeUp=credits.some(function(c){ return c.redeemedSessionId===s.id; });
         const typeBadge=s.recurring? '<span class="badge booked">Regular</span>' : (isMakeUp? '<span class="badge available">Make-Up</span>' : '<span class="badge soon">One-off</span>');
+        // Cancelling is always allowed, even same-day past the 10am cutoff — it just won't come
+        // with a make-up credit past that point (5.26, per Allie: previously refused outright,
+        // which just pushed the family to phone in instead). Flag it here too, not only in the
+        // confirm dialog, so it's not a surprise after they've already clicked Cancel.
+        const noMakeUpToday = toKey(s.date)===toKey(simNow()) && sameDayMakeUpCutoffPassed();
         return '<div class="session-row">'
           +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
-          +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(pod?pod.name:'—')+' · '+(instr?instr.name:'Unassigned')+'</div></div>'
+          +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(pod?pod.name:'—')+' · '+(instr?instr.name:'Unassigned')+'</div>'
+            +(noMakeUpToday? '<div class="small" style="color:var(--danger)">Past 10am — cancelling now won\'t include a make-up credit</div>' : '')
+          +'</div>'
           +typeBadge
           +'<button class="btn sm ghost" onclick="parentCancelSession(\''+s.id+'\')">Cancel</button>'
         +'</div>';
