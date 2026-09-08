@@ -757,7 +757,12 @@ var state={
   // default so the page opens on the actual schedule instead of a wall of admin tables. Still just
   // a plain key in this same collapsedSections map, so clicking any of these open (or the ones
   // above closed) works exactly the same via toggleSection().
-  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, checkedin:true},
+  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, checkedin:true, podSeating:true},
+  // Quick check-in/out student search (Sept 2026, per Allie: a search bar that suggests the closest
+  // matched student name so front desk doesn't have to hunt through the Schedule list) — just the
+  // live query text; matching happens fresh on every render from `sessions`/`students`, nothing else
+  // to persist.
+  checkInSearchQuery:'',
 };
 
 // how many days before a make-up credit expires the parent gets advance notice — the "expiring
@@ -2337,6 +2342,70 @@ function checkInArrivalOptions(sess){
 // desk is checking someone in AS they arrive, so "on time" is a poor default the moment that's not
 // true; this saves having to manually correct it on every late (or early) check-in. Still fully
 // overridable, down to any earlier time, but never a later one (5.29).
+// Quick check-in/out student search (Sept 2026, per Allie: "a search-bar that suggests the closest
+// matched student name, upon selecting it, it once again gives the option to change check in or
+// check out time, as well as the pod they'll be sitting at") — matches only against today's own
+// roster, and only the two states a quick action actually applies to: still to arrive (routes to
+// Check-in, which already has its own Pod picker), or already here and not yet checked out (routes
+// to Check-out). No-show/excused/cancelled/already-checked-out sessions are excluded — nothing left
+// to do for those from this box.
+function checkInSearchCandidates(query){
+  const q=String(query||'').trim().toLowerCase();
+  if(!q) return [];
+  const todayKey=toKey(simNow());
+  return sessions.filter(function(s){
+    if(toKey(s.date)!==todayKey) return false;
+    if(s.status==='attended' && s.checkedOut) return false;
+    if(s.status!=='attended' && s.status!=='scheduled') return false;
+    const student=findStudent(s.studentId);
+    return student && student.name.toLowerCase().indexOf(q)!==-1;
+  }).map(function(s){
+    return {sess:s, name:findStudent(s.studentId).name};
+  }).sort(function(a,b){
+    const an=a.name.toLowerCase(), bn=b.name.toLowerCase();
+    const aStarts=an.indexOf(q)===0, bStarts=bn.indexOf(q)===0;
+    if(aStarts!==bStarts) return aStarts? -1 : 1;
+    return a.name.localeCompare(b.name, undefined, {sensitivity:'base'});
+  }).slice(0,8);
+}
+function setCheckInSearchQuery(v){ state.checkInSearchQuery=v; render(); }
+// Picking a suggestion goes straight to whichever modal actually applies right now — Check-in
+// (Pod + arrival time) if they haven't arrived yet, Check-out (exit time) if they're already here —
+// instead of making front desk scroll the Schedule list or Pod seating section to find that same row.
+function selectCheckInSearchResult(sessionId){
+  const sess=findSession(sessionId);
+  state.checkInSearchQuery='';
+  if(!sess){ render(); return; }
+  if(sess.status==='attended' && !sess.checkedOut){ openCheckOut(sessionId); }
+  else { openCheckIn(sessionId); }
+}
+function renderCheckInSearchPanel(){
+  const q=state.checkInSearchQuery||'';
+  const results=checkInSearchCandidates(q);
+  let html='<div class="card" style="margin-bottom:12px">';
+  html+='<input type="text" placeholder="Check a student in or out — start typing their name…" value="'+q.replace(/"/g,'&quot;')+'" oninput="setCheckInSearchQuery(this.value)" style="margin-bottom:0"/>';
+  if(q.trim()){
+    if(results.length){
+      html+='<div style="margin-top:8px;display:flex;flex-direction:column;gap:4px">'
+        +results.map(function(r){
+          const s=r.sess;
+          const alreadyHere=s.status==='attended' && !s.checkedOut;
+          const pod=findPod(s.podId);
+          const where = s.online? ('Online'+(findInstructor(s.instructorId)? ' — '+findInstructor(s.instructorId).name : '')) : (pod? pod.name : 'Unassigned');
+          const actionBadge = alreadyHere? '<span class="badge soon">Check out</span>' : '<span class="badge available">Check in</span>';
+          return '<button class="btn sm ghost" style="text-align:left;justify-content:flex-start;width:100%" onclick="selectCheckInSearchResult(\''+s.id+'\')">'
+            +'<b>'+r.name+'</b> · '+rangeLabel(s.start,s.duration)+' · '+where+' &nbsp; '+actionBadge
+          +'</button>';
+        }).join('')
+        +'</div>';
+    } else {
+      html+='<div class="empty-note" style="margin-top:8px;padding-bottom:0">No match among today\'s students still to arrive or already checked in.</div>';
+    }
+  }
+  html+='</div>';
+  return html;
+}
+
 function openCheckIn(sessionId){
   const sess=findSession(sessionId);
   // Belt-and-suspenders alongside the row-action button already being hidden for a future date
@@ -3818,7 +3887,10 @@ function sessionRowHtml(sess, weekday, dayKey, now){
     handoffNote = ' · with '+findInstructor(sess.instructorId).name+(sess.online? ' (online)' : '');
   }
   let html='<tr><td><b>'+student.name+'</b></td><td>'+yearLabel(student.year)+'</td><td>'+rangeLabel(sess.start,sess.duration)+'</td>';
-  html+='<td><select onchange="setSessionLocation(\''+sess.id+'\',this.value)">'
+  // This "Move to" picker lives only in the Pod seating section (see renderPodSummaryStrip) — a
+  // PERMANENT standing change from this weekday forward (setPermanentSessionLocation), not the
+  // one-off single-session move every other Pod/Online picker in the app uses (setSessionLocation).
+  html+='<td><select onchange="setPermanentSessionLocation(\''+sess.id+'\',\''+weekday+'\',\''+dayKey+'\',this.value)">'
     +'<option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
     +locationOptionsHtml(weekday, dayKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
   +'</select></td>';
@@ -4030,6 +4102,83 @@ function setSessionPod(sessionId, podId){
   render();
 }
 
+// The Pod seating section's own "Move to" picker (Sept 2026, per Allie: "I think maybe instead of
+// having the pre-assigned pods as always visible, that is another section at the bottom default
+// collapsed, where we can visually arrange students and any changes made to that section are
+// permanent changes from that day onward") — unlike setSessionLocation/setSessionPod above (a
+// one-off, this-session-only move), choosing a destination here is a PERMANENT standing change:
+// this weekday, from the viewed day forward, using the exact same pin mechanism as the "Change Pod"
+// feature (saveStudentPodAssignment) — just invoked directly instead of through its own modal.
+// Confirmed sessionRowHtml/rosterTableHtml are only ever rendered inside renderPodSummaryStrip, so
+// this is the only picker that needs this behavior; every other Pod/Online picker in the app
+// (Schedule list row wasn't a thing anymore, check-in modal, the separate Move-pod modal) stays a
+// one-off move via setSessionLocation/confirmMovePod, untouched.
+function setPermanentSessionLocation(sessionId, weekday, dayKey, value){
+  const sess=findSession(sessionId);
+  if(!sess) return;
+  const student=findStudent(sess.studentId);
+  const isOnline=String(value).indexOf('online:')===0;
+  const podId=isOnline? null : (value||null);
+  const instructorId=isOnline? value.slice(7) : null;
+
+  // Move the session actually being looked at right now, the same way the one-off pickers always
+  // have (movePodSession/setSessionOnline directly, same as confirmMovePod uses) — capacity is still
+  // enforced for a future-dated day exactly as before (movePodSession's own isToday check), only
+  // relaxed for the day it's actually happening. If this fails, stop — no pin gets written for a
+  // move that didn't actually happen.
+  if(isOnline){
+    const result=setSessionOnline(sessionId, instructorId);
+    if(!result.ok){ toast(result.error); render(); return; }
+  } else if(podId){
+    const result=movePodSession(sessionId, podId);
+    if(!result.ok){ toast(result.error); render(); return; }
+  } else {
+    sess.podId=null; sess.instructorId=null; sess.instructorId2=null; sess.handoff=null; sess.online=false;
+    dbWrite('unassigning a session\'s Pod', function(){ return supabaseClient.from('sessions').update({
+      pod_id:null, instructor_id:null, instructor_id_2:null, handoff_min:null, online:false
+    }).eq('id', sess.id); });
+  }
+
+  // Then pin it as a standing change from this weekday forward — identity for "replacing" a prior
+  // pin is (effectiveFrom, weekday) together, same convention saveStudentPodAssignment() uses.
+  student.podAssignments=(student.podAssignments||[]).filter(function(a){
+    return !(toKey(a.effectiveFrom)===dayKey && (a.weekday||null)===weekday);
+  });
+  student.podAssignments.push({podId:podId, online:isOnline, instructorId:instructorId, effectiveFrom:new Date(dayKey), weekday:weekday});
+  dbWrite('pinning standing Pod from seating section', function(){
+    return supabaseClient.from('student_pod_assignments').delete().eq('student_id', student.id).eq('effective_from', dayKey).eq('weekday', weekday)
+      .then(function(){
+        return supabaseClient.from('student_pod_assignments').insert({student_id:student.id, pod_id:podId, online:isOnline, instructor_id:instructorId, effective_from:dayKey, weekday:weekday});
+      });
+  });
+
+  // Cancel + regenerate already-generated future standing occurrences on that one weekday from this
+  // date forward, same as saveStudentPodAssignment() — otherwise only sessions not yet generated
+  // would pick up the new pin. The session moved directly above is excluded (already handled, and
+  // it may not even be `recurring`, e.g. a one-off staff-placed session).
+  let movedCount=0;
+  sessions.forEach(function(s){
+    if(s.studentId!==student.id || !s.recurring || s.status!=='scheduled' || s.id===sessionId) return;
+    if(toKey(s.date) < dayKey) return;
+    if(WEEKDAY_KEYS[(new Date(s.date).getDay()+6)%7]!==weekday) return;
+    s.status='cancelled';
+    movedCount++;
+    dbWrite('cancelling a session for a permanent Pod seating change', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+    if(s.creditId){
+      const cr=findCredit(s.creditId);
+      if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){
+        cr.status='available'; cr.redeemedSessionId=null;
+        dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', cr.id); });
+      }
+    }
+  });
+  regenerateAllRecurring();
+
+  const destLabel = isOnline? ('Online — '+findInstructor(instructorId).name) : (podId? findPod(podId).name : 'Unassigned');
+  toast(student.name+' permanently moved to '+destLabel+' on '+weekday+'s, from '+fmtShort(new Date(dayKey))+' onward'+(movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match' : '')+'.');
+  render();
+}
+
 // Collapse state for front-desk sections lives on `state` (so it survives the full-page
 // re-render every action triggers) but isn't persisted anywhere beyond the current browser tab —
 // each section just remembers whether it's open or closed for the rest of this visit.
@@ -4062,7 +4211,8 @@ function renderStaff(){
   const isPast = selectedDate < new Date(toKey(now));
   const closure=closedDayFor(selectedDate);
 
-  let html=renderCoverageRequestsPanel();
+  let html=renderCheckInSearchPanel();
+  html+=renderCoverageRequestsPanel();
   html+=renderEnrollmentRequestsPanel();
   html+=renderCheckedInPanel();
   html+=renderAvailabilityLookup();
@@ -4084,8 +4234,6 @@ function renderStaff(){
   if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
 
   html+=renderLiveOccupancyBoard(dayKey);
-
-  html+=renderPodSummaryStrip(dayKey, weekday);
 
   html+=renderCoverageGrid(weekDates);
 
@@ -4110,6 +4258,20 @@ function renderStaff(){
   html+=renderCreditsReport();
   html+=renderInactiveStudentsPanel();
   html+=renderInactiveParentsPanel();
+
+  // Relocated out of the always-visible Schedule card and collapsed by default (Sept 2026, per
+  // Allie: "instead of having the pre-assigned pods as always visible, that is another section at
+  // the bottom default collapsed, where we can visually arrange students") — same per-Pod/Online/
+  // Unassigned rosters as before, still following whichever day is selected in the Schedule day
+  // picker above, just tucked away since day-to-day front desk work rarely needs it. Its "Move to"
+  // picker now makes a PERMANENT standing change (see setPermanentSessionLocation) rather than a
+  // one-off swap, which is exactly what makes this the right place to "visually arrange" seating —
+  // a change made here is meant to stick, not just cover today.
+  html+=sectionOpen('podSeating','Pod seating — permanent changes')
+    +'<p class="small muted">Move a student here and it sticks — every '+weekday+' from '+fmtShort(selectedDate)+' onward, not just '+fmtShort(selectedDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead.</p>'
+    +renderPodSummaryStrip(dayKey, weekday)
+    +'</div>';
+
   return html;
 }
 
