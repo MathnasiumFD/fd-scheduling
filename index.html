@@ -2003,10 +2003,15 @@ function openBooking(podId, dateKey){
   // Pod/Online picker appears (see sessionLocationValue) — a Pod's own id, '' for unassigned, or
   // 'online:<instructorId>' for an Online group; pickBestPod (auto-suggest) only ever proposes a
   // physical Pod, never Online — that's always a deliberate manual pick.
-  state.bookingForm={studentId:'', duration:dur, start:possibleStarts(dur)[0], location:podId||'', overrideOk:false, locationManual:!!podId};
+  state.bookingForm={studentId:'', duration:dur, start:possibleStarts(dur)[0], location:podId||'', overrideOk:false, locationManual:!!podId, checkInNow:false};
   render();
 }
 function closeBooking(){ state.booking=null; render(); }
+// "They're here right now" — offered only for a same-day booking (see renderBookingModal): checks
+// the student in immediately after confirmBooking() creates the session, instead of leaving front
+// desk to find them in the Schedule list and click Check in separately a moment later. Exactly the
+// walk-in case Allie described: a student whose usual day is different shows up unexpectedly today.
+function setBookingCheckInNow(v){ state.bookingForm.checkInNow=!!v; render(); }
 
 // Re-suggests a Pod via pickBestPod() (first staffed, under-capacity Pod — no age consideration,
 // Sept 2026) whenever the student, start time, or duration changes — mirrors the "pre-filled,
@@ -2070,6 +2075,16 @@ function setBookingStart(v){
 function setBookingLocation(v){ state.bookingForm.location=v; state.bookingForm.locationManual=true; state.bookingForm.overrideOk=false; render(); }
 function toggleOverride(){ state.bookingForm.overrideOk=!state.bookingForm.overrideOk; render(); }
 
+// Applies the "they're here right now" quick check-in to a session that confirmBooking() just
+// created, returning a note to tack onto the usual booking toast. Only ever invoked for a same-day
+// booking (see the checkInNow guard in confirmBooking()) — arrival defaults to the same "nearest
+// 5-minute mark, capped 3 minutes ahead" smart default the Check-in modal itself uses.
+function checkInNewBookingNow(sess){
+  const arrival=nearestOption(checkInArrivalOptions(sess), nowMinutesOfDay());
+  const exitTime=autoExitTime(sess, arrival-sess.start);
+  applyCheckIn(sess, arrival, exitTime);
+  return ' Checked in immediately — running '+minToLabel(sess.actualStart)+'–'+minToLabel(sess.actualEnd)+'.';
+}
 function confirmBooking(){
   const b=state.booking; const f=state.bookingForm;
   if(!f.studentId || f.start==null) return;
@@ -2080,6 +2095,7 @@ function confirmBooking(){
   const pod = (!isOnline && f.location)? findPod(f.location) : null;
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
   const end=f.start+f.duration;
+  const checkInNow = !!f.checkInNow && dateKey===toKey(simNow());
 
   if(studentOverlapClash(student.id, dateKey, f.start, f.duration, null)){
     toast('Blocked — '+student.name+' already has an overlapping session that day.');
@@ -2101,7 +2117,9 @@ function confirmBooking(){
       id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:newSess.instructorId, instructor_id_2:null, handoff_min:null, online:true,
       the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
     }); });
-    toast(student.name+' booked into Online — '+instr.name+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+'.');
+    let msg=student.name+' booked into Online — '+instr.name+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+'.';
+    if(checkInNow) msg+=checkInNewBookingNow(newSess);
+    toast(msg);
     state.booking=null;
     render();
     return;
@@ -2116,7 +2134,9 @@ function confirmBooking(){
       id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:null, instructor_id_2:null, handoff_min:null,
       the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
     }); });
-    toast(student.name+' booked '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+' — no Pod chosen, pick one any time from the Schedule list.');
+    let msg=student.name+' booked '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+' — no Pod chosen, pick one any time from the Schedule list.';
+    if(checkInNow) msg+=checkInNewBookingNow(newSess);
+    toast(msg);
     state.booking=null;
     render();
     return;
@@ -2159,7 +2179,9 @@ function confirmBooking(){
   const withNote = cov.primaryInstructorId? (' with '+findInstructor(cov.primaryInstructorId).name) : '';
   const gapNote = (cov.gapMinutes>0 && cov.ok)? (' ('+cov.gapMinutes+' min unattended — within the '+UNATTENDED_TOLERANCE_MIN+'-min tolerance)') : '';
   const capacityNote = overCapacityToday? (' — over capacity ('+wouldBePeak+'/'+cap+'), allowed since it\'s today') : '';
-  toast(student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+gapNote+capacityNote+'.');
+  let msg=student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+gapNote+capacityNote+'.';
+  if(checkInNow) msg+=checkInNewBookingNow(newSess);
+  toast(msg);
   state.booking=null;
   render();
 }
@@ -2359,6 +2381,22 @@ function setCheckInArrival(v){
 }
 function setCheckInExit(v){ state.checkIn.exitTime=Number(v); render(); }
 
+// The actual check-in write, factored out of confirmCheckIn() so the "they're here right now" quick
+// option on a same-day booking (confirmBooking(), below) can apply the exact same effect — status,
+// actual start/end, checkInOffset, and the parent notification — without duplicating it (Sept 2026,
+// per Allie: "i need an option to add a student on a day when they show up unexpectedly").
+function applyCheckIn(sess, arrival, exitTime){
+  const offset=arrival-sess.start;
+  sess.checkInOffset=offset;
+  sess.actualStart=arrival;
+  sess.actualEnd=exitTime;
+  sess.status='attended';
+  dbWrite('checking in', function(){ return supabaseClient.from('sessions').update({
+    check_in_offset:sess.checkInOffset, actual_start_min:sess.actualStart, actual_end_min:sess.actualEnd, status:sess.status
+  }).eq('id', sess.id); });
+  notifyParentOfCheckIn(sess.id, sess.actualStart, sess.actualEnd);
+  return offset;
+}
 function confirmCheckIn(){
   const sess=findSession(state.checkIn.sessionId);
   if(toKey(sess.date)>toKey(simNow())){
@@ -2371,16 +2409,8 @@ function confirmCheckIn(){
   // modal was left open long enough that the arrival it was last set to is now later than "right
   // now" (only possible for a session dated today; checkInMaxArrival() never restricts a past date).
   state.checkIn.arrival=nearestOption(checkInArrivalOptions(sess), state.checkIn.arrival);
-  const offset=state.checkIn.arrival-sess.start;
-  const autoEnd=autoExitTime(sess, offset);
-  sess.checkInOffset=offset;
-  sess.actualStart=state.checkIn.arrival;
-  sess.actualEnd=state.checkIn.exitTime;
-  sess.status='attended';
-  dbWrite('checking in', function(){ return supabaseClient.from('sessions').update({
-    check_in_offset:sess.checkInOffset, actual_start_min:sess.actualStart, actual_end_min:sess.actualEnd, status:sess.status
-  }).eq('id', sess.id); });
-  notifyParentOfCheckIn(sess.id, sess.actualStart, sess.actualEnd);
+  const autoEnd=autoExitTime(sess, state.checkIn.arrival-sess.start);
+  const offset=applyCheckIn(sess, state.checkIn.arrival, state.checkIn.exitTime);
   const adjusted = sess.actualEnd!==autoEnd;
   state.checkIn=null;
   if(adjusted){
@@ -3839,16 +3869,32 @@ function liveOccupancyGroups(dayKey){
       return ea-eb || a.name.localeCompare(b.name, undefined, {sensitivity:'base'});
     });
   };
+  // podId carried through (null for an Online group) so the renderer can look up that Pod's own
+  // capacity for the seat-map/badge below — Online has a different capacity model entirely (the
+  // combined 1:9 ratio, not a fixed 8 seats), so it deliberately gets neither.
   const groups=[];
   pods.forEach(function(pod){
-    if(byPod[pod.id] && byPod[pod.id].length) groups.push({label:pod.name, entries:sortEntries(byPod[pod.id])});
+    if(byPod[pod.id] && byPod[pod.id].length) groups.push({label:pod.name, podId:pod.id, entries:sortEntries(byPod[pod.id])});
   });
   Object.keys(byOnlineInstr).forEach(function(instrId){
     const instr=findInstructor(instrId);
     if(!instr) return;
-    groups.push({label:'Online — '+instr.name, entries:sortEntries(byOnlineInstr[instrId])});
+    groups.push({label:'Online — '+instr.name, podId:null, entries:sortEntries(byOnlineInstr[instrId])});
   });
   return groups;
+}
+// A row of small seat-status squares — one per seat in the Pod's capacity, filled in the order
+// occupied seats are counted (not tied to any particular physical seat, since the app doesn't track
+// individual seats within a Pod) — red for taken, green for still open (Sept 2026, per Allie: "mark
+// the empty spaces in green, and the occupied spaces in red... next to each pod (x/8)").
+function seatDotsHtml(occupied, cap){
+  let html='<span style="display:inline-flex;gap:3px;vertical-align:middle">';
+  for(let i=0;i<cap;i++){
+    const filled = i<occupied;
+    html+='<span style="width:9px;height:9px;border-radius:2px;display:inline-block;background:'+(filled?'var(--danger)':'var(--success)')+'" title="'+(filled?'Occupied':'Empty')+'"></span>';
+  }
+  html+='</span>';
+  return html;
 }
 function renderLiveOccupancyBoard(dayKey){
   const groups=liveOccupancyGroups(dayKey).filter(function(g){ return g.entries.length; });
@@ -3860,7 +3906,16 @@ function renderLiveOccupancyBoard(dayKey){
   }
   html+='<div style="display:flex;flex-wrap:wrap;gap:16px">'
     +groups.map(function(g){
-      return '<div style="min-width:150px"><h4 style="margin:0 0 4px 0">'+g.label+'</h4>'
+      const occupancy=g.entries.length;
+      const cap=g.podId? podCapacity(g.podId) : null;
+      // Same "full" (red) / "available" (green) badge convention already used for every other
+      // capacity badge in the app (renderPodSummaryStrip, etc.) — flips to "full" right at 8/8.
+      const capBadge = cap!=null
+        ? ' <span class="badge '+(occupancy>=cap?'full':'available')+'" style="margin-left:6px">'+occupancy+'/'+cap+'</span>'
+        : '';
+      const dots = cap!=null? '<div style="margin:2px 0 6px">'+seatDotsHtml(occupancy, cap)+'</div>' : '';
+      return '<div style="min-width:150px"><h4 style="margin:0 0 4px 0">'+g.label+capBadge+'</h4>'
+        +dots
         +'<table><tr><th>Student</th><th>Leaves</th></tr>'
         +g.entries.map(function(e){ return '<tr><td>'+e.name+'</td><td>'+(e.exit!=null? minToLabel(e.exit) : '—')+'</td></tr>'; }).join('')
         +'</table></div>';
@@ -4589,6 +4644,14 @@ function renderBookingModal(){
   }
   if(student && !pod && !isOnline){
     html+='<div class="banner info">ℹ️ No Pod chosen — this books '+student.name+' in, unassigned. Pick a Pod for them any time from the Schedule list.</div>';
+  }
+  // Walk-in convenience (Sept 2026, per Allie: "i need an option to add a student on a day when they
+  // show up unexpectedly" — a student whose usual day is different turns up today). Only offered for
+  // a same-day booking; a same-day booking made in ADVANCE of an actual arrival (lining up a make-up
+  // before the student is actually due in) leaves this unticked.
+  if(isTodayBooking){
+    html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px"><input type="checkbox" '+(f.checkInNow?'checked':'')+' onchange="setBookingCheckInNow(this.checked)" style="width:auto;margin:0"/> They\'re here right now — check '+(student?student.name:'them')+' in immediately</label>';
+    html+='<p class="small muted" style="margin:2px 0 0">Skips finding them in the Schedule list and clicking Check in separately — uses the same closest-to-now arrival time the Check-in screen itself defaults to.</p>';
   }
 
   const confirmDisabled = !f.studentId || f.start==null || overCapacity || onlineOverCapacity || (needsOverride && !f.overrideOk);
