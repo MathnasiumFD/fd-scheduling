@@ -830,6 +830,8 @@ function findStudent(id){ return students.find(s=>s.id===id); }
 function findInstructor(id){ return instructors.find(i=>i.id===id); }
 function findSession(id){ return sessions.find(s=>s.id===id); }
 function findCredit(id){ return credits.find(c=>c.id===id); }
+function findParent(id){ return parents.find(p=>p.id===id); }
+function findStaffMember(id){ return staffMembers.find(s=>s.id===id); }
 
 /* ---------- pod scheduling & capacity ---------- */
 // Sessions booked into a Pod that day (any status but cancelled) — capacity belongs to the Pod
@@ -3065,6 +3067,52 @@ function saveNewStudent(){
   render();
 }
 
+// Editing an existing student's basic details (5.31, per Allie: "I need the option to edit existing
+// Students... change their names, emails, etc") — deliberately separate from openRecurringForm
+// (their day/time pattern) and openPlanChangeForm (a dated frequency/stop change): this is just
+// fixing a typo'd name, correcting their school year, or moving them under a different parent
+// record, none of which need the effective-dated regeneration machinery those other two forms carry.
+// A student has no email of their own — that's their parent's — so there's nothing email-shaped to
+// edit here; "reassign parent" covers the other half of "who this student belongs to".
+function openEditStudentForm(studentId){
+  const student=findStudent(studentId);
+  state.editStudentForm={studentId, name:student.name, year:student.year, parentId:student.parentId, error:''};
+  render();
+}
+function closeEditStudentForm(){ state.editStudentForm=null; render(); }
+function setEditStudentField(field, value){ state.editStudentForm[field]=value; state.editStudentForm.error=''; render(); }
+function saveEditStudent(){
+  const f=state.editStudentForm;
+  const student=findStudent(f.studentId);
+  if(!f.name.trim()){ f.error='Enter the student\'s name.'; render(); return; }
+  if(!f.year){ f.error='Choose a school year.'; render(); return; }
+  if(!f.parentId){ f.error='Choose a parent.'; render(); return; }
+  student.name=f.name.trim();
+  // A plain student.year=... would get silently clobbered the next time applyPromotions() runs
+  // (advancing the clock, or any real day rollover) — that recomputes year fresh from baseYear/
+  // yearBaseline every time, exactly the way saveNewStudent() sets them at enrollment. Re-pinning
+  // both here to "this corrected year, as of today" makes the edit stick and promotes correctly
+  // forward from it, instead of reverting to whatever the old (wrong) year would have promoted to.
+  student.year=Number(f.year);
+  student.baseYear=Number(f.year);
+  student.yearBaseline=schoolYearIndex(simNow());
+  const parentChanged = f.parentId!==student.parentId;
+  if(parentChanged){
+    const oldParent=findParent(student.parentId);
+    if(oldParent) oldParent.studentIds=(oldParent.studentIds||[]).filter(function(id){ return id!==student.id; });
+    const newParent=findParent(f.parentId);
+    newParent.studentIds=newParent.studentIds||[];
+    if(newParent.studentIds.indexOf(student.id)===-1) newParent.studentIds.push(student.id);
+    student.parentId=f.parentId;
+  }
+  dbWrite('editing student details', function(){ return supabaseClient.from('students').update({
+    name:student.name, year:student.year, base_year:student.baseYear, year_baseline:student.yearBaseline, parent_id:student.parentId
+  }).eq('id', student.id); });
+  toast(student.name+'\'s details updated'+(parentChanged? ' — now under '+findParent(student.parentId).name : '')+'.');
+  state.editStudentForm=null;
+  render();
+}
+
 // Bringing on a new instructor (5.18): identity, their starting weekly availability (one row per
 // weekday, toggled on/off, exactly the same shape as an ongoing availRule — saved with
 // effectiveFrom:AVAIL_BASELINE so it behaves as their standing pattern from day one, not a future
@@ -3117,6 +3165,63 @@ function saveNewInstructor(){
   state.newInstructorForm=null;
   render();
   if(f.inviteNow) inviteLogin(newInstructor.email, 'instructor', newInstructor.id, newInstructor.name);
+}
+
+// Editing an existing instructor's name/email/"best suited for" range (5.31, per Allie) —
+// deliberately separate from openStaffAvailManager (their actual weekly hours), same reasoning as
+// keeping student detail edits separate from their schedule/plan forms. Same login-email caveat as
+// editing a parent or staff member.
+function openEditInstructorForm(instructorId){
+  const instr=findInstructor(instructorId);
+  state.editInstructorForm={instructorId, name:instr.name, email:instr.email, yearMin:instr.yearMin, yearMax:instr.yearMax, error:''};
+  render();
+}
+function closeEditInstructorForm(){ state.editInstructorForm=null; render(); }
+function setEditInstructorField(field, value){ state.editInstructorForm[field]=value; state.editInstructorForm.error=''; render(); }
+function saveEditInstructor(){
+  const f=state.editInstructorForm;
+  const instr=findInstructor(f.instructorId);
+  if(!f.name.trim()){ f.error='Enter the instructor\'s name.'; render(); return; }
+  if(!f.email.trim()){ f.error='Enter an email address.'; render(); return; }
+  const clash=instructors.find(function(i){ return i.id!==instr.id && i.email.toLowerCase()===f.email.trim().toLowerCase(); });
+  if(clash){ f.error='Another instructor already uses that email.'; render(); return; }
+  if(Number(f.yearMax)<Number(f.yearMin)){ f.error='"Best suited to" can\'t be earlier than "Best suited from".'; render(); return; }
+  instr.name=f.name.trim();
+  instr.email=f.email.trim();
+  instr.yearMin=Number(f.yearMin);
+  instr.yearMax=Number(f.yearMax);
+  dbWrite('editing instructor details', function(){ return supabaseClient.from('instructors').update({
+    name:instr.name, email:instr.email, year_min:instr.yearMin, year_max:instr.yearMax
+  }).eq('id', instr.id); });
+  toast(instr.name+'\'s details updated.');
+  state.editInstructorForm=null;
+  render();
+}
+function renderEditInstructorModal(){
+  const f=state.editInstructorForm;
+  if(!f) return '';
+  const instr=findInstructor(f.instructorId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeEditInstructorForm()"><div class="modal">';
+  html+='<h3>Edit '+instr.name+'\'s details</h3>';
+  html+='<label>Name</label><input type="text" value="'+f.name+'" oninput="setEditInstructorField(\'name\', this.value)"/>';
+  html+='<label>Email</label><input type="text" value="'+f.email+'" oninput="setEditInstructorField(\'email\', this.value)"/>';
+  html+='<label>Best suited for <span class="small muted">(a preference only — they can teach any year)</span></label>';
+  html+='<div class="row2"><div><label>From</label><select onchange="setEditInstructorField(\'yearMin\', Number(this.value))">'
+    +YEARS.map(function(y){ return '<option value="'+y+'"'+(y===f.yearMin?' selected':'')+'>'+yearLabel(y)+'</option>'; }).join('')
+    +'</select></div>'
+    +'<div><label>To</label><select onchange="setEditInstructorField(\'yearMax\', Number(this.value))">'
+    +YEARS.map(function(y){ return '<option value="'+y+'"'+(y===f.yearMax?' selected':'')+'>'+yearLabel(y)+'</option>'; }).join('')
+    +'</select></div></div>';
+  if(instr.authUserId){
+    html+='<p class="small muted">They already have a login — changing the email above only updates their contact record here, not what they actually sign in with.</p>';
+  }
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeEditInstructorForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveEditInstructor()">Save</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
 }
 
 function openRecurringForm(studentId){
@@ -4269,10 +4374,11 @@ function renderStudentsPanel(){
       +'<td class="small">'+recurringSummary(s)+'</td>'
       +'<td>'+(short? '<span class="badge soon">'+booked+' / '+s.sessionsPerWeek+'</span>' : '<span class="badge available">'+booked+' / '+s.sessionsPerWeek+'</span>')+'</td>'
       +'<td class="small">'+(parent? parent.name : '—')+'</td>'
-      +'<td><button class="btn sm ghost" onclick="openRecurringForm(\''+s.id+'\')">Edit</button> <button class="btn sm ghost" onclick="openHoldForm(\''+s.id+'\')">Hold</button> <button class="btn sm ghost" onclick="openAddCreditForm(\''+s.id+'\')">+ Credit</button> <button class="btn sm ghost" onclick="openAttendanceLog(\''+s.id+'\')">History</button> <button class="btn sm ghost" onclick="openStudentPodForm(\''+s.id+'\')">Change Pod</button> <button class="btn sm ghost" onclick="openPlanChangeForm(\''+s.id+'\')">Stop / change plan</button></td></tr>';
+      +'<td><button class="btn sm ghost" onclick="openEditStudentForm(\''+s.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openRecurringForm(\''+s.id+'\')">Edit schedule</button> <button class="btn sm ghost" onclick="openHoldForm(\''+s.id+'\')">Hold</button> <button class="btn sm ghost" onclick="openAddCreditForm(\''+s.id+'\')">+ Credit</button> <button class="btn sm ghost" onclick="openAttendanceLog(\''+s.id+'\')">History</button> <button class="btn sm ghost" onclick="openStudentPodForm(\''+s.id+'\')">Change Pod</button> <button class="btn sm ghost" onclick="openPlanChangeForm(\''+s.id+'\')">Stop / change plan</button></td></tr>';
   });
   html+='</table></div>';
   html+=renderNewStudentModal();
+  html+=renderEditStudentModal();
   html+=renderRecurringModal();
   html+=renderHoldModal();
   html+=renderAttendanceLogModal();
@@ -4299,7 +4405,7 @@ function renderInstructorsPanel(){
       : '<button class="btn sm ghost" onclick="inviteLogin(\''+instr.email+'\',\'instructor\',\''+instr.id+'\',\''+instr.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
     html+='<tr'+(inactive?' style="opacity:.55"':'')+'><td>'+instr.name+(inactive?' <span class="small muted">(inactive)</span>':'')+'</td><td class="small">'+instr.email+'</td><td>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</td><td class="small">'+summary+'</td>'
       +'<td>'+loginCell+'</td>'
-      +'<td><button class="btn sm ghost" onclick="openStaffAvailManager(\''+instr.id+'\')">Adjust hours</button> '
+      +'<td><button class="btn sm ghost" onclick="openEditInstructorForm(\''+instr.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openStaffAvailManager(\''+instr.id+'\')">Adjust hours</button> '
       +(inactive
         ? '<button class="btn sm ghost" onclick="reactivateInstructor(\''+instr.id+'\')">Reactivate</button>'
         : '<button class="btn sm ghost" onclick="deactivateInstructor(\''+instr.id+'\')">Deactivate</button>')
@@ -4307,6 +4413,7 @@ function renderInstructorsPanel(){
   });
   html+='</table></div>';
   html+=renderNewInstructorModal();
+  html+=renderEditInstructorModal();
   html+=renderStaffAvailManagerModal();
   return html;
 }
@@ -4347,6 +4454,52 @@ function saveNewParent(){
   render();
   if(f.inviteNow) inviteLogin(newParent.email, 'parent', newParent.id, newParent.name);
 }
+
+// Editing an existing parent's name/email (5.31, per Allie). Changing the email here only updates
+// their contact record — if they already have a login (authUserId set), it does NOT change what
+// they actually sign in with, since that lives in Supabase Auth, not this table; the form says so
+// rather than silently doing something narrower than it looks like it's doing.
+function openEditParentForm(parentId){
+  const parent=findParent(parentId);
+  state.editParentForm={parentId, name:parent.name, email:parent.email, error:''};
+  render();
+}
+function closeEditParentForm(){ state.editParentForm=null; render(); }
+function setEditParentField(field, value){ state.editParentForm[field]=value; state.editParentForm.error=''; render(); }
+function saveEditParent(){
+  const f=state.editParentForm;
+  const parent=findParent(f.parentId);
+  if(!f.name.trim()){ f.error='Enter the parent\'s name.'; render(); return; }
+  if(!f.email.trim()){ f.error='Enter an email address.'; render(); return; }
+  const clash=parents.find(function(p){ return p.id!==parent.id && p.email.toLowerCase()===f.email.trim().toLowerCase(); });
+  if(clash){ f.error='Another parent already uses that email.'; render(); return; }
+  parent.name=f.name.trim();
+  parent.email=f.email.trim();
+  dbWrite('editing parent details', function(){ return supabaseClient.from('parents').update({name:parent.name, email:parent.email}).eq('id', parent.id); });
+  toast(parent.name+'\'s details updated.');
+  state.editParentForm=null;
+  render();
+}
+function renderEditParentModal(){
+  const f=state.editParentForm;
+  if(!f) return '';
+  const parent=findParent(f.parentId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeEditParentForm()"><div class="modal">';
+  html+='<h3>Edit '+parent.name+'\'s details</h3>';
+  html+='<label>Name</label><input type="text" value="'+f.name+'" oninput="setEditParentField(\'name\', this.value)"/>';
+  html+='<label>Email</label><input type="text" value="'+f.email+'" oninput="setEditParentField(\'email\', this.value)"/>';
+  if(parent.authUserId){
+    html+='<p class="small muted">They already have a login — changing the email above only updates their contact record here, not what they actually sign in with.</p>';
+  }
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeEditParentForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveEditParent()">Save</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+
 function renderNewParentModal(){
   const f=state.newParentForm;
   if(!f) return '';
@@ -4376,10 +4529,11 @@ function renderParentsPanel(){
       : p.authUserId==='pending'? '<span class="badge soon">Invited</span>'
       : p.authUserId? '<span class="badge available">Active</span>'
       : '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
-    html+='<tr><td>'+p.name+'</td><td class="small">'+p.email+'</td><td class="small">'+(kids.length? kids.join(', ') : '—')+'</td><td>'+loginCell+'</td><td></td></tr>';
+    html+='<tr><td>'+p.name+'</td><td class="small">'+p.email+'</td><td class="small">'+(kids.length? kids.join(', ') : '—')+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditParentForm(\''+p.id+'\')">Edit details</button></td></tr>';
   });
   html+='</table></div>';
   html+=renderNewParentModal();
+  html+=renderEditParentModal();
   return html;
 }
 
@@ -4405,6 +4559,50 @@ function saveNewStaff(){
   render();
   if(f.inviteNow) inviteLogin(newStaff.email, 'staff', newStaff.id, newStaff.name);
 }
+
+// Editing an existing front-desk staff member's name/email (5.31, per Allie) — same caveat as
+// editing a parent's email: it only updates the contact record, not an already-active login.
+function openEditStaffForm(staffId){
+  const staff=findStaffMember(staffId);
+  state.editStaffForm={staffId, name:staff.name, email:staff.email, error:''};
+  render();
+}
+function closeEditStaffForm(){ state.editStaffForm=null; render(); }
+function setEditStaffField(field, value){ state.editStaffForm[field]=value; state.editStaffForm.error=''; render(); }
+function saveEditStaff(){
+  const f=state.editStaffForm;
+  const staff=findStaffMember(f.staffId);
+  if(!f.name.trim()){ f.error='Enter their name.'; render(); return; }
+  if(!f.email.trim()){ f.error='Enter an email address.'; render(); return; }
+  const clash=staffMembers.find(function(s){ return s.id!==staff.id && s.email.toLowerCase()===f.email.trim().toLowerCase(); });
+  if(clash){ f.error='Another staff member already uses that email.'; render(); return; }
+  staff.name=f.name.trim();
+  staff.email=f.email.trim();
+  dbWrite('editing staff member details', function(){ return supabaseClient.from('staff_members').update({name:staff.name, email:staff.email}).eq('id', staff.id); });
+  toast(staff.name+'\'s details updated.');
+  state.editStaffForm=null;
+  render();
+}
+function renderEditStaffModal(){
+  const f=state.editStaffForm;
+  if(!f) return '';
+  const staff=findStaffMember(f.staffId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeEditStaffForm()"><div class="modal">';
+  html+='<h3>Edit '+staff.name+'\'s details</h3>';
+  html+='<label>Name</label><input type="text" value="'+f.name+'" oninput="setEditStaffField(\'name\', this.value)"/>';
+  html+='<label>Email</label><input type="text" value="'+f.email+'" oninput="setEditStaffField(\'email\', this.value)"/>';
+  if(staff.authUserId){
+    html+='<p class="small muted">They already have a login — changing the email above only updates their contact record here, not what they actually sign in with.</p>';
+  }
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeEditStaffForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveEditStaff()">Save</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+
 function renderNewStaffModal(){
   const f=state.newStaffForm;
   if(!f) return '';
@@ -4433,11 +4631,12 @@ function renderFrontStaffPanel(){
       : s.authUserId==='pending'? '<span class="badge soon">Invited</span>'
       : s.authUserId? '<span class="badge available">Active</span>'
       : '<button class="btn sm ghost" onclick="inviteLogin(\''+s.email+'\',\'staff\',\''+s.id+'\',\''+s.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
-    html+='<tr><td>'+s.name+'</td><td class="small">'+s.email+'</td><td>'+loginCell+'</td><td></td></tr>';
+    html+='<tr><td>'+s.name+'</td><td class="small">'+s.email+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditStaffForm(\''+s.id+'\')">Edit details</button></td></tr>';
   });
   if(staffMembers.length===0) html+='<tr><td colspan="4" class="small muted">No named staff yet — everyone currently signs in with a shared front-desk login.</td></tr>';
   html+='</table></div>';
   html+=renderNewStaffModal();
+  html+=renderEditStaffModal();
   return html;
 }
 
@@ -4573,6 +4772,31 @@ function renderNewStudentModal(){
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeNewStudentForm()">Cancel</button>'
     +'<button class="btn primary" onclick="saveNewStudent()">Enroll student</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+
+function renderEditStudentModal(){
+  const f=state.editStudentForm;
+  if(!f) return '';
+  const student=findStudent(f.studentId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeEditStudentForm()"><div class="modal">';
+  html+='<h3>Edit '+student.name+'\'s details</h3>';
+  html+='<label>Student name</label><input type="text" value="'+f.name+'" oninput="setEditStudentField(\'name\', this.value)"/>';
+  html+='<label>School year</label><select onchange="setEditStudentField(\'year\', Number(this.value))">'
+    +YEARS.map(function(y){ return '<option value="'+y+'"'+(y===f.year?' selected':'')+'>'+yearLabel(y)+'</option>'; }).join('')
+    +'</select>';
+  html+='<label>Parent</label><select onchange="setEditStudentField(\'parentId\', this.value)">'
+    +parents.filter(function(p){ return !isParentInactive(p) || p.id===f.parentId; }).sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(p){
+      return '<option value="'+p.id+'"'+(p.id===f.parentId?' selected':'')+'>'+p.name+' ('+p.email+')</option>';
+    }).join('')
+    +'</select>';
+  html+='<p class="small muted" style="margin-top:-6px">For their regular day/time schedule, use "Edit schedule" instead; for a frequency change or stopping, use "Stop / change plan" — both apply from a chosen date rather than right away.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeEditStudentForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveEditStudent()">Save</button>'
   +'</div>';
   html+='</div></div>';
   return html;
