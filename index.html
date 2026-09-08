@@ -4393,19 +4393,34 @@ function renderStudentsPanel(){
 function renderInstructorsPanel(){
   let html=sectionOpen('instructors','Instructors',
     '<button class="btn sm primary" onclick="openNewInstructorForm()">+ Add instructor</button>');
-  html+='<table><tr><th>Instructor</th><th>Email</th><th>Best suited for</th><th>Working days</th><th>Login</th><th></th></tr>';
+  html+='<table><tr><th>Instructor</th><th>Email</th><th>Best suited for</th><th>Availability <span class="small muted" style="font-weight:400">(self-reported)</span></th><th>Rostered shifts <span class="small muted" style="font-weight:400">(you set these)</span></th><th>Login</th><th></th></tr>';
   instructors.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(instr){
+    // Two genuinely separate concepts, shown side by side so front desk never has to guess which
+    // one they're looking at: "Availability" is what the instructor says they COULD work (availRules,
+    // editable by the instructor themselves, or by front desk via "Adjust availability" below) —
+    // it's a declaration, not a commitment. "Rostered shifts" is what front desk has actually
+    // assigned them to cover (instructorRosteredShifts(), set via each Pod's "Assign" button in the
+    // Schedule section) — that's the real, live staffing record students and other instructors rely
+    // on. An instructor can be available Mon-Fri and rostered on only two of those days, or (if a
+    // shift was arranged outside their stated hours) rostered on a day they haven't marked available
+    // at all — though in practice qualifyingInstructorsForBlock() only offers already-available
+    // instructors when assigning a shift, so the two normally line up (Sept 2026).
     const pattern=instructorCurrentWeeklyPattern(instr.id);
     const days=WEEKDAY_KEYS.filter(function(d){ return pattern[d]; });
-    const summary = days.length? days.map(function(d){ return d+' '+minToLabel(pattern[d].start)+'–'+minToLabel(pattern[d].end); }).join(', ') : 'No regular availability set';
+    const availSummary = days.length? days.map(function(d){ return d+' '+minToLabel(pattern[d].start)+'–'+minToLabel(pattern[d].end); }).join(', ') : 'None on file';
+    const shifts=instructorRosteredShifts(instr.id).filter(function(a){ return !a.upcoming; });
+    const shiftSummary = shifts.length
+      ? shifts.sort(function(a,b){ return WEEKDAY_KEYS.indexOf(a.day)-WEEKDAY_KEYS.indexOf(b.day) || a.start-b.start; })
+          .map(function(a){ return a.day+' '+minToLabel(a.start)+'–'+minToLabel(a.end)+' ('+findPod(a.podId).name+')'; }).join(', ')
+      : 'Not rostered';
     const inactive = instr.active===false;
     const loginCell = !supabaseClient? '<span class="small muted">—</span>'
       : instr.authUserId==='pending'? '<span class="badge soon">Invited</span>'
       : instr.authUserId? '<span class="badge available">Active</span>'
       : '<button class="btn sm ghost" onclick="inviteLogin(\''+instr.email+'\',\'instructor\',\''+instr.id+'\',\''+instr.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
-    html+='<tr'+(inactive?' style="opacity:.55"':'')+'><td>'+instr.name+(inactive?' <span class="small muted">(inactive)</span>':'')+'</td><td class="small">'+instr.email+'</td><td>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</td><td class="small">'+summary+'</td>'
+    html+='<tr'+(inactive?' style="opacity:.55"':'')+'><td>'+instr.name+(inactive?' <span class="small muted">(inactive)</span>':'')+'</td><td class="small">'+instr.email+'</td><td>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</td><td class="small">'+availSummary+'</td><td class="small">'+shiftSummary+'</td>'
       +'<td>'+loginCell+'</td>'
-      +'<td><button class="btn sm ghost" onclick="openEditInstructorForm(\''+instr.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openStaffAvailManager(\''+instr.id+'\')">Adjust hours</button> '
+      +'<td><button class="btn sm ghost" onclick="openEditInstructorForm(\''+instr.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openStaffAvailManager(\''+instr.id+'\')">Adjust availability</button> '
       +(inactive
         ? '<button class="btn sm ghost" onclick="reactivateInstructor(\''+instr.id+'\')">Reactivate</button>'
         : '<button class="btn sm ghost" onclick="deactivateInstructor(\''+instr.id+'\')">Deactivate</button>')
