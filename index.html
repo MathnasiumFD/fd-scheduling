@@ -2550,8 +2550,20 @@ function checkedInTodayStillPresent(){
 // since "in case we signed them out late accidentally" is exactly the case where the estimate
 // isn't what actually happened. sessionId is optional — omit it to default to whoever's been
 // waiting longest (soonest exit time first), or pass one to preselect a specific student.
+// Scopes "who can be checked out right now" to the current viewer — front desk sees and can act on
+// everyone checked in centre-wide, but an instructor only ever sees (and can check out) students
+// currently checked in at their own Pod(s) or their own Online group today (Sept 2026, per Allie:
+// "can we do it so the instructors can check out the kids on their pod as well as front staff").
+// Mirrors the exact same identity lookup renderInstructor() itself already uses.
+function checkedInPresentForCurrentViewer(){
+  if(state.role==='instructor'){
+    const instrId = supabaseClient? (currentUser && currentUser.instructorId) : state.instructorLoggedIn;
+    return instrId? checkedInAtInstructorPodToday(instrId) : [];
+  }
+  return checkedInTodayStillPresent();
+}
 function openCheckOut(sessionId){
-  const present=checkedInTodayStillPresent();
+  const present=checkedInPresentForCurrentViewer();
   if(present.length===0) return;
   const sess=sessionId? findSession(sessionId) : present.slice().sort(function(a,b){ return a.actualEnd-b.actualEnd; })[0];
   state.checkOut={sessionId:sess.id, exitTime:nearestOption(EXIT_TIME_OPTIONS, nowMinutesOfDay())};
@@ -4450,7 +4462,7 @@ function renderCheckOutModal(){
   const sess=findSession(f.sessionId);
   if(!sess) return '';
   const student=findStudent(sess.studentId);
-  const present=checkedInTodayStillPresent().slice().sort(function(a,b){
+  const present=checkedInPresentForCurrentViewer().slice().sort(function(a,b){
     return findStudent(a.studentId).name.localeCompare(findStudent(b.studentId).name, undefined, {sensitivity:'base'});
   });
 
@@ -5417,12 +5429,16 @@ function instructorPodIdsToday(instructorId){
 }
 // Includes both flavours of "checked in with me today": physically seated at one of my Pods, and
 // checked in to my own Online group — an instructor is on the hook for both at once, so both show
-// up together on their one "My Pod today" panel.
+// up together on their one "My Pod today" panel. Excludes anyone already checked out (Sept 2026,
+// once instructors could check students out themselves, this list had to drop them immediately —
+// same live-vs-historical rule checkedInTodayStillPresent()/checkedInNamesByPod() already use —
+// otherwise a checked-out student would sit on the instructor's own roster, offering a Check out
+// button, for the rest of the day).
 function checkedInAtInstructorPodToday(instructorId){
   const todayKey=toKey(simNow());
   const myPodIds=instructorPodIdsToday(instructorId);
   return sessions.filter(function(s){
-    if(s.status!=='attended' || toKey(s.date)!==todayKey) return false;
+    if(s.status!=='attended' || toKey(s.date)!==todayKey || s.checkedOut) return false;
     if(s.online) return s.instructorId===instructorId;
     return myPodIds.indexOf(s.podId)>-1;
   }).sort(function(a,b){ return a.start-b.start; });
@@ -5614,12 +5630,18 @@ function renderInstructor(){
         const timeLabel=(s.actualStart!=null && s.actualEnd!=null)? minToLabel(s.actualStart)+'–'+minToLabel(s.actualEnd) : rangeLabel(s.start,s.duration);
         return '<tr><td>'+student.name+' <span class="small muted">'+yearLabel(student.year)+'</span></td><td>'+locLabel+'</td><td>'+timeLabel+'</td>'
           +'<td><span class="badge '+cd.cls+'">'+cd.label+'</span></td>'
-          +'<td><button class="btn sm ghost" onclick="openMoveForm(\''+s.id+'\')">Move pod</button></td></tr>';
+          +'<td><button class="btn sm" onclick="openCheckOut(\''+s.id+'\')">Check out</button> '
+          +'<button class="btn sm ghost" onclick="openMoveForm(\''+s.id+'\')">Move pod</button></td></tr>';
       }).join('')
       +'</table>';
   }
   html+='</div>';
   html+=renderMoveModal();
+  // Instructors can now check out their own students directly (Sept 2026, per Allie: "can we do it
+  // so the instructors can check out the kids on their pod as well as front staff") — same modal
+  // front desk uses, but scoped to just this instructor's own checked-in students (see
+  // checkedInPresentForCurrentViewer()), not the whole centre.
+  html+=renderCheckOutModal();
 
   html+=renderAvailabilityManager(instr, 'My availability');
   html+=renderAvailRuleModal();
