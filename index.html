@@ -760,9 +760,6 @@ var state={
   collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true},
 };
 
-// how late (minutes) a student can arrive before the session's end time stops moving with them —
-// beyond this, the end time is computed as if they'd arrived exactly this late.
-var LATE_GRACE_MIN=15;
 // how many days before a make-up credit expires the parent gets advance notice — the "expiring
 // soon" badge/banner, and the automated reminder email in the real product, both key off this.
 var CREDIT_EXPIRY_NOTICE_DAYS=28;
@@ -781,11 +778,17 @@ var MANAGER_EMAIL='manager@mathnasium-demo.example';
 // exactly mirroring how the exit-time picker (openCheckOut(), below) already worked. Kept as its
 // own name for readability even though the values are identical to EXIT_TIME_OPTIONS.
 var CHECKIN_TIME_OPTIONS=EXIT_TIME_OPTIONS;
-// The exit time at check-in pre-fills automatically — arrival time plus the session's usual
-// length, capped at the 15-min-late rule. Staff can still override it, in 5-min steps.
+// The exit time at check-in pre-fills automatically — arrival time plus the session's usual length,
+// however late (or early) that arrival was. Staff can still override it, in 5-min steps.
+//
+// Used to cap this at 15 minutes late (LATE_GRACE_MIN) — arriving later than that computed an end
+// time as if they'd only been 15 minutes late, not their actual arrival time. Removed Sept 2026, per
+// Allie: "we need to get rid of the hard rule for signing out — the 15 min later thing isn't
+// working, especially when there's accidents etc." — a genuinely late arrival (traffic, a mix-up, an
+// actual accident on the way in) still deserves their full session length from whenever they actually
+// showed up, not a default quietly shortened by however far past 15 minutes they were running.
 function autoExitTime(sess, offset){
-  const cappedOffset = offset>LATE_GRACE_MIN? LATE_GRACE_MIN : offset;
-  return sess.start+cappedOffset+sess.duration;
+  return sess.start+offset+sess.duration;
 }
 
 // Picks whichever value in a preset list (e.g. CHECKIN_TIME_OPTIONS, EXIT_TIME_OPTIONS) sits closest
@@ -2410,13 +2413,11 @@ function confirmCheckIn(){
   // now" (only possible for a session dated today; checkInMaxArrival() never restricts a past date).
   state.checkIn.arrival=nearestOption(checkInArrivalOptions(sess), state.checkIn.arrival);
   const autoEnd=autoExitTime(sess, state.checkIn.arrival-sess.start);
-  const offset=applyCheckIn(sess, state.checkIn.arrival, state.checkIn.exitTime);
+  applyCheckIn(sess, state.checkIn.arrival, state.checkIn.exitTime);
   const adjusted = sess.actualEnd!==autoEnd;
   state.checkIn=null;
   if(adjusted){
     toast(findStudent(sess.studentId).name+' checked in — exit time set to '+minToLabel(sess.actualEnd)+' (usually would\'ve been '+minToLabel(autoEnd)+').');
-  } else if(offset>LATE_GRACE_MIN){
-    toast(findStudent(sess.studentId).name+' checked in at '+minToLabel(sess.actualStart)+' — session still ends at '+minToLabel(sess.actualEnd)+' (15-min grace applied).');
   } else {
     toast(findStudent(sess.studentId).name+' checked in — running '+minToLabel(sess.actualStart)+'–'+minToLabel(sess.actualEnd)+'.');
   }
@@ -3809,7 +3810,7 @@ function instructorOccupantCount(instructorId, dayKey){
 function sessionRowHtml(sess, weekday, dayKey, now){
   const student=findStudent(sess.studentId);
   if(!student) return '';
-  const actualNote = sess.actualStart!=null? ' · checked in '+minToLabel(sess.actualStart)+', ran to '+minToLabel(sess.actualEnd)+(sess.checkInOffset>LATE_GRACE_MIN? ' (capped)':'') : '';
+  const actualNote = sess.actualStart!=null? ' · checked in '+minToLabel(sess.actualStart)+', ran to '+minToLabel(sess.actualEnd) : '';
   let handoffNote='';
   if(sess.instructorId2){
     handoffNote = ' · '+findInstructor(sess.instructorId).name+' until '+minToLabel(sess.handoff)+', then '+findInstructor(sess.instructorId2).name;
@@ -4232,7 +4233,7 @@ function renderCheckedInPanel(){
   const todays=checkedInTodayStillPresent().slice().sort(function(a,b){ return a.actualEnd-b.actualEnd; });
   let html=sectionOpen('checkedin','Checked in today',
     '<span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+'</span>');
-  html+='<p>Exit time defaults to check-in time plus their usual session length (90 min for most, per each student\'s plan), capped at 15 minutes late per the check-in rule. Both the checked-in time and exit time can be corrected here if needed — say a parent\'s pick-up plan changes, or the arrival time recorded at check-in was wrong. "Time left" counts down live against the actual clock, so it stays accurate even if you don\'t touch this page. Once a student actually leaves, use their own "Check out" button — it drops them off this list, defaulting to whichever preset time is closest to right now (adjust it if they were signed out earlier or later than that).</p>';
+  html+='<p>Exit time defaults to check-in time plus their usual session length (90 min for most, per each student\'s plan) — however late (or early) that check-in was. Both the checked-in time and exit time can be corrected here if needed — say a parent\'s pick-up plan changes, or the arrival time recorded at check-in was wrong. "Time left" counts down live against the actual clock, so it stays accurate even if you don\'t touch this page. Once a student actually leaves, use their own "Check out" button — it drops them off this list, defaulting to whichever preset time is closest to right now (adjust it if they were signed out earlier or later than that).</p>';
   if(todays.length===0){ html+='<div class="empty-note">Nobody checked in yet today.</div>'; }
   else{
     html+='<table><tr><th>Student</th><th>Pod</th><th>Checked in</th><th>Exit time</th><th>Time left</th><th></th></tr>';
@@ -4431,7 +4432,7 @@ function renderCheckInModal(){
 
   let html='<div class="overlay" onclick="if(event.target===this) closeCheckIn()"><div class="modal">';
   html+='<h3>Check in '+student.name+'</h3>';
-  html+='<p>Scheduled '+rangeLabel(sess.start,sess.duration)+'. Record when they actually arrived — the exit time below fills in automatically from that (capped at '+LATE_GRACE_MIN+' minutes late), but you can adjust it in 5-minute steps if needed.</p>';
+  html+='<p>Scheduled '+rangeLabel(sess.start,sess.duration)+'. Record when they actually arrived — the exit time below fills in automatically from that, however late (or early) it was, but you can adjust it in 5-minute steps if needed.</p>';
   html+='<label>Pod</label><select onchange="setSessionLocation(\''+sess.id+'\',this.value)"><option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
     +locationOptionsHtml(weekday, dateKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
   +'</select>';
@@ -4443,8 +4444,6 @@ function renderCheckInModal(){
     +'</select>';
   if(adjusted){
     html+='<div class="banner accent">Exit time adjusted — auto-filled would\'ve been '+minToLabel(autoEnd)+'.</div>';
-  } else if(offset>LATE_GRACE_MIN){
-    html+='<div class="banner warn">⏰ Exit time capped at '+LATE_GRACE_MIN+' minutes late, not their full '+sess.duration+' minutes.</div>';
   } else {
     html+='<div class="banner info">Session will run '+minToLabel(arrival)+'–'+minToLabel(exitTime)+'.</div>';
   }
@@ -5357,7 +5356,7 @@ function renderAttendanceLogModal(){
       }[s.status] || s.status;
       let detail='';
       if(s.status==='attended' && s.actualStart!=null){
-        detail='Checked in '+minToLabel(s.actualStart)+', ran to '+minToLabel(s.actualEnd)+(s.checkInOffset>LATE_GRACE_MIN? ' (capped)':'');
+        detail='Checked in '+minToLabel(s.actualStart)+', ran to '+minToLabel(s.actualEnd);
       }
       detail += (detail?' · ':'') + (s.bookedBy==='parent'? '👪 booked by parent' : s.recurring? 'regular schedule' : 'booked by staff');
       html+='<tr><td>'+fmtShort(s.date)+'</td><td>'+rangeLabel(s.start,s.duration)+'</td><td>'+(s.online?'Online':(pod?pod.name:'—'))+'</td><td class="small">'+instrLabel+'</td><td>'+statusBadge+'</td><td class="small muted">'+detail+'</td></tr>';
