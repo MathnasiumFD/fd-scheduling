@@ -761,7 +761,10 @@ var state={
   // default so the page opens on the actual schedule instead of a wall of admin tables. Still just
   // a plain key in this same collapsedSections map, so clicking any of these open (or the ones
   // above closed) works exactly the same via toggleSection().
-  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, checkedin:true, podSeating:true},
+  // Checked-in-today starts UNCOLLAPSED (Sept 2026, per Allie: "checked in today uncollapsed by
+  // default") — it now also carries the "Who's here right now" board at its top, so front desk
+  // wants it open on page load rather than needing an extra click to see who's actually present.
+  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, podSeating:true},
   // Quick check-in/out student search (Sept 2026, per Allie: a search bar that suggests the closest
   // matched student name so front desk doesn't have to hunt through the Schedule list) — just the
   // live query text; matching happens fresh on every render from `sessions`/`students`, nothing else
