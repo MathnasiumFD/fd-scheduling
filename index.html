@@ -1957,7 +1957,11 @@ function closeBooking(){ state.booking=null; render(); }
 // Sept 2026) whenever the student, start time, or duration changes — mirrors the "pre-filled,
 // editable" default used for check-in/check-out times. Never runs once a location has been chosen
 // manually — either via setBookingLocation() below, or by opening the form with an explicit Pod
-// already in mind (locationManual, set in openBooking()).
+// already in mind (locationManual, set in openBooking()). Passes the student's own standing Pod pin
+// (their Preferred Pod from enrollment, or any later "Change Pod" — studentAssignedPodOn() resolves
+// either) as pickBestPod's preferredPodId, so a fresh manual booking defaults to it too — this used
+// to only happen for check-in's own auto-suggest and standing pre-booking, leaving a plain manual
+// booking to ignore the pin entirely (5.30 fix).
 function suggestBookingPod(){
   const f=state.bookingForm;
   if(f.locationManual) return;
@@ -1965,7 +1969,7 @@ function suggestBookingPod(){
   const student=findStudent(f.studentId);
   const date=new Date(state.booking.dateKey);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
-  f.location = pickBestPod(weekday, state.booking.dateKey, f.start, f.duration, student.year) || '';
+  f.location = pickBestPod(weekday, state.booking.dateKey, f.start, f.duration, student.year, studentAssignedPodOn(student.id, date)) || '';
 }
 
 function setBookingStudent(sid){
@@ -2942,7 +2946,7 @@ function defaultRecurring(count, duration){
 
 function openNewStudentForm(){
   const dur=90, spw=2;
-  state.newStudentForm={ parentMode:'existing', parentId: parents[0]? parents[0].id : '', parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), matchedInactiveId:null, confirmNewAnyway:false, error:'' };
+  state.newStudentForm={ parentMode:'existing', parentId: parents[0]? parents[0].id : '', parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), preferredPodId:'', matchedInactiveId:null, confirmNewAnyway:false, error:'' };
   render();
 }
 function closeNewStudentForm(){ state.newStudentForm=null; render(); }
@@ -3015,6 +3019,19 @@ function saveNewStudent(){
     parentId=newParent.id;
   }
   const newStudent={id:newId()||('s'+(nextStudentId++)), name:f.studentName.trim(), year:Number(f.year), baseYear:Number(f.year), yearBaseline:schoolYearIndex(simNow()), duration:Number(f.duration), sessionsPerWeek:Number(f.sessionsPerWeek), parentId, recurring:f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; }), holds:[]};
+  // A Preferred Pod chosen at enrollment (5.30, per Allie) isn't a separate field/column — it's just
+  // the student's very first standing Pod pin, written the same way "Change Pod" (openStudentPodForm/
+  // saveStudentPodAssignment) writes any other one, effective from day one. That means
+  // studentAssignedPodOn() picks it up automatically everywhere a pin already mattered (recurring
+  // pre-booking below, check-in's auto-suggest for an unassigned session, and the booking modal's own
+  // suggestBookingPod()) with no extra plumbing, and a later "Change Pod" naturally supersedes it —
+  // it'll always have a later effectiveFrom, and studentAssignedPodOn() already resolves ties that
+  // way. No fallback if the preferred Pod turns out to be unstaffed or full for a given slot (same
+  // "front desk's own explicit call" rule pickBestPod applies to every pin) — that occurrence is
+  // simply left unassigned, visible in the Schedule tab like any other coverage gap.
+  if(f.preferredPodId){
+    newStudent.podAssignments=[{podId:f.preferredPodId, effectiveFrom:new Date(toKey(simNow())), weekday:null}];
+  }
   students.push(newStudent);
   dbWrite('enrolling a new student', function(){ return supabaseClient.from('students').insert({
     id:newStudent.id, parent_id:newStudent.parentId, name:newStudent.name, year:newStudent.year, base_year:newStudent.baseYear,
@@ -3022,6 +3039,11 @@ function saveNewStudent(){
   }).then(function(r){
     if(r.error || !newStudent.recurring.length) return r;
     return supabaseClient.from('student_recurring_slots').insert(newStudent.recurring.map(function(rec){ return {student_id:newStudent.id, weekday:rec.weekday, start_min:rec.start}; }));
+  }).then(function(r){
+    if(r.error || !newStudent.podAssignments || !newStudent.podAssignments.length) return r;
+    return supabaseClient.from('student_pod_assignments').insert(newStudent.podAssignments.map(function(a){
+      return {student_id:newStudent.id, pod_id:a.podId, effective_from:toKey(a.effectiveFrom), weekday:a.weekday};
+    }));
   }); });
   const parent=parents.find(function(p){ return p.id===parentId; });
   parent.studentIds.push(newStudent.id);
@@ -3029,6 +3051,13 @@ function saveNewStudent(){
   const uncovered=slotsWithoutCoverage(newStudent.recurring, newStudent.duration, newStudent.year);
   if(uncovered.length){
     toast(newStudent.name+' enrolled, but no Pod '+newStudent.name+' qualifies for (by age) is currently staffed for '+describeUncoveredSlots(uncovered)+' — 0 session(s) could be pre-booked for that time yet. Assign coverage on the Schedule tab, then reopen '+newStudent.name+'\'s regular schedule and save it again.', 9000);
+  } else if(f.preferredPodId && made===0){
+    // Some Pod generically covers every chosen slot (uncovered came back empty) — so the reason
+    // nothing got pre-booked is specifically that the Preferred Pod picked above doesn't have room
+    // (or coverage) at these times, and a pin never falls back to a different Pod on its own (same
+    // rule as "Change Pod" — see the comment above where podAssignments gets set). Worth calling
+    // out by name here, since "0 pre-booked" alone would otherwise look like a plain coverage gap.
+    toast(newStudent.name+' enrolled, but their Preferred Pod ('+findPod(f.preferredPodId).name+') doesn\'t have room (or coverage) at '+describeUncoveredSlots(newStudent.recurring)+' — 0 session(s) pre-booked there. Pick a different Preferred Pod via "Change Pod", or leave it on auto-assign.', 9000);
   } else {
     toast(newStudent.name+' enrolled — '+f.sessionsPerWeek+'x/week, '+f.duration+' min, with '+parent.name+'. '+made+' standing session(s) pre-booked.');
   }
@@ -4312,7 +4341,7 @@ function saveNewParent(){
   // its own isn't useful for anything else in the app, so there's no reason to make this a
   // separate trip back to the Students panel and having to find them in the dropdown.
   const dur=90, spw=2;
-  state.newStudentForm={ parentMode:'existing', parentId:newParent.id, parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), matchedInactiveId:null, confirmNewAnyway:false, error:'' };
+  state.newStudentForm={ parentMode:'existing', parentId:newParent.id, parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), preferredPodId:'', matchedInactiveId:null, confirmNewAnyway:false, error:'' };
   toast(newParent.name+' added — now add their first child below.');
   state.newParentForm=null;
   render();
@@ -4536,6 +4565,10 @@ function renderNewStudentModal(){
     +'</select></div></div>';
   html+='<label>Regular schedule</label>';
   html+=renderRecurringPickers(f.recurring, starts, 'setNSFRecurring');
+  html+='<label>Preferred Pod</label><select onchange="setNSF(\'preferredPodId\', this.value)"><option value=""'+(f.preferredPodId===''?' selected':'')+'>No preference (auto-assign)</option>'
+    +pods.map(function(p){ return '<option value="'+p.id+'"'+(p.id===f.preferredPodId?' selected':'')+'>'+p.name+'</option>'; }).join('')
+    +'</select>';
+  html+='<p class="small muted" style="margin-top:-6px">Becomes '+f.studentName.trim()+'\'s default Pod for every regular session, as long as it has room — front desk can still move '+(f.studentName.trim()||'them')+' to a different Pod any time from the Students list ("Change Pod").</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeNewStudentForm()">Cancel</button>'
