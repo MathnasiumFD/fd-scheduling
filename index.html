@@ -6018,7 +6018,17 @@ function subscribeToLiveUpdates(){
   LIVE_SYNC_TABLES.forEach(function(t){
     channel=channel.on('postgres_changes', {event:'*', schema:'public', table:t}, scheduleLiveSync);
   });
-  channel.subscribe();
+  // Logged rather than silent — Realtime depends on several things lining up (the table actually
+  // being in the supabase_realtime publication, the project's Realtime feature, the connecting
+  // user's own permissions) that can fail in ways invisible from the UI itself. If SUBSCRIBED never
+  // shows up in the console, the 30-second heartbeat below is still catching every change anyway —
+  // this is a "faster when it works" layer, not the only thing keeping tabs in sync.
+  channel.subscribe(function(status, err){
+    if(status==='SUBSCRIBED'){ console.log('Live sync connected — changes from other logins arrive within about a second.'); }
+    else if(status==='CHANNEL_ERROR' || status==='TIMED_OUT' || status==='CLOSED'){
+      console.error('Live sync could not connect ('+status+') — still syncing every 30 seconds via the fallback refresh.', err||'');
+    }
+  });
 }
 
 function afterLogin(){
@@ -6035,12 +6045,22 @@ function afterLogin(){
         regenerateAllRecurring();
         render();
         // Live mode has no demo-clock button to trigger applyPromotions()/applyPlanChanges() as
-        // days actually pass — real time just ticks forward on its own. Re-checking both on the
-        // same 30s heartbeat that already drives the checked-in "time left" countdown (see the
-        // offline-mode comment below) means a scheduled promotion or plan change takes effect
-        // within 30 seconds of its date arriving, not only the next time someone happens to
-        // re-open the page.
-        setInterval(function(){ applyPromotions(); applyPlanChanges(); render(); }, 30000);
+        // days actually pass — real time just ticks forward on its own. Re-checking both on this
+        // heartbeat (already needed for the checked-in "time left" countdown, see the offline-mode
+        // comment below) means a scheduled promotion or plan change takes effect within 30 seconds
+        // of its date arriving, not only the next time someone happens to re-open the page.
+        //
+        // This heartbeat also re-runs loadAllData() itself now (5.36, live sync) — a guaranteed,
+        // always-works fallback for seeing another login's changes even if the faster Realtime push
+        // subscription below never actually connects (it depends on several things — the table
+        // being in the right Supabase publication, project settings, permissions — that can silently
+        // fail in ways invisible from here). Worst case with Realtime working, staff see each
+        // other's changes within about a second; worst case without it, within 30 seconds; either
+        // way, never "not until someone reloads the page" again.
+        setInterval(function(){
+          loadAllData().then(function(){ applyPromotions(); applyPlanChanges(); render(); })
+            .catch(function(err){ console.error('Heartbeat refresh failed', err); });
+        }, 30000);
         subscribeToLiveUpdates();
       }).catch(function(err){
         console.error(err);
