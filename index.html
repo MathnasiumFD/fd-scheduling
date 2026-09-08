@@ -1752,7 +1752,11 @@ function describeUpcomingChange(change){
 // over an every-day pin (a.weekday null/unset) covering the same date, regardless of which was set
 // more recently — it's the more specific instruction. Within the same specificity, whichever has
 // the latest effectiveFrom on or before this date wins, same as before.
-function studentAssignedPodOn(studentId, date){
+// The single standing pin currently in effect for this student on this date, whatever kind it is
+// (a Pod, an Online instructor, or none at all — auto-assign) — shared by studentAssignedPodOn()
+// and studentAssignedOnlineInstructorOn() below so both always agree on which entry is "latest",
+// rather than risking two separately-written resolution passes drifting apart.
+function latestStudentPodAssignment(studentId, date){
   const student=findStudent(studentId);
   const dateKey=toKey(date);
   const weekday=WEEKDAY_KEYS[(new Date(date).getDay()+6)%7];
@@ -1763,7 +1767,20 @@ function studentAssignedPodOn(studentId, date){
   const daySpecific=applicable.filter(function(a){ return !!a.weekday; });
   const pool = daySpecific.length? daySpecific : applicable;
   pool.sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); });
-  return pool[pool.length-1].podId;
+  return pool[pool.length-1];
+}
+function studentAssignedPodOn(studentId, date){
+  const a=latestStudentPodAssignment(studentId, date);
+  return a? a.podId : null;
+}
+// Online counterpart of studentAssignedPodOn() — null unless the currently-effective pin is
+// specifically an Online one (5.32, per Allie: "moving forward how do i set them their assigned
+// pod" / "i dont see the option to schedule them online" — the standing pin needed to support
+// Online, not just physical Pods). Mutually exclusive with studentAssignedPodOn() by construction:
+// whichever pin is latest, only one of the two ever comes back non-null for it.
+function studentAssignedOnlineInstructorOn(studentId, date){
+  const a=latestStudentPodAssignment(studentId, date);
+  return a && a.online? a.instructorId : null;
 }
 function currentOrUpcomingPodAssignments(studentId){
   const student=findStudent(studentId);
@@ -1772,7 +1789,10 @@ function currentOrUpcomingPodAssignments(studentId){
 
 /* ---------- standing Pod pin (moving forward) ---------- */
 function openStudentPodForm(studentId){
-  state.studentPodForm={studentId, podId:'', effectiveFrom:toKey(simNow()), weekday:'', error:''};
+  // `location` uses the same encoded convention as every other Pod/Online picker in the app (see
+  // sessionLocationValue): '' = auto-assign, a Pod's own id = that Pod, 'online:<instructorId>' =
+  // that instructor's Online group.
+  state.studentPodForm={studentId, location:'', effectiveFrom:toKey(simNow()), weekday:'', error:''};
   render();
 }
 function closeStudentPodForm(){ state.studentPodForm=null; render(); }
@@ -1786,18 +1806,21 @@ function saveStudentPodAssignment(){
   if(!f.effectiveFrom){ f.error='Choose an effective date.'; render(); return; }
   const weekday=f.weekday||null; // '' (or unset) means "every day"
   const student=findStudent(f.studentId);
+  const isOnline=String(f.location).indexOf('online:')===0;
+  const podId=isOnline? null : (f.location||null);
+  const instructorId=isOnline? f.location.slice(7) : null;
   // Identity for "replacing" a prior pin is now (effectiveFrom, weekday) together, not just
   // effectiveFrom alone — a Monday pin and a Tuesday pin sharing the same effective date are two
   // separate, coexisting entries, not a conflict.
   student.podAssignments=(student.podAssignments||[]).filter(function(a){
     return !(toKey(a.effectiveFrom)===f.effectiveFrom && (a.weekday||null)===weekday);
   });
-  student.podAssignments.push({podId: f.podId || null, effectiveFrom:new Date(f.effectiveFrom), weekday:weekday});
+  student.podAssignments.push({podId:podId, online:isOnline, instructorId:instructorId, effectiveFrom:new Date(f.effectiveFrom), weekday:weekday});
   dbWrite('pinning standing Pod', function(){
     let q=supabaseClient.from('student_pod_assignments').delete().eq('student_id', student.id).eq('effective_from', f.effectiveFrom);
     q = weekday? q.eq('weekday', weekday) : q.is('weekday', null);
     return q.then(function(){
-      return supabaseClient.from('student_pod_assignments').insert({student_id:student.id, pod_id:f.podId||null, effective_from:f.effectiveFrom, weekday:weekday});
+      return supabaseClient.from('student_pod_assignments').insert({student_id:student.id, pod_id:podId, online:isOnline, instructor_id:instructorId, effective_from:f.effectiveFrom, weekday:weekday});
     });
   });
 
@@ -1824,7 +1847,7 @@ function saveStudentPodAssignment(){
     }
   });
   regenerateAllRecurring();
-  const podName=f.podId? findPod(f.podId).name : 'auto-assign';
+  const podName = isOnline? ('Online — '+findInstructor(instructorId).name) : (podId? findPod(podId).name : 'auto-assign');
   const dayLabel=weekday? ' on '+weekday+'s' : '';
   toast(student.name+' moves to '+podName+dayLabel+' from '+fmtShort(new Date(f.effectiveFrom))+(movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match' : '')+'.');
   state.studentPodForm=null;
@@ -1845,6 +1868,23 @@ function removeStudentPodAssignment(studentId, effectiveFromKey, weekday){
   render();
 }
 
+// Resolves where one standing occurrence should land: an Online pin (if one applies and is
+// currently feasible — the instructor is on shift and under the combined ratio at this exact
+// day/time), else a Pod pin or auto-assign via pickBestPod (existing behavior, unchanged). An
+// Online pin that's infeasible right now leaves the occurrence unassigned rather than silently
+// falling back to a physical Pod — the same "pinned, no fallback" rule pickBestPod's own
+// preferredPodId already follows (5.8/5.32).
+function resolveStandingLocation(studentId, weekday, dateKey, date, start, duration, year){
+  const onlineInstructorId=studentAssignedOnlineInstructorOn(studentId, date);
+  if(onlineInstructorId){
+    const onShift=instructorsOnShift(weekday, start, duration, date).some(function(i){ return i.id===onlineInstructorId; });
+    const blocked=!onShift || instructorOnlineBlocked(onlineInstructorId, dateKey, start, duration, null);
+    return blocked? {podId:null, online:false, instructorId:null} : {podId:null, online:true, instructorId:onlineInstructorId};
+  }
+  const pinnedPodId=studentAssignedPodOn(studentId, date); // front desk's standing Pod pin, if any (else auto-assign)
+  const podId=pickBestPod(weekday, dateKey, start, duration, year, pinnedPodId);
+  return {podId:podId||null, online:false, instructorId:null};
+}
 function generateRecurringSessions(student, weeksAhead){
   const startMonday=getMonday(simNow());
   let created=0;
@@ -1867,33 +1907,39 @@ function generateRecurringSessions(student, weeksAhead){
         // Pod freeing up — so it's the natural place for an unassigned session to self-heal the
         // moment something actually opens up, rather than sitting unassigned until someone happens
         // to notice and fix it by hand.
-        if(dup.podId==null){
-          const pinnedPodId=studentAssignedPodOn(student.id, date);
-          const podId=pickBestPod(weekday, dateKey, slot.start, student.duration, student.year, pinnedPodId);
-          if(podId){
-            const cov=podCoverageDetail(podId, weekday, slot.start, student.duration, date);
-            dup.podId=podId; dup.instructorId=cov.primaryInstructorId; dup.instructorId2=cov.secondaryInstructorId; dup.handoff=cov.handoffAt;
-            dbWrite('filling a previously-unassigned standing session', function(){ return supabaseClient.from('sessions').update({
-              pod_id:dup.podId, instructor_id:dup.instructorId, instructor_id_2:dup.instructorId2, handoff_min:dup.handoff
-            }).eq('id', dup.id); });
+        if(dup.podId==null && !dup.online){
+          const loc=resolveStandingLocation(student.id, weekday, dateKey, date, slot.start, student.duration, student.year);
+          if(loc.podId || loc.online){
+            if(loc.online){
+              dup.podId=null; dup.online=true; dup.instructorId=loc.instructorId; dup.instructorId2=null; dup.handoff=null;
+              dbWrite('filling a previously-unassigned standing session (Online)', function(){ return supabaseClient.from('sessions').update({
+                pod_id:null, online:true, instructor_id:dup.instructorId, instructor_id_2:null, handoff_min:null
+              }).eq('id', dup.id); });
+            } else {
+              const cov=podCoverageDetail(loc.podId, weekday, slot.start, student.duration, date);
+              dup.podId=loc.podId; dup.instructorId=cov.primaryInstructorId; dup.instructorId2=cov.secondaryInstructorId; dup.handoff=cov.handoffAt;
+              dbWrite('filling a previously-unassigned standing session', function(){ return supabaseClient.from('sessions').update({
+                pod_id:dup.podId, instructor_id:dup.instructorId, instructor_id_2:dup.instructorId2, handoff_min:dup.handoff
+              }).eq('id', dup.id); });
+            }
             created++;
           }
         }
         return;
       }
       if(studentOverlapClash(student.id, dateKey, slot.start, student.duration, null)) return;
-      const pinnedPodId=studentAssignedPodOn(student.id, date); // front desk's standing Pod pin, if any (else auto-assign)
-      const podId=pickBestPod(weekday, dateKey, slot.start, student.duration, student.year, pinnedPodId);
-      // No eligible Pod is staffed/available for this exact day+time. This USED to mean the
-      // occurrence was simply never created — a student's regular class could silently vanish for
-      // a day with nothing anywhere to show it. Instead, still create the session, just with no
-      // Pod/instructor — visible on the Schedule tab's "Unassigned" section so front desk can see
-      // and fix it directly (assign a Pod once one opens up), rather than it disappearing unnoticed.
-      const cov=podId? podCoverageDetail(podId, weekday, slot.start, student.duration, date) : {primaryInstructorId:null, secondaryInstructorId:null, handoffAt:null}; // tolerant of a short unattended gap (UNATTENDED_TOLERANCE_MIN), same as pickBestPod just validated
-      const recSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:podId||null, instructorId:cov.primaryInstructorId, instructorId2:cov.secondaryInstructorId, handoff:cov.handoffAt, date, start:slot.start, duration:student.duration, status:'scheduled', bookedBy:'staff', creditId:null, recurring:true};
+      const loc=resolveStandingLocation(student.id, weekday, dateKey, date, slot.start, student.duration, student.year);
+      // No eligible Pod/Online instructor is staffed/available for this exact day+time (or nothing
+      // was pinned and no Pod anywhere is staffed). This USED to mean the occurrence was simply
+      // never created — a student's regular class could silently vanish for a day with nothing
+      // anywhere to show it. Instead, still create the session, just with no Pod/instructor —
+      // visible on the Schedule tab's "Unassigned" section so front desk can see and fix it
+      // directly (assign a Pod once one opens up), rather than it disappearing unnoticed.
+      const cov=loc.podId? podCoverageDetail(loc.podId, weekday, slot.start, student.duration, date) : {primaryInstructorId: loc.online? loc.instructorId : null, secondaryInstructorId:null, handoffAt:null}; // tolerant of a short unattended gap (UNATTENDED_TOLERANCE_MIN), same as pickBestPod just validated
+      const recSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:loc.podId||null, online:!!loc.online, instructorId:cov.primaryInstructorId, instructorId2:cov.secondaryInstructorId, handoff:cov.handoffAt, date, start:slot.start, duration:student.duration, status:'scheduled', bookedBy:'staff', creditId:null, recurring:true};
       sessions.push(recSess);
       dbWrite('pre-booking a standing session', function(){ return supabaseClient.from('sessions').insert({
-        id:recSess.id, student_id:recSess.studentId, pod_id:recSess.podId, instructor_id:recSess.instructorId,
+        id:recSess.id, student_id:recSess.studentId, pod_id:recSess.podId, online:recSess.online, instructor_id:recSess.instructorId,
         instructor_id_2:recSess.instructorId2, handoff_min:recSess.handoff,
         the_date:toKey(recSess.date), start_min:recSess.start, duration:recSess.duration, status:recSess.status,
         booked_by:recSess.bookedBy, credit_id:recSess.creditId, is_recurring:true
@@ -1978,6 +2024,17 @@ function suggestBookingPod(){
   const student=findStudent(f.studentId);
   const date=new Date(state.booking.dateKey);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+  // An Online pin (see studentAssignedOnlineInstructorOn) is checked first — same "hard pin, no
+  // fallback" rule as a Pod pin: if it's pinned to Online but that instructor isn't actually
+  // available right now, this suggests nothing at all rather than falling back to hunting for a
+  // physical Pod instead (5.32).
+  const onlineInstructorId=studentAssignedOnlineInstructorOn(student.id, date);
+  if(onlineInstructorId){
+    const eligible=instructorsOnShift(weekday, f.start, f.duration, date).some(function(i){ return i.id===onlineInstructorId; })
+      && !instructorOnlineBlocked(onlineInstructorId, state.booking.dateKey, f.start, f.duration, null);
+    f.location = eligible? ('online:'+onlineInstructorId) : '';
+    return;
+  }
   f.location = pickBestPod(weekday, state.booking.dateKey, f.start, f.duration, student.year, studentAssignedPodOn(student.id, date)) || '';
 }
 
@@ -2097,20 +2154,28 @@ function confirmBooking(){
   render();
 }
 
+// A student who simply doesn't turn up is two very different situations to front desk (Sept 2026,
+// per Allie: "I need to differentiate... the student not coming and having notified us thus getting
+// a makeup credit, or the student just not showing up"). 'no-show' is the plain, un-notified case —
+// no make-up credit, since nothing was arranged in advance. 'excused' is a family who called/messaged
+// ahead of time to say they can't make it — treated exactly like any other advance-notice absence
+// (a parent's own self-cancel, a centre closure): a make-up credit is issued, same 90-day rule.
 function markStatus(sessionId, status){
   const sess=findSession(sessionId);
   sess.status=status;
   dbWrite('updating attendance', function(){ return supabaseClient.from('sessions').update({status}).eq('id', sess.id); });
-  if(status==='no-show'){
+  if(status==='excused'){
     const issued=sess.date;
     const expiry=addMonths(issued,3);
-    const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'no-show', note:''};
+    const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:''};
     credits.push(c);
     dbWrite('issuing a make-up credit', function(){ return supabaseClient.from('credits').insert({
       id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
       status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
     }); });
-    toast('Make-up credit issued to '+findStudent(sess.studentId).name+' — expires '+fmtShort(expiry)+'.');
+    toast(findStudent(sess.studentId).name+' marked excused (notified in advance) — a make-up credit was issued, expires '+fmtShort(expiry)+'.');
+  } else if(status==='no-show'){
+    toast(findStudent(sess.studentId).name+' marked as a no-show — no make-up credit issued, since nothing was arranged in advance.');
   } else {
     render();
   }
@@ -2237,16 +2302,25 @@ function openCheckIn(sessionId){
     return;
   }
   const arrival=nearestOption(checkInArrivalOptions(sess), nowMinutesOfDay());
-  // If the student walks in with no Pod chosen yet (booked as Unassigned, or auto-assignment never
-  // found one), suggest one right away via pickBestPod() — same "pre-filled, editable" pattern used
-  // everywhere else — so front desk isn't forced to check in first and go hunt them down in the
-  // Schedule list afterward just to pick a Pod. Silent (no toast) since nothing has been confirmed
-  // yet; the Pod field below is still freely editable before Confirm.
-  if(!sess.podId){
+  // If the student walks in with nowhere chosen yet (booked as Unassigned, or auto-assignment never
+  // found one), suggest somewhere right away — same "pre-filled, editable" pattern used everywhere
+  // else — so front desk isn't forced to check in first and go hunt them down in the Schedule list
+  // afterward just to pick a Pod. Silent (no toast) since nothing has been confirmed yet; the Pod
+  // field below is still freely editable before Confirm. Checks `!sess.online` too (not just
+  // `!sess.podId`) — an already-online session (booked or pinned that way) also has a null podId,
+  // and must NOT get silently reassigned onto a physical Pod here (5.32 fix).
+  if(!sess.podId && !sess.online){
     const student=findStudent(sess.studentId);
     const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
-    const suggested=pickBestPod(weekday, toKey(sess.date), sess.start, sess.duration, student.year, studentAssignedPodOn(student.id, sess.date));
-    if(suggested) movePodSession(sessionId, suggested);
+    const onlineInstructorId=studentAssignedOnlineInstructorOn(student.id, sess.date);
+    if(onlineInstructorId){
+      const eligible=instructorsOnShift(weekday, sess.start, sess.duration, sess.date).some(function(i){ return i.id===onlineInstructorId; })
+        && !instructorOnlineBlocked(onlineInstructorId, toKey(sess.date), sess.start, sess.duration, sess.id);
+      if(eligible) setSessionOnline(sessionId, onlineInstructorId);
+    } else {
+      const suggested=pickBestPod(weekday, toKey(sess.date), sess.start, sess.duration, student.year, studentAssignedPodOn(student.id, sess.date));
+      if(suggested) movePodSession(sessionId, suggested);
+    }
   }
   state.checkIn={sessionId, arrival, exitTime:autoExitTime(sess, arrival-sess.start)};
   render();
@@ -2295,6 +2369,30 @@ function confirmCheckIn(){
   } else {
     toast(findStudent(sess.studentId).name+' checked in — running '+minToLabel(sess.actualStart)+'–'+minToLabel(sess.actualEnd)+'.');
   }
+  render();
+}
+
+// Reverts an accidental check-in — front desk checked in the wrong student, or the right student
+// against the wrong session. Puts the session back to exactly 'scheduled' and clears every
+// check-in-specific field, so it's as if the check-in never happened: it drops back into the
+// "still to arrive" half of its Pod's roster (see rosterTableHtml), ready to be checked in again,
+// correctly, from scratch. Doesn't touch credits — check-in/out never consumes or issues one, so
+// there's nothing to reverse there. Works regardless of whether the session's already been checked
+// OUT too (undoing should still be possible if the mistake is only noticed after the fact).
+function undoCheckIn(sessionId){
+  const sess=findSession(sessionId);
+  if(!sess || sess.status!=='attended') return;
+  const student=findStudent(sess.studentId);
+  if(!confirm('Undo '+student.name+'\'s check-in?\n\nThis puts the session back to "scheduled", as if it never happened — use this if the wrong student was checked in by mistake.')) return;
+  sess.status='scheduled';
+  sess.actualStart=null;
+  sess.actualEnd=null;
+  sess.checkInOffset=null;
+  sess.checkedOut=false;
+  dbWrite('undoing a check-in', function(){ return supabaseClient.from('sessions').update({
+    status:'scheduled', actual_start_min:null, actual_end_min:null, check_in_offset:null, checked_out:false
+  }).eq('id', sess.id); });
+  toast(student.name+"'s check-in was undone.");
   render();
 }
 
@@ -3650,9 +3748,12 @@ function sessionRowHtml(sess, weekday, dayKey, now){
   let actions='';
   if(sess.status==='scheduled' && toKey(sess.date)<=toKey(now)){
     actions+='<button class="btn sm success" onclick="openCheckIn(\''+sess.id+'\')">✓ Check in</button>'
-      +'<button class="btn sm danger" onclick="markStatus(\''+sess.id+'\',\'no-show\')">No-show</button>';
+      +'<button class="btn sm ghost" onclick="markStatus(\''+sess.id+'\',\'excused\')" title="They let us know in advance — issues a make-up credit">Excused</button>'
+      +'<button class="btn sm danger" onclick="markStatus(\''+sess.id+'\',\'no-show\')" title="No word from them — no make-up credit">No-show</button>';
   } else if(sess.status==='scheduled'){
     actions+='<button class="btn sm ghost" onclick="markStatus(\''+sess.id+'\',\'cancelled\')">Cancel</button>';
+  } else if(sess.status==='attended'){
+    actions+='<button class="btn sm ghost" onclick="undoCheckIn(\''+sess.id+'\')">Undo check-in</button>';
   }
   html+='<td>'+actions+'</td></tr>';
   return html;
@@ -3995,7 +4096,8 @@ function renderCheckedInPanel(){
         +'</select>'
         +(adjusted? ' <span class="small muted">(usually '+minToLabel(defaultEnd)+')</span>' : '')
         +'</td><td><span class="badge '+cd.cls+'">'+cd.label+'</span></td>'
-        +'<td><button class="btn sm" onclick="openCheckOut(\''+s.id+'\')">Check out</button></td></tr>';
+        +'<td><button class="btn sm" onclick="openCheckOut(\''+s.id+'\')">Check out</button> '
+        +'<button class="btn sm ghost" onclick="undoCheckIn(\''+s.id+'\')">Undo check-in</button></td></tr>';
     });
     html+='</table>';
   }
@@ -4934,7 +5036,7 @@ function renderInactiveParentsPanel(){
 
 function renderCreditsReport(){
   let html=sectionOpen('credits','Make-up credits','<button class="btn sm primary" onclick="openAddCreditForm(\'\')">+ Add credit</button>');
-  html+='<p>Issued automatically on no-show, or added by hand — for a make-up owed from before this system (e.g. carried over from the old manual log), or any other credit front desk needs to grant directly. Both expire automatically 3 months after the date entered — no manual cleanup.</p>';
+  html+='<p>Issued automatically for an excused absence (notified in advance), a parent self-cancel, or a centre closure — never for a plain no-show, which gets no credit — or added by hand for a make-up owed from before this system (e.g. carried over from the old manual log), or any other credit front desk needs to grant directly. All expire automatically 3 months after the date entered — no manual cleanup.</p>';
   html+='<table><tr><th>Student</th><th>Issued (missed session)</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
   credits.slice().sort(function(a,b){ return a.expiryDate-b.expiryDate; }).forEach(function(c){
     const st=creditDisplayStatus(c);
@@ -4945,7 +5047,11 @@ function renderCreditsReport(){
       const sess=findSession(c.redeemedSessionId);
       if(sess) detail=fmtShort(sess.date)+' '+rangeLabel(sess.start,sess.duration)+' · '+(findPod(sess.podId)?findPod(sess.podId).name+' · ':'')+(sess.instructorId? findInstructor(sess.instructorId).name : '—');
     }
-    const sourceLabel = c.source==='manual'? 'Manual'+(c.note? ' <span class="small muted">— '+c.note+'</span>' : '') : 'No-show';
+    const sourceLabel = c.source==='manual'? 'Manual'+(c.note? ' <span class="small muted">— '+c.note+'</span>' : '')
+      : c.source==='excused-absence'? 'Excused absence'
+      : c.source==='parent-cancel'? 'Parent cancel'
+      : c.source==='closure'? 'Centre closure'
+      : 'No-show';
     const removable = c.source==='manual' && c.status==='available';
     html+='<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
       +'<td>'+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
@@ -4955,26 +5061,40 @@ function renderCreditsReport(){
   return html;
 }
 
+// Label for one standing pin (current or "scheduled changes") — shared so "Currently" and the
+// upcoming-changes list always describe an Online pin the same way.
+function studentPodAssignmentLabel(a){
+  if(!a) return 'Auto-assign';
+  if(a.online) return 'Online — '+(findInstructor(a.instructorId)? findInstructor(a.instructorId).name : 'Unknown instructor');
+  return a.podId? findPod(a.podId).name : 'Auto-assign';
+}
 function renderStudentPodModal(){
   const f=state.studentPodForm;
   if(!f) return '';
   const student=findStudent(f.studentId);
   const now=simNow();
-  const currentPodId=studentAssignedPodOn(student.id, now);
+  const current=latestStudentPodAssignment(student.id, now);
   const upcoming=currentOrUpcomingPodAssignments(student.id).filter(function(a){ return toKey(a.effectiveFrom)>toKey(now); });
   let html='<div class="overlay" onclick="if(event.target===this) closeStudentPodForm()"><div class="modal">';
   html+='<h3>Change '+student.name+'’s Pod</h3>';
-  html+='<p>Sets which Pod '+student.name+'’s regular sessions land in from a chosen date forward — today\'s auto-generated sessions and any beyond it regenerate to match. For a one-off change to a single already-booked session instead, use “Move pod” on that session from the day\'s schedule.</p>';
-  html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+(currentPodId? findPod(currentPodId).name : 'Auto-assigned')+'</b>'+(student.recurring&&student.recurring.length>1? ' <span class="muted">(today — may differ by day, see below)</span>':'')+'</div>';
+  html+='<p>Sets where '+student.name+'’s regular sessions land from a chosen date forward — a Pod, Online with a specific instructor, or auto-assign. Today\'s auto-generated sessions and any beyond it regenerate to match. For a one-off change to a single already-booked session instead, use “Move pod” on that session from the day\'s schedule.</p>';
+  html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+studentPodAssignmentLabel(current)+'</b>'+(student.recurring&&student.recurring.length>1? ' <span class="muted">(today — may differ by day, see below)</span>':'')+'</div>';
   if(upcoming.length>0){
     html+='<div class="small muted" style="margin-bottom:8px">Scheduled changes: '+upcoming.map(function(a){
-      return (a.podId? findPod(a.podId).name : 'Auto-assign')+(a.weekday? ' on '+a.weekday+'s' : ' every day')+' from '+fmtShort(a.effectiveFrom)+' <a href="#" onclick="removeStudentPodAssignment(\''+student.id+'\',\''+toKey(a.effectiveFrom)+'\',\''+(a.weekday||'')+'\');return false;" style="color:var(--danger)">✕</a>';
+      return studentPodAssignmentLabel(a)+(a.weekday? ' on '+a.weekday+'s' : ' every day')+' from '+fmtShort(a.effectiveFrom)+' <a href="#" onclick="removeStudentPodAssignment(\''+student.id+'\',\''+toKey(a.effectiveFrom)+'\',\''+(a.weekday||'')+'\');return false;" style="color:var(--danger)">✕</a>';
     }).join(', ')+'</div>';
   }
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
-  html+='<label>Pod</label><select onchange="setStudentPodField(\'podId\',this.value)"><option value=""'+(f.podId===''?' selected':'')+'>Auto-assign (default)</option>'
-    +pods.map(function(p){ return '<option value="'+p.id+'"'+(p.id===f.podId?' selected':'')+'>'+p.name+'</option>'; }).join('')
+  html+='<label>Pod</label><select onchange="setStudentPodField(\'location\',this.value)"><option value=""'+(f.location===''?' selected':'')+'>Auto-assign (default)</option>'
+    +pods.map(function(p){ return '<option value="'+p.id+'"'+(p.id===f.location?' selected':'')+'>'+p.name+'</option>'; }).join('')
+    +'<optgroup label="Online">'
+      +instructors.filter(function(i){ return i.active!==false; }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(i){
+        const val='online:'+i.id;
+        return '<option value="'+val+'"'+(val===f.location?' selected':'')+'>Online — '+i.name+'</option>';
+      }).join('')
+    +'</optgroup>'
     +'</select>';
+  html+='<p class="small muted" style="margin-top:-6px">An Online pin only actually takes for a given occurrence if that instructor is on shift and under the combined ratio at the time — same "pinned, no fallback" rule a Pod pin already follows: infeasible just leaves that occurrence unassigned rather than picking something else.</p>';
   html+='<label>Applies to</label><select onchange="setStudentPodField(\'weekday\',this.value)"><option value=""'+(!f.weekday?' selected':'')+'>Every day</option>'
     +WEEKDAY_KEYS.map(function(w){ return '<option value="'+w+'"'+(f.weekday===w?' selected':'')+'>'+w+'s only</option>'; }).join('')
     +'</select>';
@@ -5045,6 +5165,7 @@ function renderAttendanceLogModal(){
         scheduled:'<span class="badge soon">Scheduled</span>',
         attended:'<span class="badge available">Attended</span>',
         'no-show':'<span class="badge full">No-show</span>',
+        excused:'<span class="badge booked">Excused</span>',
         cancelled:'<span class="small muted">Cancelled</span>',
       }[s.status] || s.status;
       let detail='';
@@ -5911,7 +6032,7 @@ function loadAllData(){
     T('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes'),
     T('student_recurring_slots','student_id,weekday,start_min'),
     T('student_holds','id,student_id,start_date,end_date,note'),
-    T('student_pod_assignments','id,student_id,pod_id,effective_from,weekday'),
+    T('student_pod_assignments','id,student_id,pod_id,effective_from,weekday,online,instructor_id'),
     T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
     T('parents','id,name,email,auth_user_id'),
@@ -5960,7 +6081,7 @@ function loadAllData(){
       duration:r.duration, sessionsPerWeek:r.sessions_per_week,
       recurring: slotRows.filter(function(s){ return s.student_id===r.id; }).map(function(s){ return {weekday:s.weekday, start:s.start_min}; }),
       holds: holdRows.filter(function(h){ return h.student_id===r.id; }).map(function(h){ return {id:h.id, start:new Date(h.start_date), end:new Date(h.end_date), note:h.note||''}; }),
-      podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from), weekday:a.weekday||null}; }),
+      podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from), weekday:a.weekday||null, online:a.online||false, instructorId:a.instructor_id||null}; }),
       planChanges: planChangeRows.filter(function(pc){ return pc.student_id===r.id; }).map(function(pc){ return {
         id:pc.id, effectiveFrom:new Date(pc.effective_from), stopped:pc.stopped, sessionsPerWeek:pc.sessions_per_week,
         recurring: planChangeRecurRows.filter(function(rec){ return rec.plan_change_id===pc.id; }).map(function(rec){ return {weekday:rec.weekday, start:rec.start_min}; }),
