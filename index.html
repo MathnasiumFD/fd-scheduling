@@ -2279,12 +2279,23 @@ function openAttendanceLog(studentId){ state.attendanceLogFor=studentId; render(
 function closeAttendanceLog(){ state.attendanceLogFor=null; render(); }
 
 // A student can be checked in for right now, or backdated earlier (catching up on one missed
-// earlier in the shift), but never for a time that hasn't happened yet (5.29, per Allie) — so for a
-// session dated TODAY, the latest selectable arrival is the actual current clock; for one dated
-// before today, "the future" isn't a meaningful idea (the whole day is already over), so the full
-// center-hours range stays open, same as ever.
+// earlier in the shift), but not meaningfully into the future (5.29, per Allie) — so for a session
+// dated TODAY, the latest selectable arrival is (effectively) the actual current clock; for one
+// dated before today, "the future" isn't a meaningful idea (the whole day is already over), so the
+// full center-hours range stays open, same as ever.
+//
+// "Effectively", because flooring strictly to the real clock (the original 5.29 behaviour) meant a
+// student walking in at 3:58 always got rounded DOWN to 3:55 even though 4:00 — only two minutes
+// away — was the genuinely closer 5-minute mark on the picker's own grid. Revised Sept 2026 per
+// Allie: "round to the nearest 5 minutes, even if it's ahead of time, but never more than 3 minutes
+// into the future." Rounding whole minutes to the nearest multiple of EXIT_STEP can only ever land
+// up to 2 minutes ahead of the real clock, so the +3 ceiling below is a safety margin rather than
+// something normal rounding will actually hit.
 function checkInMaxArrival(sess){
-  return toKey(sess.date)===toKey(simNow())? nowMinutesOfDay() : CENTER_CLOSE;
+  if(toKey(sess.date)!==toKey(simNow())) return CENTER_CLOSE;
+  const now=nowMinutesOfDay();
+  const nearestFive=Math.round(now/EXIT_STEP)*EXIT_STEP;
+  return Math.min(nearestFive, now+3);
 }
 // The arrival dropdown's actual option list — CHECKIN_TIME_OPTIONS trimmed to whatever's not in the
 // future per checkInMaxArrival() above. Falls back to just the center's opening time in the (very
