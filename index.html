@@ -1132,7 +1132,14 @@ function movePodSession(sessionId, newPodId){
   const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
   const student=findStudent(sess.studentId);
   const cap=podCapacity(newPodId);
-  if(podCapacityBlocked(newPodId, dateKey, {start:sess.start, duration:sess.duration})){
+  // The 1:8 ratio is only enforced when moving a session dated in the future — locking in a seat
+  // that isn't a physical reality yet. Once it's actually the day of the session, front desk is
+  // looking at the real room, not a projection, and needs to be able to seat a student wherever
+  // makes sense right then without the system refusing on their behalf (Sept 2026, per Allie: "on
+  // the day students can be moved to other pods, disregarding pod fullness"). A future-dated move
+  // still needs the check — this only relaxes same-day, real-time adjustments.
+  const isToday=dateKey===toKey(simNow());
+  if(!isToday && podCapacityBlocked(newPodId, dateKey, {start:sess.start, duration:sess.duration})){
     return {ok:false, error:newPod.name+' is already full at that time ('+cap+'/'+cap+') — pick another Pod.'};
   }
   const oldPod=findPod(sess.podId);
@@ -2331,12 +2338,17 @@ function renderMoveModal(){
   html+='<h3>'+(currentLabel? 'Move '+student.name+' to a different Pod' : 'Assign '+student.name+' to a Pod')+'</h3>';
   html+='<p>'+(currentLabel? 'Currently in '+currentLabel : 'Currently unassigned — no Pod could be found for this session when it was created')+', '+rangeLabel(sess.start,sess.duration)+' on '+fmtShort(sess.date)+'. The instructor shown for this session updates automatically to whoever covers the new Pod at this time.</p>';
   const onlineChoices=instructorsOnShift(weekday, sess.start, sess.duration, sess.date).filter(function(instr){ return !(sess.online && instr.id===sess.instructorId); });
+  // Same-day moves are allowed to exceed the 1:8 ratio (see movePodSession()) — this dropdown only
+  // disables/marks a Pod "full" when the move would actually be refused, i.e. for a future date.
+  const isTodayMove=dateKey===toKey(simNow());
   html+='<label>Move to</label><select onchange="setMoveFormLocation(this.value)"><option value="">Choose…</option>'
     +pods.filter(function(p){ return p.id!==sess.podId; }).map(function(p){
       const peak=peakConcurrency(p.id, dateKey, {start:sess.start, duration:sess.duration});
       const cap=podCapacity(p.id);
       const full=podCapacityBlocked(p.id, dateKey, {start:sess.start, duration:sess.duration});
-      return '<option value="'+p.id+'"'+(p.id===f.location?' selected':'')+(full?' disabled':'')+'>'+p.name+(full?' — full':' — '+peak+'/'+cap+' after move')+'</option>';
+      const disable=full && !isTodayMove;
+      const label = full? (isTodayMove? ' — over capacity, allowed today':' — full') : ' — '+peak+'/'+cap+' after move';
+      return '<option value="'+p.id+'"'+(p.id===f.location?' selected':'')+(disable?' disabled':'')+'>'+p.name+label+'</option>';
     }).join('')
     + (onlineChoices.length? ('<optgroup label="Online">'+onlineChoices.map(function(instr){
         const val='online:'+instr.id;
@@ -3557,11 +3569,13 @@ function renderCoverageGrid(weekDates){
   return html;
 }
 
-// Compact per-Pod strip for the day the Schedule list is showing — capacity and who's covering it,
-// at a glance, now that pod cards themselves are gone (Sept 2026: replaced by one flat student
-// list, see scheduleListForDay()/renderStaff()). "Assign" here is about STAFFING the Pod (which
-// instructor runs it) — a different concern from which students sit in it, which now lives in each
-// student's own row via the Pod dropdown (podOptionLabel/setSessionPod).
+// Per-Pod cards for the day the Schedule section is showing — capacity, who's covering it, and the
+// actual seated roster, all together (brought back Sept 2026, per Allie: "we need to bring back
+// the pod-based scheduling" — this had briefly been split into a compact badge/pill strip plus one
+// separate flat student list; this restores the single per-Pod view, without changing any of the
+// underlying actions). "Assign" on a card's header is about STAFFING the Pod (which instructor runs
+// it) — a different concern from which students sit in it, which is each row's own "Move to"
+// dropdown (locationOptionsHtml/setSessionLocation).
 // Names of every student sitting at each Pod on the given day — for TODAY that means "checked in
 // and not yet checked out" (a live, moment-to-moment roster: a name drops off the instant that
 // student is checked out, freeing the seat), which is what drives the live 1/8, 2/8... occupancy
@@ -3613,10 +3627,48 @@ function instructorOccupantCount(instructorId, dayKey){
   }).length;
 }
 
+// One row of the seating table — a single session, with its own "Move to" (Pod/Online) picker and
+// check-in/no-show/cancel actions. Factored out so every card (each Pod, each Online instructor
+// group, and Unassigned) renders rows identically — the exact same markup the old single flat list
+// used per row, just grouped differently now.
+function sessionRowHtml(sess, weekday, dayKey, now){
+  const student=findStudent(sess.studentId);
+  if(!student) return '';
+  const actualNote = sess.actualStart!=null? ' · checked in '+minToLabel(sess.actualStart)+', ran to '+minToLabel(sess.actualEnd)+(sess.checkInOffset>LATE_GRACE_MIN? ' (capped)':'') : '';
+  let handoffNote='';
+  if(sess.instructorId2){
+    handoffNote = ' · '+findInstructor(sess.instructorId).name+' until '+minToLabel(sess.handoff)+', then '+findInstructor(sess.instructorId2).name;
+  } else if(sess.instructorId){
+    handoffNote = ' · with '+findInstructor(sess.instructorId).name+(sess.online? ' (online)' : '');
+  }
+  let html='<tr><td><b>'+student.name+'</b></td><td>'+yearLabel(student.year)+'</td><td>'+rangeLabel(sess.start,sess.duration)+'</td>';
+  html+='<td><select onchange="setSessionLocation(\''+sess.id+'\',this.value)">'
+    +'<option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
+    +locationOptionsHtml(weekday, dayKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
+  +'</select></td>';
+  html+='<td class="small muted">'+sess.status+(sess.bookedBy==='parent'?' · 👪 parent':'')+(sess.recurring?' · regular':'')+handoffNote+actualNote+'</td>';
+  let actions='';
+  if(sess.status==='scheduled' && toKey(sess.date)<=toKey(now)){
+    actions+='<button class="btn sm success" onclick="openCheckIn(\''+sess.id+'\')">✓ Check in</button>'
+      +'<button class="btn sm danger" onclick="markStatus(\''+sess.id+'\',\'no-show\')">No-show</button>';
+  } else if(sess.status==='scheduled'){
+    actions+='<button class="btn sm ghost" onclick="markStatus(\''+sess.id+'\',\'cancelled\')">Cancel</button>';
+  }
+  html+='<td>'+actions+'</td></tr>';
+  return html;
+}
+function rosterTableHtml(rows, weekday, dayKey, now){
+  return '<table><tr><th>Student</th><th>Year</th><th>Time</th><th>Move to</th><th>Status</th><th></th></tr>'
+    +rows.map(function(sess){ return sessionRowHtml(sess, weekday, dayKey, now); }).join('')
+  +'</table>';
+}
+
 function renderPodSummaryStrip(dayKey, weekday){
+  const now=simNow();
   const selectedDate=new Date(dayKey);
+  const dayList=scheduleListForDay(dayKey);
   const checkedInByPod=checkedInNamesByPod(dayKey);
-  let html='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
+  let html='<div style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px">';
   pods.forEach(function(pod){
     const cap=podCapacity(pod.id);
     const coverage=podCoverageSummary(pod.id, weekday, selectedDate);
@@ -3626,37 +3678,40 @@ function renderPodSummaryStrip(dayKey, weekday){
     // climbs 1/8, 2/8, 3/8... as each student is checked in and assigned here, exactly the "seats
     // filling up" view front desk watches through the day (5.28, per Allie).
     const occupancy=checkedIn.length;
-    html+='<div class="pill" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
-      +'<b>'+pod.name+'</b><span class="small muted">'+coverage+'</span>'
+    const roster=dayList.filter(function(s){ return s.podId===pod.id && !s.online; });
+    html+='<div class="card" style="margin:0"><div class="card-head" style="flex-wrap:wrap;row-gap:6px">'
+      +'<h3 style="margin:0">'+pod.name+'</h3>'
+      +'<span class="small muted">'+coverage+'</span>'
       +'<span class="badge '+(occupancy>=cap?'full':'available')+'">'+occupancy+'/'+cap+'</span>'
-      +(checkedIn.length? '<span class="small">✓ '+checkedIn.join(', ')+'</span>' : '')
-      +'<button class="btn sm ghost" onclick="openPodAssignForm(\''+pod.id+'\',\''+weekday+'\')">Assign</button>'
+      +'<button class="btn sm ghost" style="margin-left:auto" onclick="openPodAssignForm(\''+pod.id+'\',\''+weekday+'\')">Assign</button>'
+    +'</div>'
+    +(roster.length? rosterTableHtml(roster, weekday, dayKey, now) : '<div class="empty-note">Nobody assigned here yet.</div>')
     +'</div>';
   });
-  // Online strips — one per instructor currently minding an Online group today, shown as its own
-  // distinct row rather than mixed in with the Pod pills above (Online is a separate concept, not
-  // just another Pod). Only instructors with at least one online student booked today get a strip;
-  // an on-shift instructor with nobody online yet doesn't clutter this up.
+  // Online cards — one per instructor currently minding an Online group today, shown separately
+  // from the Pod cards above (Online is a separate concept, not just another Pod). Only instructors
+  // with at least one online student booked today get a card; an on-shift instructor with nobody
+  // online yet doesn't clutter this up.
   const onlineByInstructor={};
-  sessions.forEach(function(s){
-    if(s.status==='cancelled' || !s.online || toKey(s.date)!==dayKey) return;
-    (onlineByInstructor[s.instructorId]=onlineByInstructor[s.instructorId]||[]).push(s);
+  dayList.forEach(function(s){ if(s.online){ (onlineByInstructor[s.instructorId]=onlineByInstructor[s.instructorId]||[]).push(s); } });
+  Object.keys(onlineByInstructor).forEach(function(instrId){
+    const instr=findInstructor(instrId);
+    if(!instr) return;
+    const occupancy=instructorOccupantCount(instrId, dayKey); // combined (physical + online) headcount actually sitting with this instructor — the number the 1:9 ratio caps
+    html+='<div class="card online" style="margin:0"><div class="card-head" style="flex-wrap:wrap;row-gap:6px">'
+      +'<h3 style="margin:0">Online — '+instr.name+'</h3>'
+      +'<span class="badge '+(occupancy>=ONLINE_COMBINED_CAP?'full':'available')+'">'+occupancy+'/'+ONLINE_COMBINED_CAP+'</span>'
+    +'</div>'
+    +rosterTableHtml(onlineByInstructor[instrId], weekday, dayKey, now)
+    +'</div>';
   });
-  const checkedInByOnlineInstructor=checkedInNamesByOnlineInstructor(dayKey);
-  const onlineInstructorIds=Object.keys(onlineByInstructor);
-  if(onlineInstructorIds.length){
-    html+='</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
-    onlineInstructorIds.forEach(function(instrId){
-      const instr=findInstructor(instrId);
-      if(!instr) return;
-      const occupancy=instructorOccupantCount(instrId, dayKey); // combined (physical + online) headcount actually sitting with this instructor — the number the 1:9 ratio caps
-      const checkedIn=checkedInByOnlineInstructor[instrId]||[];
-      html+='<div class="pill online" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
-        +'<b>Online — '+instr.name+'</b>'
-        +'<span class="badge '+(occupancy>=ONLINE_COMBINED_CAP?'full':'available')+'">'+occupancy+'/'+ONLINE_COMBINED_CAP+'</span>'
-        +(checkedIn.length? '<span class="small">✓ '+checkedIn.join(', ')+'</span>' : '')
-      +'</div>';
-    });
+  // Unassigned — anyone with no Pod and not online: a genuine gap front desk still needs to resolve,
+  // called out as its own card rather than silently missing from every Pod's roster.
+  const unassigned=dayList.filter(function(s){ return !s.podId && !s.online; });
+  if(unassigned.length){
+    html+='<div class="card" style="margin:0"><div class="card-head"><h3 style="margin:0;color:var(--danger)">Unassigned</h3></div>'
+      +rosterTableHtml(unassigned, weekday, dayKey, now)
+    +'</div>';
   }
   html+='</div>';
   return html;
@@ -3755,38 +3810,6 @@ function renderStaff(){
   if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
 
   html+=renderPodSummaryStrip(dayKey, weekday);
-
-  const dayList=scheduleListForDay(dayKey);
-  if(dayList.length===0){ html+='<div class="empty-note">Nobody expected today.</div>'; }
-  else{
-    html+='<table><tr><th>Student</th><th>Year</th><th>Time</th><th>Pod</th><th>Status</th><th></th></tr>';
-    dayList.forEach(function(sess){
-      const student=findStudent(sess.studentId);
-      if(!student) return;
-      const actualNote = sess.actualStart!=null? ' · checked in '+minToLabel(sess.actualStart)+', ran to '+minToLabel(sess.actualEnd)+(sess.checkInOffset>LATE_GRACE_MIN? ' (capped)':'') : '';
-      let handoffNote='';
-      if(sess.instructorId2){
-        handoffNote = ' · '+findInstructor(sess.instructorId).name+' until '+minToLabel(sess.handoff)+', then '+findInstructor(sess.instructorId2).name;
-      } else if(sess.instructorId){
-        handoffNote = ' · with '+findInstructor(sess.instructorId).name+(sess.online? ' (online)' : '');
-      }
-      html+='<tr><td><b>'+student.name+'</b></td><td>'+yearLabel(student.year)+'</td><td>'+rangeLabel(sess.start,sess.duration)+'</td>';
-      html+='<td><select onchange="setSessionLocation(\''+sess.id+'\',this.value)">'
-        +'<option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
-        +locationOptionsHtml(weekday, dayKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
-      +'</select></td>';
-      html+='<td class="small muted">'+sess.status+(sess.bookedBy==='parent'?' · 👪 parent':'')+(sess.recurring?' · regular':'')+handoffNote+actualNote+'</td>';
-      let actions='';
-      if(sess.status==='scheduled' && toKey(sess.date)<=toKey(now)){
-        actions+='<button class="btn sm success" onclick="openCheckIn(\''+sess.id+'\')">✓ Check in</button>'
-          +'<button class="btn sm danger" onclick="markStatus(\''+sess.id+'\',\'no-show\')">No-show</button>';
-      } else if(sess.status==='scheduled'){
-        actions+='<button class="btn sm ghost" onclick="markStatus(\''+sess.id+'\',\'cancelled\')">Cancel</button>';
-      }
-      html+='<td>'+actions+'</td></tr>';
-    });
-    html+='</table>';
-  }
 
   html+=renderCoverageGrid(weekDates);
 
