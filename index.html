@@ -3657,10 +3657,22 @@ function sessionRowHtml(sess, weekday, dayKey, now){
   html+='<td>'+actions+'</td></tr>';
   return html;
 }
+// Checked-in students first, then whoever's still to arrive — each half keeping the same
+// alphabetical-by-name order scheduleListForDay() already sorted `rows` into (Sept 2026, per
+// Allie: "split the ones that are checked in at the top, and the ones to come after at the
+// bottom... alphabetically sorted per section"). A no-show is neither — it's grouped with "still
+// to arrive" since it never actually checked in, same as a plain scheduled session.
 function rosterTableHtml(rows, weekday, dayKey, now){
-  return '<table><tr><th>Student</th><th>Year</th><th>Time</th><th>Move to</th><th>Status</th><th></th></tr>'
-    +rows.map(function(sess){ return sessionRowHtml(sess, weekday, dayKey, now); }).join('')
-  +'</table>';
+  const checkedIn=rows.filter(function(s){ return s.status==='attended'; });
+  const upcoming=rows.filter(function(s){ return s.status!=='attended'; });
+  let html='<table><tr><th>Student</th><th>Year</th><th>Time</th><th>Move to</th><th>Status</th><th></th></tr>';
+  html+=checkedIn.map(function(sess){ return sessionRowHtml(sess, weekday, dayKey, now); }).join('');
+  if(checkedIn.length && upcoming.length){
+    html+='<tr><td colspan="6" class="small muted" style="text-align:center;padding:4px 0">— yet to arrive —</td></tr>';
+  }
+  html+=upcoming.map(function(sess){ return sessionRowHtml(sess, weekday, dayKey, now); }).join('');
+  html+='</table>';
+  return html;
 }
 
 function renderPodSummaryStrip(dayKey, weekday){
