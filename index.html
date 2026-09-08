@@ -2122,10 +2122,17 @@ function confirmBooking(){
     return;
   }
 
-  // The only thing that can require an override now (Sept 2026 — age/year rules removed entirely)
-  // is actual staffing: no instructor anywhere near the window, or a real gap bigger than the
-  // tolerated 15 minutes unattended (UNATTENDED_TOLERANCE_MIN). Capacity (the 1:8 ratio) is
-  // checked separately below and is never override-able.
+  // The only thing that can require an override for STAFFING is actual coverage: no instructor
+  // anywhere near the window, or a real gap bigger than the tolerated 15 minutes unattended
+  // (UNATTENDED_TOLERANCE_MIN). Capacity (the 1:8 ratio) used to be checked separately below and
+  // was never override-able at all — but front desk already has a same-day capacity bypass for
+  // MOVING an already-booked session (movePodSession, per Allie: "on the day students can be moved
+  // to other pods, disregarding pod fullness"), and the only way to reach that for a brand-new
+  // booking was the roundabout trick of booking it unassigned first, then moving it — something only
+  // Allie herself was doing (Sept 2026, per Allie: "I also need all front staff to have the ability
+  // to overbook a pod on the day, not just me"). So the exact same rule now applies directly here
+  // too: a future-dated booking is still hard-capped at capacity, no override; a same-day booking can
+  // go over, since front desk is looking at the real room, not a projection.
   const cov=podCoverageDetail(pod.id, weekday, f.start, f.duration, date);
   const totallyUnassigned = !cov.primaryInstructorId;
   const needsOverride = !cov.ok;
@@ -2133,8 +2140,10 @@ function confirmBooking(){
   if(needsOverride && !f.overrideOk) return; // needs explicit override checkbox
 
   const cap=podCapacity(pod.id);
-  if(podCapacityBlocked(pod.id, dateKey, {start:f.start, duration:f.duration})){
-    const wouldBePeak = peakConcurrency(pod.id, dateKey, {start:f.start, duration:f.duration});
+  const isToday=dateKey===toKey(simNow());
+  const wouldBePeak = peakConcurrency(pod.id, dateKey, {start:f.start, duration:f.duration});
+  const overCapacityToday = isToday && wouldBePeak>cap;
+  if(!isToday && podCapacityBlocked(pod.id, dateKey, {start:f.start, duration:f.duration})){
     toast('Blocked — this would put '+pod.name+' over capacity ('+wouldBePeak+'/'+cap+').');
     return;
   }
@@ -2149,7 +2158,8 @@ function confirmBooking(){
   const handoffNote = cov.secondaryInstructorId? (' with a handoff to '+findInstructor(cov.secondaryInstructorId).name+' at '+minToLabel(cov.handoffAt)) : '';
   const withNote = cov.primaryInstructorId? (' with '+findInstructor(cov.primaryInstructorId).name) : '';
   const gapNote = (cov.gapMinutes>0 && cov.ok)? (' ('+cov.gapMinutes+' min unattended — within the '+UNATTENDED_TOLERANCE_MIN+'-min tolerance)') : '';
-  toast(student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+gapNote+'.');
+  const capacityNote = overCapacityToday? (' — over capacity ('+wouldBePeak+'/'+cap+'), allowed since it\'s today') : '';
+  toast(student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+gapNote+capacityNote+'.');
   state.booking=null;
   render();
 }
@@ -4432,7 +4442,13 @@ function renderBookingModal(){
 
   const cap=pod? podCapacity(pod.id) : 0;
   const wouldBePeak = (student && f.start!=null && pod)? peakConcurrency(pod.id, b.dateKey, {start:f.start, duration:f.duration}) : 0;
-  const overCapacity = (student && f.start!=null && pod) && podCapacityBlocked(pod.id, b.dateKey, {start:f.start, duration:f.duration});
+  const isTodayBooking = b.dateKey===toKey(simNow());
+  // Same-day capacity bypass (5.34, per Allie: "I also need all front staff to have the ability to
+  // overbook a pod on the day, not just me") — a future-dated booking is still hard-capped, no
+  // override possible; today's real room can be overbooked directly here, same rule movePodSession
+  // already applies to moving an existing session.
+  const overCapacity = (student && f.start!=null && pod) && !isTodayBooking && podCapacityBlocked(pod.id, b.dateKey, {start:f.start, duration:f.duration});
+  const overCapacityButAllowedToday = (student && f.start!=null && pod) && isTodayBooking && wouldBePeak>cap;
 
   let html='<div class="overlay" onclick="if(event.target===this) closeBooking()"><div class="modal">';
   html+='<h3>Book a session — '+fmtShort(date)+'</h3>';
@@ -4478,7 +4494,10 @@ function renderBookingModal(){
     html+='<div class="banner info">ℹ️ '+yearLabel(student.year)+' isn\'t '+who+'\'s usual focus, but they can teach any year — this books normally, no override needed.</div>';
   }
   if(student && pod && overCapacity){
-    html+='<div class="banner danger">⛔ This would put '+pod.name+' over capacity ('+wouldBePeak+'/'+cap+') — not allowed, no override.</div>';
+    html+='<div class="banner danger">⛔ This would put '+pod.name+' over capacity ('+wouldBePeak+'/'+cap+') — not allowed for a future date, no override.</div>';
+  }
+  if(student && pod && overCapacityButAllowedToday){
+    html+='<div class="banner warn">⚠️ This puts '+pod.name+' over capacity ('+wouldBePeak+'/'+cap+') — allowed since it\'s today; you\'re looking at the real room, not a projection.</div>';
   }
   if(student && onlineInstr && onlineOverCapacity){
     html+='<div class="banner danger">⛔ This would put '+onlineInstr.name+"'s Online group over the combined ratio ("+onlinePeak+'/'+ONLINE_COMBINED_CAP+') — not allowed, no override.</div>';
@@ -5965,6 +5984,43 @@ function logOut(){
   supabaseClient.auth.signOut().then(function(){ location.reload(); });
 }
 
+// Live sync across open tabs/devices (Sept 2026, per Allie: "if there are two members of staff
+// logged on at the same time, how can we see what the other has done in real time?"). Before this,
+// every tab held only a frozen snapshot from whenever it last loaded — someone else's check-in,
+// booking, or Pod change was invisible until a full page reload. Subscribes to every table
+// loadAllData() reads from; ANY insert/update/delete on ANY of them (from anyone, including this
+// tab's own writes echoing back — harmless) schedules a fresh loadAllData(). Debounced so a burst of
+// related writes (e.g. regenerateAllRecurring() touching dozens of rows in one go) collapses into a
+// single re-fetch instead of one per row.
+//
+// Deliberately just re-runs loadAllData() + render() — nothing fancier. Every modal/form lives in
+// the separate `state` object and stores plain field values (a studentId string, a date, a number),
+// never a direct reference into `students`/`sessions`/etc., so swapping those arrays out for fresh
+// ones from the server can never yank a form out from under whoever has one open. regenerateAllRecurring()
+// is deliberately NOT re-run here — whichever tab actually made the change already ran it (and
+// persisted the result), so re-running it again on every other tab's every refresh would risk two
+// tabs racing to fill the same gap at once for no benefit.
+var liveSyncTimer=null;
+function scheduleLiveSync(){
+  if(liveSyncTimer) clearTimeout(liveSyncTimer);
+  liveSyncTimer=setTimeout(function(){
+    liveSyncTimer=null;
+    loadAllData().then(render).catch(function(err){ console.error('Live sync refresh failed', err); });
+  }, 500);
+}
+var LIVE_SYNC_TABLES=['instructors','instructor_avail_rules','instructor_one_offs','pods','pod_shift_blocks',
+  'pod_shift_assignments','pod_shift_one_off_coverage','students','student_recurring_slots','student_holds',
+  'student_pod_assignments','student_plan_changes','student_plan_change_recurring','parents','sessions',
+  'credits','coverage_requests','coverage_request_notified_instructors','waitlist_entries','closed_days',
+  'enrollment_requests','enrollment_request_recurring','staff_members'];
+function subscribeToLiveUpdates(){
+  let channel=supabaseClient.channel('live-updates');
+  LIVE_SYNC_TABLES.forEach(function(t){
+    channel=channel.on('postgres_changes', {event:'*', schema:'public', table:t}, scheduleLiveSync);
+  });
+  channel.subscribe();
+}
+
 function afterLogin(){
   supabaseClient.auth.getUser().then(function(res){
     if(res.error || !res.data.user){ showLoginScreen('Session expired — sign in again.'); return; }
@@ -5985,6 +6041,7 @@ function afterLogin(){
         // within 30 seconds of its date arriving, not only the next time someone happens to
         // re-open the page.
         setInterval(function(){ applyPromotions(); applyPlanChanges(); render(); }, 30000);
+        subscribeToLiveUpdates();
       }).catch(function(err){
         console.error(err);
         showLoginScreen('Signed in, but loading your data failed — check your connection and reload.');
