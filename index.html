@@ -3811,6 +3811,64 @@ function rosterTableHtml(rows, weekday, dayKey, now){
   return html;
 }
 
+// Live per-Pod (and Online) "who's here" board — literally just names and leave times, grouped by
+// where they're actually sitting, updating automatically as students check in and out (a spot
+// reopens the instant someone checks out, since they simply drop off the list) — Sept 2026, per
+// Allie: "as the students get checked into a pod, we are able to see them in that pod... as they
+// leave theres a spot again... i just need it to say the kids name and the time they leave".
+// Deliberately much lighter than the full-day roster in renderPodSummaryStrip just below it (no
+// year, no status, no move/action controls) — this is meant to be read at a glance, not worked
+// from; corrections to a checked-in/exit time still happen on the "Checked in today" panel above.
+// Same live-vs-historical rule as checkedInNamesByPod(): today shows who's still actually present
+// (checked out students drop off immediately), any other day shows that whole day's attended record.
+function liveOccupancyGroups(dayKey){
+  const live = dayKey===toKey(simNow());
+  const byPod={}, byOnlineInstr={};
+  sessions.forEach(function(s){
+    if(s.status!=='attended' || toKey(s.date)!==dayKey) return;
+    if(live && s.checkedOut) return;
+    const student=findStudent(s.studentId);
+    if(!student) return;
+    const entry={name:student.name, exit:s.actualEnd};
+    if(s.online){ (byOnlineInstr[s.instructorId]=byOnlineInstr[s.instructorId]||[]).push(entry); }
+    else if(s.podId){ (byPod[s.podId]=byPod[s.podId]||[]).push(entry); }
+  });
+  const sortEntries=function(list){
+    return list.slice().sort(function(a,b){
+      const ea = a.exit==null? Infinity : a.exit, eb = b.exit==null? Infinity : b.exit;
+      return ea-eb || a.name.localeCompare(b.name, undefined, {sensitivity:'base'});
+    });
+  };
+  const groups=[];
+  pods.forEach(function(pod){
+    if(byPod[pod.id] && byPod[pod.id].length) groups.push({label:pod.name, entries:sortEntries(byPod[pod.id])});
+  });
+  Object.keys(byOnlineInstr).forEach(function(instrId){
+    const instr=findInstructor(instrId);
+    if(!instr) return;
+    groups.push({label:'Online — '+instr.name, entries:sortEntries(byOnlineInstr[instrId])});
+  });
+  return groups;
+}
+function renderLiveOccupancyBoard(dayKey){
+  const groups=liveOccupancyGroups(dayKey).filter(function(g){ return g.entries.length; });
+  const live = dayKey===toKey(simNow());
+  let html='<div class="card"><h2>Who\'s here'+(live? ' right now':'')+'</h2>';
+  if(!groups.length){
+    html+='<div class="empty-note">'+(live? 'Nobody checked in yet today.' : 'Nobody was checked in this day.')+'</div></div>';
+    return html;
+  }
+  html+='<div style="display:flex;flex-wrap:wrap;gap:16px">'
+    +groups.map(function(g){
+      return '<div style="min-width:150px"><h4 style="margin:0 0 4px 0">'+g.label+'</h4>'
+        +'<table><tr><th>Student</th><th>Leaves</th></tr>'
+        +g.entries.map(function(e){ return '<tr><td>'+e.name+'</td><td>'+(e.exit!=null? minToLabel(e.exit) : '—')+'</td></tr>'; }).join('')
+        +'</table></div>';
+    }).join('')
+    +'</div></div>';
+  return html;
+}
+
 function renderPodSummaryStrip(dayKey, weekday){
   const now=simNow();
   const selectedDate=new Date(dayKey);
@@ -3956,6 +4014,8 @@ function renderStaff(){
   }).join('')+'</div>';
 
   if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
+
+  html+=renderLiveOccupancyBoard(dayKey);
 
   html+=renderPodSummaryStrip(dayKey, weekday);
 
@@ -5481,7 +5541,15 @@ function renderInstructor(){
         const pod=findPod(s.podId);
         const locLabel=s.online? 'Online' : (pod? pod.name : '—');
         const cd=countdownInfo(s.actualEnd!=null? s.actualEnd : s.start+s.duration);
-        return '<tr><td>'+student.name+' <span class="small muted">'+yearLabel(student.year)+'</span></td><td>'+locLabel+'</td><td>'+rangeLabel(s.start,s.duration)+'</td>'
+        // Actual (check-in-adjusted) times, not the original scheduled window — this row is only
+        // ever a student who's already checked in (checkedInAtInstructorPodToday() filters to
+        // status==='attended'), so actualStart/actualEnd are always set by then. Previously showed
+        // rangeLabel(s.start,s.duration) — the plain scheduled range — which silently disagreed with
+        // front desk's own "Checked in today" panel (renderCheckedInPanel()) any time a check-in was
+        // late/early or its exit time was manually adjusted (Sept 2026, per Allie: "the instructor
+        // view of sign out times are different to front staff view").
+        const timeLabel=(s.actualStart!=null && s.actualEnd!=null)? minToLabel(s.actualStart)+'–'+minToLabel(s.actualEnd) : rangeLabel(s.start,s.duration);
+        return '<tr><td>'+student.name+' <span class="small muted">'+yearLabel(student.year)+'</span></td><td>'+locLabel+'</td><td>'+timeLabel+'</td>'
           +'<td><span class="badge '+cd.cls+'">'+cd.label+'</span></td>'
           +'<td><button class="btn sm ghost" onclick="openMoveForm(\''+s.id+'\')">Move pod</button></td></tr>';
       }).join('')
