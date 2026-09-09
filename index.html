@@ -4137,6 +4137,22 @@ function liveOccupancyGroups(dayKey){
 // colour tied to how soon someone's leaving. Online groups have no fixed seat count to grid against
 // (they run on the combined 1:9 ratio, not 8 physical seats), so they keep the plain name/leave-time
 // list format below the grid, same as before.
+// Which instructor is actually rostered against a Pod's board column, for the small label under its
+// name (Sept 2026, per Allie: "Can we have the instructor name as well in small writing under the
+// pod number"). Resolves exactly the way openQuickCoverageForm() picks its starting block — whichever
+// shift covers the current wall-clock time, falling back to the day's last block — then reads
+// blockInstructorOn() for that calendar date, so a one-off coverage swap or a dated permanent change
+// both show up correctly, on any day, not just today.
+function podInstructorLabel(podId, dayKey){
+  const date=new Date(dayKey);
+  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+  const blocks=podBlocksForDay(podId, weekday);
+  if(!blocks.length) return null;
+  const nowMin=nowMinutesOfDay();
+  const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
+  const instrId=blockInstructorOn(block, date);
+  return instrId? findInstructor(instrId).name : null;
+}
 function renderLiveOccupancyBoard(dayKey){
   const groups=liveOccupancyGroups(dayKey).filter(function(g){ return g.entries.length; });
   const podGroups=groups.filter(function(g){ return g.podId; });
@@ -4158,7 +4174,10 @@ function renderLiveOccupancyBoard(dayKey){
       // there's nothing "quick" left to change (Sept 2026, per Allie: "maybe by clicking on th epod
       // number under whos here right now").
       const headAttrs = live? ' style="cursor:pointer" onclick="openQuickCoverageForm(\''+g.podId+'\')" title="Quick same-day coverage change"' : '';
-      return '<div class="cal-head"'+headAttrs+'>'+g.label+' <span class="badge '+(occupancy>=cap?'full':'available')+'" style="margin-left:4px">'+occupancy+'/'+cap+'</span></div>';
+      const instrName=podInstructorLabel(g.podId, dayKey);
+      return '<div class="cal-head"'+headAttrs+'>'+g.label+' <span class="badge '+(occupancy>=cap?'full':'available')+'" style="margin-left:4px">'+occupancy+'/'+cap+'</span>'
+        +(instrName? '<br><span class="small muted">'+instrName+'</span>' : '')
+      +'</div>';
     }).join('');
     for(let seat=0; seat<maxCap; seat++){
       html+='<div class="cal-row-label small muted">Seat '+(seat+1)+'</div>';
