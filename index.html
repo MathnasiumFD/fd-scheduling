@@ -4315,6 +4315,17 @@ function renderStaff(){
                    // rather than siblings) — now that collapsing hides a card's direct children,
                    // that missing tag was making "Schedule" swallow everything after it.
 
+  // Placed directly under Schedule, above Students (Sept 2026, per Allie: "place pod seating -
+  // permanent changes right under schedule, above students") — previously all the way at the bottom
+  // of the page. Collapsed by default and following whichever day is selected in the Schedule day
+  // picker above it, same as before; its "Move to" picker makes a PERMANENT standing change (see
+  // setPermanentSessionLocation) rather than a one-off swap, so this reads as an extension of
+  // Schedule's own seating rather than a roster-management afterthought.
+  html+=sectionOpen('podSeating','Pod seating — permanent changes')
+    +'<p class="small muted">Move a student here and it sticks — every '+weekday+' from '+fmtShort(selectedDate)+' onward, not just '+fmtShort(selectedDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead.</p>'
+    +renderPodSummaryStrip(dayKey, weekday)
+    +'</div>';
+
   html+=renderBookingModal();
   html+=renderPodAssignModal();
   html+=renderCheckInModal();
@@ -4329,19 +4340,6 @@ function renderStaff(){
   html+=renderCreditsReport();
   html+=renderInactiveStudentsPanel();
   html+=renderInactiveParentsPanel();
-
-  // Relocated out of the always-visible Schedule card and collapsed by default (Sept 2026, per
-  // Allie: "instead of having the pre-assigned pods as always visible, that is another section at
-  // the bottom default collapsed, where we can visually arrange students") — same per-Pod/Online/
-  // Unassigned rosters as before, still following whichever day is selected in the Schedule day
-  // picker above, just tucked away since day-to-day front desk work rarely needs it. Its "Move to"
-  // picker now makes a PERMANENT standing change (see setPermanentSessionLocation) rather than a
-  // one-off swap, which is exactly what makes this the right place to "visually arrange" seating —
-  // a change made here is meant to stick, not just cover today.
-  html+=sectionOpen('podSeating','Pod seating — permanent changes')
-    +'<p class="small muted">Move a student here and it sticks — every '+weekday+' from '+fmtShort(selectedDate)+' onward, not just '+fmtShort(selectedDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead.</p>'
-    +renderPodSummaryStrip(dayKey, weekday)
-    +'</div>';
 
   return html;
 }
