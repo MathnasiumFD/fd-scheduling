@@ -300,6 +300,14 @@ function minToLabel(min){
   return h12+(m? ':'+String(m).padStart(2,'0') : '')+period;
 }
 function rangeLabel(start,duration){ return minToLabel(start)+'–'+minToLabel(start+duration); }
+// e.g. 90 -> "1h 30m", 60 -> "1h", 45 -> "45m". Used for the attendance log's per-instructor time
+// summary — total minutes taught rarely lands on a clean hour, so this always reads naturally.
+function hoursMinutesLabel(mins){
+  const h=Math.floor(mins/60), m=mins%60;
+  if(h===0) return m+'m';
+  if(m===0) return h+'h';
+  return h+'h '+m+'m';
+}
 
 var WEEKDAY_KEYS=['Mon','Tue','Wed','Thu','Fri'];
 // Mathnasium Five Dock wordmark, embedded so the single HTML file stays self-contained.
@@ -735,6 +743,7 @@ var state={
   booking:null,
   bookingForm:{studentId:'', duration:90, start:null, overrideOk:false},
   podAssignForm:null,
+  quickCoverageForm:null,
   parentBookingCreditId:null,
   newStudentForm:null,
   newInstructorForm:null,
@@ -883,6 +892,37 @@ function studentAttendanceLog(studentId){
   })
     .slice()
     .sort(function(a,b){ return b.date-a.date || b.start-a.start; });
+}
+
+// How much time a student has actually spent with each instructor (Sept 2026, per Allie: "I also
+// want the history to keep track of what times a student spends with particular instructors").
+// Built from the same history studentAttendanceLog() shows — only counts sessions actually
+// ATTENDED; a no-show, excused absence, or cancellation means no time was spent with anyone,
+// however it was staffed. A handoff session (instructorId2 set) splits its duration at the handoff
+// point, crediting each instructor only the portion they actually covered — so the two instructors'
+// totals for that one session always add back up to its full length. Sorted most-time-first.
+function instructorTimeSummary(studentId){
+  const totals={}; // instructorId -> {minutes, sessions}
+  const credit=function(instrId, minutes){
+    if(!instrId || minutes<=0) return;
+    if(!totals[instrId]) totals[instrId]={minutes:0, sessions:0};
+    totals[instrId].minutes+=minutes;
+    totals[instrId].sessions+=1;
+  };
+  studentAttendanceLog(studentId).forEach(function(s){
+    if(s.status!=='attended') return;
+    if(s.instructorId2){
+      const handoff = s.handoff!=null? s.handoff : s.start+Math.round(s.duration/2);
+      credit(s.instructorId, handoff-s.start);
+      credit(s.instructorId2, (s.start+s.duration)-handoff);
+    } else {
+      credit(s.instructorId, s.duration);
+    }
+  });
+  return Object.keys(totals).map(function(id){
+    const instr=findInstructor(id);
+    return {instructorId:id, name:instr? instr.name : 'Former instructor', minutes:totals[id].minutes, sessions:totals[id].sessions};
+  }).sort(function(a,b){ return b.minutes-a.minutes; });
 }
 
 // A brief handover between an outgoing and incoming student at a Pod's capacity boundary — e.g.
@@ -2985,7 +3025,10 @@ function saveAssignmentChange(podId, weekday, blockId){
     render();
     return;
   }
-  // an instructor can't cover two different Pods at an overlapping time, as of that date
+  // an instructor can't cover two different Pods at an overlapping time, as of that date — this is
+  // a PERMANENT weekly-schedule change, so no override is offered here; for a same-day-only fix, see
+  // the quick coverage override on the live "who's here right now" board instead (Sept 2026, per
+  // Allie: "I dont want it to be a permanent change, just a quick on the day change").
   for(const otherPodId in podSchedule){
     if(otherPodId===podId) continue;
     const clash=podBlocksForDay(otherPodId, weekday).find(function(ob){
@@ -4110,7 +4153,12 @@ function renderLiveOccupancyBoard(dayKey){
     html+='<div></div>'+podGroups.map(function(g){
       const cap=podCapacity(g.podId);
       const occupancy=g.entries.length;
-      return '<div class="cal-head">'+g.label+' <span class="badge '+(occupancy>=cap?'full':'available')+'" style="margin-left:4px">'+occupancy+'/'+cap+'</span></div>';
+      // Clickable only on the live (today) view — a quick coverage change only ever makes sense for
+      // today, and this board also does double duty rendering a past day's historical record, where
+      // there's nothing "quick" left to change (Sept 2026, per Allie: "maybe by clicking on th epod
+      // number under whos here right now").
+      const headAttrs = live? ' style="cursor:pointer" onclick="openQuickCoverageForm(\''+g.podId+'\')" title="Quick same-day coverage change"' : '';
+      return '<div class="cal-head"'+headAttrs+'>'+g.label+' <span class="badge '+(occupancy>=cap?'full':'available')+'" style="margin-left:4px">'+occupancy+'/'+cap+'</span></div>';
     }).join('');
     for(let seat=0; seat<maxCap; seat++){
       html+='<div class="cal-row-label small muted">Seat '+(seat+1)+'</div>';
@@ -4136,6 +4184,105 @@ function renderLiveOccupancyBoard(dayKey){
       +'</div>';
   }
   html+='</div>';
+  return html;
+}
+
+// Quick same-day-only coverage change, launched by clicking a Pod's header on the live "Who's here
+// right now" board just above (Sept 2026, per Allie: "I need a quick way to assign an instructor to
+// a pod, even if they're technically assigned to a different one" — then, once a first pass wired
+// this into the PERMANENT weekly Pod Assignment editor instead, corrected to: "I dont want it to be
+// a permanent change, just a quick on the day change - maybe by clicking on th epod number under
+// whos here right now"). Deliberately reuses the exact same oneOffCoverage mechanism a filled shift
+// coverage request writes into (fillCoverageRequest) rather than the dated `assignments` history a
+// permanent change uses — so it only ever affects today, the regular weekly assignment underneath is
+// left alone, and no formal coverageRequests record needs to exist first. The instructor list is
+// every active instructor, unrestricted by availability or an existing assignment elsewhere — same
+// "front desk is trusted" philosophy as assignCoverageManually() — since the whole point is
+// overriding a clash on the spot, not hunting through who's technically free.
+function openQuickCoverageForm(podId){
+  const today=simNow();
+  const weekday=WEEKDAY_KEYS[(today.getDay()+6)%7];
+  const blocks=podBlocksForDay(podId, weekday);
+  if(!blocks.length){ toast('No shift is scheduled for '+findPod(podId).name+' today.'); render(); return; }
+  const nowMin=nowMinutesOfDay();
+  // Prefer whichever shift block actually covers right now; if the click lands outside every
+  // block's hours (e.g. someone lingering past the end of their shift), fall back to the day's last
+  // block so there's still something sensible to change.
+  const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
+  const currentId=blockInstructorOn(block, today);
+  state.quickCoverageForm={podId:podId, weekday:weekday, blockId:block.id, instructorId:currentId||'', error:''};
+  render();
+}
+function closeQuickCoverageForm(){ state.quickCoverageForm=null; render(); }
+function setQuickCoverageField(field, value){
+  state.quickCoverageForm[field]=value;
+  state.quickCoverageForm.error='';
+  render();
+}
+function saveQuickCoverage(){
+  const f=state.quickCoverageForm;
+  if(!f.instructorId){ f.error='Choose an instructor.'; render(); return; }
+  const block=podBlocksForDay(f.podId, f.weekday).find(function(b){ return b.id===f.blockId; });
+  const today=simNow();
+  const todayKey=toKey(today);
+  const instr=findInstructor(f.instructorId);
+  block.oneOffCoverage=(block.oneOffCoverage||[]).filter(function(o){ return toKey(o.date)!==todayKey; });
+  block.oneOffCoverage.push({date:new Date(today), instructorId:f.instructorId});
+  dbWrite('recording a same-day coverage change', function(){
+    return supabaseClient.from('pod_shift_one_off_coverage').delete().eq('block_id', block.id).eq('the_date', todayKey).then(function(){
+      return supabaseClient.from('pod_shift_one_off_coverage').insert({block_id:block.id, the_date:todayKey, instructor_id:f.instructorId});
+    });
+  });
+  regenerateAllRecurring();
+  toast(instr.name+' is covering '+findPod(f.podId).name+' for today only — their regular schedule is unchanged.');
+  state.quickCoverageForm=null;
+  render();
+}
+// Undoes a same-day change made in error, falling back to whoever's actually assigned to the shift
+// on its regular dated schedule — a plain removal from oneOffCoverage rather than pushing a fresh
+// entry, so blockInstructorOn() resolves straight through to the underlying assignment again.
+function clearQuickCoverage(){
+  const f=state.quickCoverageForm;
+  const block=podBlocksForDay(f.podId, f.weekday).find(function(b){ return b.id===f.blockId; });
+  const todayKey=toKey(simNow());
+  const hadOverride=(block.oneOffCoverage||[]).some(function(o){ return toKey(o.date)===todayKey; });
+  if(!hadOverride){ state.quickCoverageForm=null; render(); return; }
+  block.oneOffCoverage=(block.oneOffCoverage||[]).filter(function(o){ return toKey(o.date)!==todayKey; });
+  dbWrite('clearing a same-day coverage change', function(){
+    return supabaseClient.from('pod_shift_one_off_coverage').delete().eq('block_id', block.id).eq('the_date', todayKey);
+  });
+  regenerateAllRecurring();
+  toast(findPod(f.podId).name+'’s regular schedule is back in effect for today.');
+  state.quickCoverageForm=null;
+  render();
+}
+function renderQuickCoverageModal(){
+  const f=state.quickCoverageForm;
+  if(!f) return '';
+  const pod=findPod(f.podId);
+  const block=podBlocksForDay(f.podId, f.weekday).find(function(b){ return b.id===f.blockId; });
+  const today=simNow();
+  const currentId=block? blockInstructorOn(block, today) : null;
+  const hasOverride=!!block && (block.oneOffCoverage||[]).some(function(o){ return toKey(o.date)===toKey(today); });
+  let html='<div class="overlay" onclick="if(event.target===this) closeQuickCoverageForm()"><div class="modal">';
+  html+='<h3>Quick coverage — '+pod.name+' today</h3>';
+  html+='<p>Puts someone else on this shift for today only'+(block? ' ('+rangeLabel(block.start,block.end-block.start)+')' : '')+' — the regular weekly assignment is untouched, and this reverts on its own tomorrow. Pick anyone; they don\'t need to already be free at this time.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+(currentId? findInstructor(currentId).name : 'Unassigned')+'</b>'+(hasOverride? ' <span class="small muted">(today\'s one-off change)</span>' : '')+'</div>';
+  html+='<div class="row2" style="align-items:flex-end">'
+    +'<div><label>Cover with</label><select onchange="setQuickCoverageField(\'instructorId\',this.value)">'
+      +'<option value="">Choose…</option>'
+      +instructors.filter(function(i){ return i.active!==false; }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(i){
+        return '<option value="'+i.id+'"'+(i.id===f.instructorId?' selected':'')+'>'+i.name+'</option>';
+      }).join('')
+    +'</select></div>'
+    +'<button class="btn sm primary" onclick="saveQuickCoverage()">Save</button>'
+  +'</div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:space-between">'
+    +(hasOverride? '<button class="btn sm ghost" onclick="clearQuickCoverage()">Revert to regular schedule</button>' : '<span></span>')
+    +'<button class="btn ghost" onclick="closeQuickCoverageForm()">Close</button>'
+  +'</div>';
+  html+='</div></div>';
   return html;
 }
 
@@ -4564,6 +4711,7 @@ function renderCheckedInPanel(){
     });
     html+='</table>';
   }
+  html+=renderQuickCoverageModal();
   html+='</div>';
   return html;
 }
@@ -5659,6 +5807,12 @@ function renderAttendanceLogModal(){
   html+='<p>Every past session for '+student.name+' — which Pod they sat in, who taught it, and what happened. Upcoming sessions aren\'t shown here. Front desk only.</p>';
   if(log.length===0){ html+='<div class="empty-note">No past sessions on file yet.</div>'; }
   else{
+    const timeSummary=instructorTimeSummary(studentId);
+    if(timeSummary.length){
+      html+='<div class="small muted" style="margin-bottom:10px">Time with each instructor: '
+        +timeSummary.map(function(t){ return '<b>'+t.name+'</b> — '+hoursMinutesLabel(t.minutes)+' ('+t.sessions+' session'+(t.sessions===1?'':'s')+')'; }).join(' · ')
+      +'</div>';
+    }
     html+='<div style="max-height:60vh;overflow-y:auto"><table><tr><th>Date</th><th>Time</th><th>Pod</th><th>Instructor</th><th>Status</th><th>Details</th></tr>';
     log.forEach(function(s){
       const pod=findPod(s.podId);
