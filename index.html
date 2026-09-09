@@ -2022,6 +2022,43 @@ function openBooking(podId, dateKey){
   render();
 }
 function closeBooking(){ state.booking=null; render(); }
+
+// Manually assigning a make-up session (Sept 2026, per Allie: "I need a button to manually assign
+// make-up sessions") — opens the exact same booking modal front desk already uses for any other
+// session, just pre-loaded for this credit's own student and tagged with the credit so confirming it
+// redeems the credit instead of leaving it available. Unlike the parent's own self-service make-up
+// picker (startBookMakeUp/openSlotsForCredit — a constrained list limited to the next 2 weeks, an
+// auto-picked Pod, and no choice of date beyond that list), this gives front desk the full ordinary
+// booking form: any date, any Pod or Online, editable length — for whenever a parent calls in and
+// asks staff to just sort it out directly, rather than doing it themselves online.
+function openBookingForCredit(creditId){
+  const credit=findCredit(creditId);
+  if(!credit || credit.status!=='available') return; // guards direct calls; the button itself only ever shows for an available credit
+  const student=findStudent(credit.studentId);
+  // Defaults to the nearest non-closed day from today (usually just today) — rolls forward day by
+  // day rather than leaving staff to land on a day the centre's marked closed and have to change it
+  // immediately; they can still pick any other date from the field below.
+  let d=simNow();
+  for(let i=0;i<14 && closedDayFor(d);i++){ d=addDays(d,1); }
+  const dateKey=toKey(d);
+  const dur=student.duration;
+  state.booking={dateKey, creditId};
+  state.bookingForm={studentId:student.id, duration:dur, start:possibleStarts(dur)[0], location:'', overrideOk:false, locationManual:false, checkInNow:false};
+  suggestBookingPod();
+  render();
+}
+// The booking modal's date field — only ever shown for a credit-based booking (see
+// renderBookingModal); an ordinary booking's date comes from wherever it was opened (a specific
+// day's "+ Book a session" button) and isn't editable in-modal at all.
+function setBookingDate(v){
+  if(new Date(v) < new Date(toKey(simNow()))){ toast("Can't book into the past."); return; }
+  const closure=closedDayFor(new Date(v));
+  if(closure){ toast("The centre's marked closed that day (\""+closure.label+"\") — pick a different date."); return; }
+  state.booking.dateKey=v;
+  state.bookingForm.overrideOk=false;
+  suggestBookingPod();
+  render();
+}
 // "They're here right now" — offered only for a same-day booking (see renderBookingModal): checks
 // the student in immediately after confirmBooking() creates the session, instead of leaving front
 // desk to find them in the Schedule list and click Check in separately a moment later. Exactly the
@@ -2100,6 +2137,17 @@ function checkInNewBookingNow(sess){
   applyCheckIn(sess, arrival, exitTime);
   return ' Checked in immediately — running '+minToLabel(sess.actualStart)+'–'+minToLabel(sess.actualEnd)+'.';
 }
+// Marks the credit a booking was made against as redeemed, once the session it's tied to actually
+// exists (mirrors what bookSlot() already does for the parent's own self-service flow) — a no-op
+// when this booking wasn't for a credit at all (the ordinary case).
+function redeemCreditForBooking(creditId, sessionId){
+  if(!creditId) return;
+  const credit=findCredit(creditId);
+  if(!credit) return;
+  credit.status='redeemed';
+  credit.redeemedSessionId=sessionId;
+  dbWrite('redeeming a make-up credit', function(){ return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sessionId}).eq('id', credit.id); });
+}
 function confirmBooking(){
   const b=state.booking; const f=state.bookingForm;
   if(!f.studentId || f.start==null) return;
@@ -2111,6 +2159,7 @@ function confirmBooking(){
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
   const end=f.start+f.duration;
   const checkInNow = !!f.checkInNow && dateKey===toKey(simNow());
+  const creditId=b.creditId||null;
 
   if(studentOverlapClash(student.id, dateKey, f.start, f.duration, null)){
     toast('Blocked — '+student.name+' already has an overlapping session that day.');
@@ -2126,13 +2175,14 @@ function confirmBooking(){
       toast('Blocked — this would put '+instr.name+"'s Online group over the combined ratio ("+peak+'/'+ONLINE_COMBINED_CAP+').');
       return;
     }
-    const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:null, instructorId:onlineInstructorId, instructorId2:null, handoff:null, online:true, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId:null};
+    const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:null, instructorId:onlineInstructorId, instructorId2:null, handoff:null, online:true, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId};
     sessions.push(newSess);
     dbWrite('booking an online session', function(){ return supabaseClient.from('sessions').insert({
       id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:newSess.instructorId, instructor_id_2:null, handoff_min:null, online:true,
       the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
     }); });
-    let msg=student.name+' booked into Online — '+instr.name+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+'.';
+    redeemCreditForBooking(creditId, newSess.id);
+    let msg=(creditId? 'Make-up booked — ' : '')+student.name+' booked into Online — '+instr.name+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+'.';
     if(checkInNow) msg+=checkInNewBookingNow(newSess);
     toast(msg);
     state.booking=null;
@@ -2143,13 +2193,14 @@ function confirmBooking(){
   // No Pod chosen at all — book it unassigned, same as any other slot nothing was staffed for
   // (5.10). Front desk can pick a Pod for it any time from the Schedule list.
   if(!pod){
-    const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:null, instructorId:null, instructorId2:null, handoff:null, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId:null};
+    const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:null, instructorId:null, instructorId2:null, handoff:null, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId};
     sessions.push(newSess);
     dbWrite('booking an unassigned session', function(){ return supabaseClient.from('sessions').insert({
       id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:null, instructor_id_2:null, handoff_min:null,
       the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
     }); });
-    let msg=student.name+' booked '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+' — no Pod chosen, pick one any time from the Schedule list.';
+    redeemCreditForBooking(creditId, newSess.id);
+    let msg=(creditId? 'Make-up booked — ' : '')+student.name+' booked '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+' — no Pod chosen, pick one any time from the Schedule list.';
     if(checkInNow) msg+=checkInNewBookingNow(newSess);
     toast(msg);
     state.booking=null;
@@ -2183,18 +2234,19 @@ function confirmBooking(){
     return;
   }
 
-  const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:pod.id, instructorId: cov.primaryInstructorId, instructorId2: cov.secondaryInstructorId, handoff: cov.handoffAt, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId:null};
+  const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:pod.id, instructorId: cov.primaryInstructorId, instructorId2: cov.secondaryInstructorId, handoff: cov.handoffAt, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId};
   sessions.push(newSess);
   dbWrite('booking a session', function(){ return supabaseClient.from('sessions').insert({
     id:newSess.id, student_id:newSess.studentId, pod_id:newSess.podId, instructor_id:newSess.instructorId,
     instructor_id_2:newSess.instructorId2, handoff_min:newSess.handoff, the_date:toKey(newSess.date),
     start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
   }); });
+  redeemCreditForBooking(creditId, newSess.id);
   const handoffNote = cov.secondaryInstructorId? (' with a handoff to '+findInstructor(cov.secondaryInstructorId).name+' at '+minToLabel(cov.handoffAt)) : '';
   const withNote = cov.primaryInstructorId? (' with '+findInstructor(cov.primaryInstructorId).name) : '';
   const gapNote = (cov.gapMinutes>0 && cov.ok)? (' ('+cov.gapMinutes+' min unattended — within the '+UNATTENDED_TOLERANCE_MIN+'-min tolerance)') : '';
   const capacityNote = overCapacityToday? (' — over capacity ('+wouldBePeak+'/'+cap+'), allowed since it\'s today') : '';
-  let msg=student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+gapNote+capacityNote+'.';
+  let msg=(creditId? 'Make-up booked — ' : '')+student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+gapNote+capacityNote+'.';
   if(checkInNow) msg+=checkInNewBookingNow(newSess);
   toast(msg);
   state.booking=null;
@@ -4788,12 +4840,24 @@ function renderBookingModal(){
   const overCapacity = (student && f.start!=null && pod) && !isTodayBooking && podCapacityBlocked(pod.id, b.dateKey, {start:f.start, duration:f.duration});
   const overCapacityButAllowedToday = (student && f.start!=null && pod) && isTodayBooking && wouldBePeak>cap;
 
+  const credit=b.creditId? findCredit(b.creditId) : null;
+
   let html='<div class="overlay" onclick="if(event.target===this) closeBooking()"><div class="modal">';
-  html+='<h3>Book a session — '+fmtShort(date)+'</h3>';
-  html+='<label>Student</label><select onchange="setBookingStudent(this.value)">'
-      +'<option value="">Choose a student…</option>'
-      +students.map(function(s){ return '<option value="'+s.id+'"'+(s.id===f.studentId?' selected':'')+'>'+s.name+' ('+yearLabel(s.year)+')</option>'; }).join('')
-      +'</select>';
+  html+='<h3>'+(credit? 'Book a make-up session' : ('Book a session — '+fmtShort(date)))+'</h3>';
+  if(credit){
+    // Manually assigning a make-up (Sept 2026, per Allie: "I need a button to manually assign
+    // make-up sessions") — the student is fixed to whoever the credit belongs to (a credit can't be
+    // reassigned to someone else here), and the date becomes an editable field instead of being
+    // fixed by wherever the modal was opened from, since this wasn't opened from any one day's
+    // Schedule view.
+    html+='<div class="banner info">📌 Booking a make-up for <b>'+student.name+'</b> — using their credit for the session missed '+fmtShort(credit.issuedDate)+' (expires '+fmtShort(credit.expiryDate)+').</div>';
+    html+='<label>Date</label><input type="date" value="'+b.dateKey+'" min="'+toKey(simNow())+'" max="'+toKey(addDays(simNow(),365))+'" onchange="setBookingDate(this.value)"/>';
+  } else {
+    html+='<label>Student</label><select onchange="setBookingStudent(this.value)">'
+        +'<option value="">Choose a student…</option>'
+        +students.map(function(s){ return '<option value="'+s.id+'"'+(s.id===f.studentId?' selected':'')+'>'+s.name+' ('+yearLabel(s.year)+')</option>'; }).join('')
+        +'</select>';
+  }
   html+='<div class="row2"><div><label>Length</label><select onchange="setBookingDuration(this.value)">'
       +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===f.duration?' selected':'')+'>'+d+' min</option>'; }).join('')
       +'</select></div>'
@@ -5426,8 +5490,13 @@ function renderCreditsReport(){
       : c.source==='closure'? 'Centre closure'
       : 'No-show';
     const removable = c.source==='manual' && c.status==='available';
+    // Manually assigning a make-up (Sept 2026, per Allie: "I need a button to manually assign
+    // make-up sessions") — offered for any available credit, not just manually-added ones, since a
+    // parent might call in about ANY kind of make-up (a no-show credit, an excused absence, etc.)
+    // and ask front desk to just book it for them rather than doing it themselves online.
+    const bookable = c.status==='available';
     html+='<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
-      +'<td>'+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
+      +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
   });
   html+='</table></div>';
   html+=renderAddCreditModal();
