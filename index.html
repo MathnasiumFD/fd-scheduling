@@ -744,6 +744,7 @@ var state={
   bookingForm:{studentId:'', duration:90, start:null, overrideOk:false},
   podAssignForm:null,
   quickCoverageForm:null,
+  quickMoveForm:null,
   parentBookingCreditId:null,
   newStudentForm:null,
   newInstructorForm:null,
@@ -2205,15 +2206,23 @@ function checkInNewBookingNow(sess){
   return ' Checked in immediately — running '+minToLabel(sess.actualStart)+'–'+minToLabel(sess.actualEnd)+'.';
 }
 // Marks the credit a booking was made against as redeemed, once the session it's tied to actually
-// exists (mirrors what bookSlot() already does for the parent's own self-service flow) — a no-op
-// when this booking wasn't for a credit at all (the ordinary case).
+// exists locally (mirrors what bookSlot() already does for the parent's own self-service flow) — a
+// no-op when this booking wasn't for a credit at all (the ordinary case). Updates local state right
+// away (optimistic, same as ever), but deliberately does NOT fire the remote write itself — it hands
+// the caller back a function that does, so the caller can chain it as a step AFTER the new session's
+// own insert has committed. credits.redeemed_session_id is a real foreign key to sessions(id): firing
+// the credit update as its own independent, unordered request (the old behaviour) raced the session's
+// insert, and whichever reached Postgres second could fail outright if the session row it points at
+// doesn't exist yet (Sept 2026, root cause of "makeup credits are not saving to server" when
+// redeeming one from the front desk's manual "assign make-up" flow — same class of bug already fixed
+// once for saveNewStudent's own parent/student ordering).
 function redeemCreditForBooking(creditId, sessionId){
-  if(!creditId) return;
+  if(!creditId) return null;
   const credit=findCredit(creditId);
-  if(!credit) return;
+  if(!credit) return null;
   credit.status='redeemed';
   credit.redeemedSessionId=sessionId;
-  dbWrite('redeeming a make-up credit', function(){ return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sessionId}).eq('id', credit.id); });
+  return function(){ return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sessionId}).eq('id', credit.id); };
 }
 function confirmBooking(){
   const b=state.booking; const f=state.bookingForm;
@@ -2244,11 +2253,16 @@ function confirmBooking(){
     }
     const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:null, instructorId:onlineInstructorId, instructorId2:null, handoff:null, online:true, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId};
     sessions.push(newSess);
-    dbWrite('booking an online session', function(){ return supabaseClient.from('sessions').insert({
+    // redeemCreditForBooking() updates the local credit right away but hands back its remote write
+    // rather than firing it — chained here as a step AFTER the session insert resolves, since
+    // credits.redeemed_session_id is a real foreign key to sessions(id) and firing both as
+    // independent, unordered requests could have the credit update reach Postgres first and fail
+    // against a session row that doesn't exist yet (Sept 2026 fix).
+    const redeemWrite=redeemCreditForBooking(creditId, newSess.id);
+    dbWrite('booking an online session'+(redeemWrite? ' and redeeming its make-up credit':''), function(){ return supabaseClient.from('sessions').insert({
       id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:newSess.instructorId, instructor_id_2:null, handoff_min:null, online:true,
       the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
-    }); });
-    redeemCreditForBooking(creditId, newSess.id);
+    }).then(function(r){ return (r.error || !redeemWrite)? r : redeemWrite(); }); });
     let msg=(creditId? 'Make-up booked — ' : '')+student.name+' booked into Online — '+instr.name+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+'.';
     if(checkInNow) msg+=checkInNewBookingNow(newSess);
     toast(msg);
@@ -2262,11 +2276,12 @@ function confirmBooking(){
   if(!pod){
     const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:null, instructorId:null, instructorId2:null, handoff:null, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId};
     sessions.push(newSess);
-    dbWrite('booking an unassigned session', function(){ return supabaseClient.from('sessions').insert({
+    // See the Online branch above for why this is chained rather than fired independently.
+    const redeemWrite=redeemCreditForBooking(creditId, newSess.id);
+    dbWrite('booking an unassigned session'+(redeemWrite? ' and redeeming its make-up credit':''), function(){ return supabaseClient.from('sessions').insert({
       id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:null, instructor_id_2:null, handoff_min:null,
       the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
-    }); });
-    redeemCreditForBooking(creditId, newSess.id);
+    }).then(function(r){ return (r.error || !redeemWrite)? r : redeemWrite(); }); });
     let msg=(creditId? 'Make-up booked — ' : '')+student.name+' booked '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+' — no Pod chosen, pick one any time from the Schedule list.';
     if(checkInNow) msg+=checkInNewBookingNow(newSess);
     toast(msg);
@@ -2303,12 +2318,13 @@ function confirmBooking(){
 
   const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:pod.id, instructorId: cov.primaryInstructorId, instructorId2: cov.secondaryInstructorId, handoff: cov.handoffAt, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId};
   sessions.push(newSess);
-  dbWrite('booking a session', function(){ return supabaseClient.from('sessions').insert({
+  // See the Online branch above for why this is chained rather than fired independently.
+  const redeemWrite=redeemCreditForBooking(creditId, newSess.id);
+  dbWrite('booking a session'+(redeemWrite? ' and redeeming its make-up credit':''), function(){ return supabaseClient.from('sessions').insert({
     id:newSess.id, student_id:newSess.studentId, pod_id:newSess.podId, instructor_id:newSess.instructorId,
     instructor_id_2:newSess.instructorId2, handoff_min:newSess.handoff, the_date:toKey(newSess.date),
     start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
-  }); });
-  redeemCreditForBooking(creditId, newSess.id);
+  }).then(function(r){ return (r.error || !redeemWrite)? r : redeemWrite(); }); });
   const handoffNote = cov.secondaryInstructorId? (' with a handoff to '+findInstructor(cov.secondaryInstructorId).name+' at '+minToLabel(cov.handoffAt)) : '';
   const withNote = cov.primaryInstructorId? (' with '+findInstructor(cov.primaryInstructorId).name) : '';
   const gapNote = (cov.gapMinutes>0 && cov.ok)? (' ('+cov.gapMinutes+' min unattended — within the '+UNATTENDED_TOLERANCE_MIN+'-min tolerance)') : '';
@@ -2842,13 +2858,20 @@ function bookSlot(creditId, dateKey, start, duration, podId, instructorId){
   const student=findStudent(credit.studentId);
   const sess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId, instructorId, date:new Date(dateKey), start:Number(start), duration:Number(duration), status:'scheduled', bookedBy:'parent', creditId};
   sessions.push(sess);
-  dbWrite('booking a make-up session', function(){ return supabaseClient.from('sessions').insert({
-    id:sess.id, student_id:sess.studentId, pod_id:sess.podId, instructor_id:sess.instructorId, the_date:toKey(sess.date),
-    start_min:sess.start, duration:sess.duration, status:sess.status, booked_by:sess.bookedBy, credit_id:sess.creditId
-  }); });
   credit.status='redeemed';
   credit.redeemedSessionId=sess.id;
-  dbWrite('redeeming a make-up credit', function(){ return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sess.id}).eq('id', credit.id); });
+  // Chained as a step AFTER the session insert resolves, rather than fired as its own independent
+  // request — credits.redeemed_session_id is a real foreign key to sessions(id), so the two used to
+  // race: whichever reached Postgres second could fail outright if the other hadn't committed yet
+  // (Sept 2026, same root cause as confirmBooking()'s own credit redemption and the earlier
+  // saveNewStudent fix — just for the parent's self-service make-up flow this time).
+  dbWrite('booking a make-up session and redeeming its credit', function(){ return supabaseClient.from('sessions').insert({
+    id:sess.id, student_id:sess.studentId, pod_id:sess.podId, instructor_id:sess.instructorId, the_date:toKey(sess.date),
+    start_min:sess.start, duration:sess.duration, status:sess.status, booked_by:sess.bookedBy, credit_id:sess.creditId
+  }).then(function(r){
+    if(r.error) return r;
+    return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sess.id}).eq('id', credit.id);
+  }); });
   state.parentBookingCreditId=null;
   toast('Make-up booked for '+fmtShort(sess.date)+', '+rangeLabel(sess.start,sess.duration)+'.');
 }
@@ -4091,8 +4114,11 @@ function rosterTableHtml(rows, weekday, dayKey, now){
 // Allie: "as the students get checked into a pod, we are able to see them in that pod... as they
 // leave theres a spot again... i just need it to say the kids name and the time they leave".
 // Deliberately much lighter than the full-day roster in renderPodSummaryStrip just below it (no
-// year, no status, no move/action controls) — this is meant to be read at a glance, not worked
-// from; corrections to a checked-in/exit time still happen on the "Checked in today" panel above.
+// year, no status) — this is meant to be read at a glance, not worked from; corrections to a
+// checked-in/exit time still happen on the "Checked in today" panel above. A student's own name IS
+// still clickable, though (Sept 2026, per Allie: "if i click on a kid's name in the whos here right
+// now box, it allows me to change the pod they are sitting in for today") — see openQuickMoveForm(),
+// wired up by the renderer below using the sessionId carried on each entry here.
 // Same live-vs-historical rule as checkedInNamesByPod(): today shows who's still actually present
 // (checked out students drop off immediately), any other day shows that whole day's attended record.
 function liveOccupancyGroups(dayKey){
@@ -4103,7 +4129,7 @@ function liveOccupancyGroups(dayKey){
     if(live && s.checkedOut) return;
     const student=findStudent(s.studentId);
     if(!student) return;
-    const entry={name:student.name, exit:s.actualEnd};
+    const entry={name:student.name, exit:s.actualEnd, sessionId:s.id};
     if(s.online){ (byOnlineInstr[s.instructorId]=byOnlineInstr[s.instructorId]||[]).push(entry); }
     else if(s.podId){ (byPod[s.podId]=byPod[s.podId]||[]).push(entry); }
   });
@@ -4185,8 +4211,15 @@ function renderLiveOccupancyBoard(dayKey){
         const cap=podCapacity(g.podId);
         if(seat>=cap) return '<div></div>'; // this Pod's capacity is narrower than the widest column needs
         const entry=g.entries[seat];
+        // A student's own name is clickable on the live (today) view only — same "only makes sense
+        // for today" rule as the Pod header's quick coverage change just above (Sept 2026, per
+        // Allie: "if i click on a kid's name in the whos here right now box, it allows me to change
+        // the pod they are sitting in for today"). A past day's record is just that — a record.
+        const nameHtml = (live && entry)
+          ? '<a href="#" onclick="openQuickMoveForm(\''+entry.sessionId+'\');return false;" style="color:inherit" title="Move to a different Pod, today only">'+entry.name+'</a>'
+          : (entry? entry.name : '');
         return entry
-          ? '<div class="avail-cell full-cell">'+entry.name+'<br><span class="small">'+(entry.exit!=null? minToLabel(entry.exit) : '—')+'</span></div>'
+          ? '<div class="avail-cell full-cell">'+nameHtml+'<br><span class="small">'+(entry.exit!=null? minToLabel(entry.exit) : '—')+'</span></div>'
           : '<div class="avail-cell on">Open</div>';
       }).join('');
     }
@@ -4197,12 +4230,61 @@ function renderLiveOccupancyBoard(dayKey){
       +onlineGroups.map(function(g){
         return '<div style="min-width:150px"><h4 style="margin:0 0 4px 0">'+g.label+'</h4>'
           +'<table><tr><th>Student</th><th>Leaves</th></tr>'
-          +g.entries.map(function(e){ return '<tr><td>'+e.name+'</td><td>'+(e.exit!=null? minToLabel(e.exit) : '—')+'</td></tr>'; }).join('')
+          +g.entries.map(function(e){
+            const nameHtml = live
+              ? '<a href="#" onclick="openQuickMoveForm(\''+e.sessionId+'\');return false;" style="color:inherit" title="Move to a different Pod, today only">'+e.name+'</a>'
+              : e.name;
+            return '<tr><td>'+nameHtml+'</td><td>'+(e.exit!=null? minToLabel(e.exit) : '—')+'</td></tr>';
+          }).join('')
           +'</table></div>';
       }).join('')
       +'</div>';
   }
   html+='</div>';
+  return html;
+}
+
+// Quick same-day-only Pod (or Online) move, launched by clicking a student's own name on the live
+// "Who's here right now" board just above (Sept 2026, per Allie: "if i click on a kid's name in the
+// whos here right now box, it allows me to change the pod they are sitting in for today"). This
+// isn't a new mechanism — it hands straight off to setSessionLocation(), the exact same one-off,
+// this-session-only mover every other Pod/Online picker in the app already uses (the Schedule list
+// row, the check-in modal, the booking modal) — so capacity/coverage rules, the confirmation toast,
+// and the remote write are all identical to picking the same student's row from any of those; this
+// is purely a faster entry point to it, straight from the board where front desk is already looking.
+function openQuickMoveForm(sessionId){
+  if(!findSession(sessionId)) return;
+  state.quickMoveForm={sessionId};
+  render();
+}
+function closeQuickMoveForm(){ state.quickMoveForm=null; render(); }
+// The dropdown's own onchange — closes the little popover immediately (a single choice, not a form
+// to review and submit) and hands off to setSessionLocation() for the actual move.
+function chooseQuickMove(sessionId, value){
+  state.quickMoveForm=null;
+  setSessionLocation(sessionId, value);
+}
+function renderQuickMoveModal(){
+  const f=state.quickMoveForm;
+  if(!f) return '';
+  const sess=findSession(f.sessionId);
+  if(!sess) return ''; // the session vanished from under the open popover (checked out, cancelled elsewhere) — nothing left to move
+  const student=findStudent(sess.studentId);
+  const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
+  const dateKey=toKey(sess.date);
+  const currentValue=sessionLocationValue(sess);
+  const currentLabel=sess.online? ('Online — '+findInstructor(sess.instructorId).name) : (sess.podId? findPod(sess.podId).name : 'Unassigned');
+  let html='<div class="overlay" onclick="if(event.target===this) closeQuickMoveForm()"><div class="modal">';
+  html+='<h3>Move '+student.name+' — today</h3>';
+  html+='<p>Currently: <b>'+currentLabel+'</b>. Picking a different Pod (or Online) below moves them right now, for today only — their regular schedule is unaffected.</p>';
+  html+='<div><label>Move to</label><select onchange="chooseQuickMove(\''+sess.id+'\',this.value)">'
+    +'<option value=""'+(currentValue===''?' selected':'')+'>Unassigned</option>'
+    +locationOptionsHtml(weekday, dateKey, sess.start, sess.duration, currentValue, sess.id)
+  +'</select></div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeQuickMoveForm()">Close</button>'
+  +'</div>';
+  html+='</div></div>';
   return html;
 }
 
@@ -4731,6 +4813,7 @@ function renderCheckedInPanel(){
     html+='</table>';
   }
   html+=renderQuickCoverageModal();
+  html+=renderQuickMoveModal();
   html+='</div>';
   return html;
 }
