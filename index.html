@@ -1900,7 +1900,16 @@ function resolveStandingLocation(studentId, weekday, dateKey, date, start, durat
   const podId=pickBestPod(weekday, dateKey, start, duration, year, pinnedPodId);
   return {podId:podId||null, online:false, instructorId:null};
 }
-function generateRecurringSessions(student, weeksAhead){
+// deferredSessions is optional — when the caller passes an array, a newly-created occurrence's
+// remote insert is pushed onto it instead of being fired immediately here (its LOCAL session object
+// is still created and pushed onto `sessions` either way, so the UI updates exactly as before). Used
+// by saveNewStudent() specifically: this function normally runs safely because the student it's
+// generating for already exists in Supabase, but for a BRAND NEW student, firing these session
+// inserts immediately races the student's own not-yet-committed insert — sessions.student_id is a
+// real foreign key, so whichever request reaches Postgres first can make the other fail (Sept 2026,
+// root cause of "when adding a student i'm getting an error code" / "...may not have saved").
+// Deferring lets the caller insert them only once the student row is confirmed to exist.
+function generateRecurringSessions(student, weeksAhead, deferredSessions){
   const startMonday=getMonday(simNow());
   let created=0;
   for(let w=0; w<weeksAhead; w++){
@@ -1953,12 +1962,16 @@ function generateRecurringSessions(student, weeksAhead){
       const cov=loc.podId? podCoverageDetail(loc.podId, weekday, slot.start, student.duration, date) : {primaryInstructorId: loc.online? loc.instructorId : null, secondaryInstructorId:null, handoffAt:null}; // tolerant of a short unattended gap (UNATTENDED_TOLERANCE_MIN), same as pickBestPod just validated
       const recSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:loc.podId||null, online:!!loc.online, instructorId:cov.primaryInstructorId, instructorId2:cov.secondaryInstructorId, handoff:cov.handoffAt, date, start:slot.start, duration:student.duration, status:'scheduled', bookedBy:'staff', creditId:null, recurring:true};
       sessions.push(recSess);
-      dbWrite('pre-booking a standing session', function(){ return supabaseClient.from('sessions').insert({
-        id:recSess.id, student_id:recSess.studentId, pod_id:recSess.podId, online:recSess.online, instructor_id:recSess.instructorId,
-        instructor_id_2:recSess.instructorId2, handoff_min:recSess.handoff,
-        the_date:toKey(recSess.date), start_min:recSess.start, duration:recSess.duration, status:recSess.status,
-        booked_by:recSess.bookedBy, credit_id:recSess.creditId, is_recurring:true
-      }); });
+      if(deferredSessions){
+        deferredSessions.push(recSess);
+      } else {
+        dbWrite('pre-booking a standing session', function(){ return supabaseClient.from('sessions').insert({
+          id:recSess.id, student_id:recSess.studentId, pod_id:recSess.podId, online:recSess.online, instructor_id:recSess.instructorId,
+          instructor_id_2:recSess.instructorId2, handoff_min:recSess.handoff,
+          the_date:toKey(recSess.date), start_min:recSess.start, duration:recSess.duration, status:recSess.status,
+          booked_by:recSess.bookedBy, credit_id:recSess.creditId, is_recurring:true
+        }); });
+      }
       created++;
     });
   }
@@ -3305,6 +3318,13 @@ function saveNewStudent(){
   }
   if(!f.year){ f.error='Choose a school year.'; render(); return; }
   let parentId=null;
+  // Set only when creating a brand-new parent alongside this student — its actual remote insert is
+  // deferred and chained as the FIRST step of the student's own dbWrite below (see there for why:
+  // students.parent_id is a real foreign key to parents(id), and firing these as two independent,
+  // unordered requests risked the student's insert reaching Postgres before the parent's had
+  // committed, failing on that foreign key — Sept 2026, root cause of "when adding a student i'm
+  // getting an error code" / "it still says change is visible here but may not have saved").
+  let newParentInsert=null;
   if(f.parentMode==='existing'){
     if(!f.parentId){ f.error='Choose a parent, or switch to “New parent”.'; render(); return; }
     parentId=f.parentId;
@@ -3323,7 +3343,7 @@ function saveNewStudent(){
     }
     const newParent={id:newId()||('p'+(nextParentId++)), name:f.parentName.trim(), email:f.parentEmail.trim(), studentIds:[]};
     parents.push(newParent);
-    dbWrite('adding a new parent', function(){ return supabaseClient.from('parents').insert({id:newParent.id, name:newParent.name, email:newParent.email}); });
+    newParentInsert=function(){ return supabaseClient.from('parents').insert({id:newParent.id, name:newParent.name, email:newParent.email}); };
     parentId=newParent.id;
   }
   const newStudent={id:newId()||('s'+(nextStudentId++)), name:f.studentName.trim(), year:Number(f.year), baseYear:Number(f.year), yearBaseline:schoolYearIndex(simNow()), duration:Number(f.duration), sessionsPerWeek:Number(f.sessionsPerWeek), parentId, recurring:f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; }), holds:[]};
@@ -3350,21 +3370,44 @@ function saveNewStudent(){
     .map(function(r){ return {podId:r.preferredPodId, effectiveFrom:new Date(toKey(simNow())), weekday:r.weekday}; });
   if(preferredPodAssignments.length) newStudent.podAssignments=preferredPodAssignments;
   students.push(newStudent);
-  dbWrite('enrolling a new student', function(){ return supabaseClient.from('students').insert({
-    id:newStudent.id, parent_id:newStudent.parentId, name:newStudent.name, year:newStudent.year, base_year:newStudent.baseYear,
-    year_baseline:newStudent.yearBaseline, duration:newStudent.duration, sessions_per_week:newStudent.sessionsPerWeek
-  }).then(function(r){
-    if(r.error || !newStudent.recurring.length) return r;
-    return supabaseClient.from('student_recurring_slots').insert(newStudent.recurring.map(function(rec){ return {student_id:newStudent.id, weekday:rec.weekday, start_min:rec.start}; }));
-  }).then(function(r){
-    if(r.error || !newStudent.podAssignments || !newStudent.podAssignments.length) return r;
-    return supabaseClient.from('student_pod_assignments').insert(newStudent.podAssignments.map(function(a){
-      return {student_id:newStudent.id, pod_id:a.podId, effective_from:toKey(a.effectiveFrom), weekday:a.weekday};
-    }));
-  }); });
+  // Every remote write below is chained into ONE ordered sequence — parent (if new) -> student ->
+  // recurring slots -> pod assignments -> the recurring sessions generateRecurringSessions() creates
+  // further down — rather than each firing as its own independent, unordered request. Several of
+  // these reference the row before them as a real foreign key (parent_id, student_id), so an
+  // out-of-order arrival at Postgres previously meant an otherwise-successful enrollment could still
+  // fail here with a foreign-key violation (Sept 2026 fix — see newParentInsert/deferredSessions
+  // above). Purely a remote-persistence-ordering fix: every local/optimistic update below (pushing to
+  // `students`, generating sessions into `sessions`, the toast) still happens immediately, same as always.
+  const deferredSessions=[];
+  dbWrite('enrolling a new student', function(){
+    const afterParent = newParentInsert? newParentInsert() : Promise.resolve({error:null});
+    return afterParent.then(function(r){
+      if(r && r.error) return r;
+      return supabaseClient.from('students').insert({
+        id:newStudent.id, parent_id:newStudent.parentId, name:newStudent.name, year:newStudent.year, base_year:newStudent.baseYear,
+        year_baseline:newStudent.yearBaseline, duration:newStudent.duration, sessions_per_week:newStudent.sessionsPerWeek
+      });
+    }).then(function(r){
+      if(r.error || !newStudent.recurring.length) return r;
+      return supabaseClient.from('student_recurring_slots').insert(newStudent.recurring.map(function(rec){ return {student_id:newStudent.id, weekday:rec.weekday, start_min:rec.start}; }));
+    }).then(function(r){
+      if(r.error || !newStudent.podAssignments || !newStudent.podAssignments.length) return r;
+      return supabaseClient.from('student_pod_assignments').insert(newStudent.podAssignments.map(function(a){
+        return {student_id:newStudent.id, pod_id:a.podId, effective_from:toKey(a.effectiveFrom), weekday:a.weekday};
+      }));
+    }).then(function(r){
+      if(r.error || !deferredSessions.length) return r;
+      return supabaseClient.from('sessions').insert(deferredSessions.map(function(s){ return {
+        id:s.id, student_id:s.studentId, pod_id:s.podId, online:s.online, instructor_id:s.instructorId,
+        instructor_id_2:s.instructorId2, handoff_min:s.handoff,
+        the_date:toKey(s.date), start_min:s.start, duration:s.duration, status:s.status,
+        booked_by:s.bookedBy, credit_id:s.creditId, is_recurring:true
+      }; }));
+    });
+  });
   const parent=parents.find(function(p){ return p.id===parentId; });
   parent.studentIds.push(newStudent.id);
-  const made=generateRecurringSessions(newStudent, HORIZON_WEEKS);
+  const made=generateRecurringSessions(newStudent, HORIZON_WEEKS, deferredSessions);
   const uncovered=slotsWithoutCoverage(newStudent.recurring, newStudent.duration, newStudent.year);
   if(uncovered.length){
     toast(newStudent.name+' enrolled, but no Pod '+newStudent.name+' qualifies for (by age) is currently staffed for '+describeUncoveredSlots(uncovered)+' — 0 session(s) could be pre-booked for that time yet. Assign coverage on the Schedule tab, then reopen '+newStudent.name+'\'s regular schedule and save it again.', 9000);
