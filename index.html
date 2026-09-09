@@ -860,13 +860,23 @@ function sessionsInvolvingInstructor(instructorId, dateKey){
   return sessions.filter(s=> (s.instructorId===instructorId || s.instructorId2===instructorId) && toKey(s.date)===dateKey && s.status!=='cancelled');
 }
 
-// A student's full attendance history — every session ever booked for them, regardless of status,
-// most recent first — showing exactly which Pod they sat in and which instructor(s) covered it.
+// A student's attendance HISTORY — every past session on file for them, most recent first,
+// showing exactly which Pod they sat in and which instructor(s) covered it. Excludes anything
+// still genuinely upcoming — 'scheduled' and dated today or later (Sept 2026, per Allie: "I want
+// student history to only show past sessions, not upcoming"). Anything already resolved one way
+// or another (attended, no-show, excused, cancelled) still counts as history and stays visible
+// even if it happens to be dated in the future — cancelling a future session, say, resolves it;
+// it's not "upcoming" any more, and history should never quietly lose that record. Only a still-
+// pending 'scheduled' session dated today or later counts as "upcoming".
 // Front-desk only (5.5): instructors only ever see today's checked-in roster at their own Pod
 // (5.13), and parents never see Pod/instructor detail at all (5.7) — this is the one place the
 // full where-and-with-whom history lives, and it's deliberately not exposed anywhere else.
 function studentAttendanceLog(studentId){
-  return sessions.filter(function(s){ return s.studentId===studentId; })
+  const todayKey=toKey(simNow());
+  return sessions.filter(function(s){
+    if(s.studentId!==studentId) return false;
+    return !(s.status==='scheduled' && toKey(s.date)>=todayKey);
+  })
     .slice()
     .sort(function(a,b){ return b.date-a.date || b.start-a.start; });
 }
@@ -4011,10 +4021,10 @@ function sessionRowHtml(sess, weekday, dayKey, now){
   return html;
 }
 // Checked-in students first, then whoever's still to arrive — each half keeping the same
-// alphabetical-by-name order scheduleListForDay() already sorted `rows` into (Sept 2026, per
-// Allie: "split the ones that are checked in at the top, and the ones to come after at the
-// bottom... alphabetically sorted per section"). A no-show is neither — it's grouped with "still
-// to arrive" since it never actually checked in, same as a plain scheduled session.
+// arrival-time order scheduleListForDay() already sorted `rows` into (originally alphabetical by
+// name, per Allie's 5.35 request; changed Sept 2026 per a later Allie request to order by arrival
+// instead — see scheduleListForDay()'s own comment). A no-show is neither — it's grouped with
+// "still to arrive" since it never actually checked in, same as a plain scheduled session.
 function rosterTableHtml(rows, weekday, dayKey, now){
   const checkedIn=rows.filter(function(s){ return s.status==='attended'; });
   const upcoming=rows.filter(function(s){ return s.status!=='attended'; });
@@ -4180,16 +4190,22 @@ function renderPodSummaryStrip(dayKey, weekday){
 }
 
 // Every student expected on a given day, across every Pod (and Unassigned) at once — replaces the
-// old per-Pod roster loop (Sept 2026). Alphabetical by student name, same convention as the old
-// per-Pod rosters used (easier to scan and find a specific kid than sorting by time), start time as
-// the tie-break.
+// old per-Pod roster loop (Sept 2026). Originally sorted alphabetically by student name; changed
+// Sept 2026 (per Allie: "can we arrange pod scheduling permanent changes to be by order of
+// arrival, not alphabetical") to sort by arrival time instead — a student already checked in sorts
+// by when they actually arrived (actualStart), everyone else by their scheduled start time, so the
+// list reads top-to-bottom as "who's here/coming first". Student name is now only a tie-break for
+// two sessions landing at the exact same time.
 function scheduleListForDay(dayKey){
   return sessions.filter(function(s){ return toKey(s.date)===dayKey && s.status!=='cancelled'; })
     .slice()
     .sort(function(a,b){
+      const aTime=(a.status==='attended' && a.actualStart!=null)? a.actualStart : a.start;
+      const bTime=(b.status==='attended' && b.actualStart!=null)? b.actualStart : b.start;
+      if(aTime!==bTime) return aTime-bTime;
       const an=findStudent(a.studentId), bn=findStudent(b.studentId);
       if(!an || !bn) return 0;
-      return an.name.localeCompare(bn.name, undefined, {sensitivity:'base'}) || a.start-b.start;
+      return an.name.localeCompare(bn.name, undefined, {sensitivity:'base'});
     });
 }
 
@@ -5636,8 +5652,8 @@ function renderAttendanceLogModal(){
   const log=studentAttendanceLog(studentId);
   let html='<div class="overlay" onclick="if(event.target===this) closeAttendanceLog()"><div class="modal" style="max-width:720px">';
   html+='<h3>Attendance log — '+student.name+'</h3>';
-  html+='<p>Every session on file for '+student.name+' — which Pod they sat in, who taught it, and what happened. Front desk only.</p>';
-  if(log.length===0){ html+='<div class="empty-note">No sessions on file yet.</div>'; }
+  html+='<p>Every past session for '+student.name+' — which Pod they sat in, who taught it, and what happened. Upcoming sessions aren\'t shown here. Front desk only.</p>';
+  if(log.length===0){ html+='<div class="empty-note">No past sessions on file yet.</div>'; }
   else{
     html+='<div style="max-height:60vh;overflow-y:auto"><table><tr><th>Date</th><th>Time</th><th>Pod</th><th>Instructor</th><th>Status</th><th>Details</th></tr>';
     log.forEach(function(s){
