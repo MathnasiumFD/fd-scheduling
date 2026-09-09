@@ -861,13 +861,16 @@ function sessionsInvolvingInstructor(instructorId, dateKey){
 }
 
 // A student's attendance HISTORY — every past session on file for them, most recent first,
-// showing exactly which Pod they sat in and which instructor(s) covered it. Excludes anything
-// still genuinely upcoming — 'scheduled' and dated today or later (Sept 2026, per Allie: "I want
-// student history to only show past sessions, not upcoming"). Anything already resolved one way
-// or another (attended, no-show, excused, cancelled) still counts as history and stays visible
-// even if it happens to be dated in the future — cancelling a future session, say, resolves it;
-// it's not "upcoming" any more, and history should never quietly lose that record. Only a still-
-// pending 'scheduled' session dated today or later counts as "upcoming".
+// showing exactly which Pod they sat in and which instructor(s) covered it (Sept 2026, per Allie:
+// "I want student history to only show past sessions, not upcoming" — then, after a pass that kept
+// an already-resolved FUTURE session like a cancellation visible, "no, don't show them as
+// cancelled, just don't show them at all"). Anything dated strictly before today is history,
+// regardless of status. A session dated exactly today counts as history too, but only once it's
+// been resolved one way or another (attended/no-show/excused/cancelled) — a same-day session
+// front desk just marked excused, say, needs to show up here right away, not tomorrow. Anything
+// dated today or later that's still plain 'scheduled' is genuinely upcoming and stays hidden, and
+// any FUTURE-dated session is hidden outright no matter its status — resolving it early doesn't
+// earn it a spot in "history" before its date has actually arrived.
 // Front-desk only (5.5): instructors only ever see today's checked-in roster at their own Pod
 // (5.13), and parents never see Pod/instructor detail at all (5.7) — this is the one place the
 // full where-and-with-whom history lives, and it's deliberately not exposed anywhere else.
@@ -875,7 +878,8 @@ function studentAttendanceLog(studentId){
   const todayKey=toKey(simNow());
   return sessions.filter(function(s){
     if(s.studentId!==studentId) return false;
-    return !(s.status==='scheduled' && toKey(s.date)>=todayKey);
+    const sessKey=toKey(s.date);
+    return sessKey<todayKey || (sessKey===todayKey && s.status!=='scheduled');
   })
     .slice()
     .sort(function(a,b){ return b.date-a.date || b.start-a.start; });
