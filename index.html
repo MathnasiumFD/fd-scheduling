@@ -836,9 +836,14 @@ function nowMinutesOfDay(){
 }
 // A short "time until pickup" label + badge color for a checked-in student, measured against
 // their recorded exit time (defaulted at check-in, or since adjusted by staff).
-function countdownInfo(exitMinute){
+// soonThreshold (minutes) defaults to 10 — the front desk's own Checked-in-today panel. The
+// instructor's "My Pod today" view passes 5 instead (Sept 2026, per Allie: "can the countdown not
+// turn orange until 5 minutes instead of 10") — it's their own students, right in front of them, so
+// they don't need as much lead time as front desk juggling the whole centre.
+function countdownInfo(exitMinute, soonThreshold){
+  const threshold = soonThreshold==null ? 10 : soonThreshold;
   const diff=exitMinute-nowMinutesOfDay();
-  if(diff>10){
+  if(diff>threshold){
     const h=Math.floor(diff/60), m=diff%60;
     return {label:'Leaves in '+(h>0? h+'h'+(m? ' '+m+'m':'') : m+' min'), cls:'available'};
   }
@@ -6026,11 +6031,20 @@ function instructorPodIdsToday(instructorId){
 function checkedInAtInstructorPodToday(instructorId){
   const todayKey=toKey(simNow());
   const myPodIds=instructorPodIdsToday(instructorId);
+  // Ordered by exit time, soonest-leaving first (Sept 2026, per Allie: "can the students be shown
+  // ordered by exit time, not alphabetical") — same convention the front desk's own live board
+  // already uses (see sortEntries() in liveOccupancyGroups()), so an instructor sees who's about to
+  // need checking out right at the top of their own list, rather than everyone in whatever order
+  // they happened to check in.
   return sessions.filter(function(s){
     if(s.status!=='attended' || toKey(s.date)!==todayKey || s.checkedOut) return false;
     if(s.online) return s.instructorId===instructorId;
     return myPodIds.indexOf(s.podId)>-1;
-  }).sort(function(a,b){ return a.start-b.start; });
+  }).sort(function(a,b){
+    const ea = a.actualEnd!=null? a.actualEnd : a.start+a.duration;
+    const eb = b.actualEnd!=null? b.actualEnd : b.start+b.duration;
+    return ea-eb;
+  });
 }
 
 /* ---------- shift coverage requests ---------- */
@@ -6208,7 +6222,7 @@ function renderInstructor(){
         const student=findStudent(s.studentId);
         const pod=findPod(s.podId);
         const locLabel=s.online? 'Online' : (pod? pod.name : '—');
-        const cd=countdownInfo(s.actualEnd!=null? s.actualEnd : s.start+s.duration);
+        const cd=countdownInfo(s.actualEnd!=null? s.actualEnd : s.start+s.duration, 5);
         // Actual (check-in-adjusted) times, not the original scheduled window — this row is only
         // ever a student who's already checked in (checkedInAtInstructorPodToday() filters to
         // status==='attended'), so actualStart/actualEnd are always set by then. Previously showed
