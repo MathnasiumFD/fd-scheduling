@@ -6213,6 +6213,17 @@ function renderInstructor(){
 
   const myPodIdsToday=instructorPodIdsToday(instr.id);
   const checkedInAtMyPods=checkedInAtInstructorPodToday(instr.id);
+  // A lone student turning orange at 5 minutes is plenty of notice; a genuine rush — 3 or more
+  // leaving at the exact same time — needs the earlier 10-minute warning instead, since that's a
+  // few check-outs to get through at once (Sept 2026, per Allie: "if you have 3 or more students
+  // leaving at the same time, can it go orange with 10 min to go, 5 min otherwise"). Grouped by
+  // each student's own actual exit time (not their scheduled one), same value the countdown itself
+  // is built from.
+  const exitTimeCounts={};
+  checkedInAtMyPods.forEach(function(s){
+    const exit=s.actualEnd!=null? s.actualEnd : s.start+s.duration;
+    exitTimeCounts[exit]=(exitTimeCounts[exit]||0)+1;
+  });
   html+='<div class="card"><h2>My Pod today</h2><p>Students checked in today at the Pod(s) you\'re covering. If one needs to be somewhere else, move them to another Pod here — front desk sees the change immediately.</p>';
   if(myPodIdsToday.length===0){ html+='<div class="empty-note">You\'re not rostered to cover a Pod today.</div>'; }
   else if(checkedInAtMyPods.length===0){ html+='<div class="empty-note">Nobody\'s checked in yet today.</div>'; }
@@ -6222,7 +6233,9 @@ function renderInstructor(){
         const student=findStudent(s.studentId);
         const pod=findPod(s.podId);
         const locLabel=s.online? 'Online' : (pod? pod.name : '—');
-        const cd=countdownInfo(s.actualEnd!=null? s.actualEnd : s.start+s.duration, 5);
+        const exit=s.actualEnd!=null? s.actualEnd : s.start+s.duration;
+        const soonThreshold=exitTimeCounts[exit]>=3? 10 : 5;
+        const cd=countdownInfo(exit, soonThreshold);
         // Actual (check-in-adjusted) times, not the original scheduled window — this row is only
         // ever a student who's already checked in (checkedInAtInstructorPodToday() filters to
         // status==='attended'), so actualStart/actualEnd are always set by then. Previously showed
