@@ -4123,6 +4123,7 @@ function rosterTableHtml(rows, weekday, dayKey, now){
 // (checked out students drop off immediately), any other day shows that whole day's attended record.
 function liveOccupancyGroups(dayKey){
   const live = dayKey===toKey(simNow());
+  const weekday=WEEKDAY_KEYS[(new Date(dayKey).getDay()+6)%7];
   const byPod={}, byOnlineInstr={};
   sessions.forEach(function(s){
     if(s.status!=='attended' || toKey(s.date)!==dayKey) return;
@@ -4142,9 +4143,19 @@ function liveOccupancyGroups(dayKey){
   // podId carried through (null for an Online group) so the renderer can look up that Pod's own
   // capacity for the seat-map/badge below — Online has a different capacity model entirely (the
   // combined 1:9 ratio, not a fixed 8 seats), so it deliberately gets neither.
+  // A Pod with nobody checked in still shows up here — but only on the live (today) view, and only
+  // when it actually has a shift scheduled for today's weekday (Sept 2026, per Allie: "make the
+  // checked in today section show the pods, (empty) but with the staff allocated to them even if
+  // there are no students check in" — scoped, per her own choice, to "only pods with a shift
+  // scheduled today"). A Pod with no shift at all today (e.g. it doesn't run on this weekday) stays
+  // hidden, same as before. This deliberately isn't extended to a past day's view: that board is
+  // already a definitive attendance record, so an all-empty staffed Pod there isn't the same kind of
+  // useful "who's actually here" read this was built for.
   const groups=[];
   pods.forEach(function(pod){
-    if(byPod[pod.id] && byPod[pod.id].length) groups.push({label:pod.name, podId:pod.id, entries:sortEntries(byPod[pod.id])});
+    const list=byPod[pod.id];
+    if(list && list.length){ groups.push({label:pod.name, podId:pod.id, entries:sortEntries(list)}); }
+    else if(live && podBlocksForDay(pod.id, weekday).length){ groups.push({label:pod.name, podId:pod.id, entries:[]}); }
   });
   Object.keys(byOnlineInstr).forEach(function(instrId){
     const instr=findInstructor(instrId);
@@ -4180,7 +4191,10 @@ function podInstructorLabel(podId, dayKey){
   return instrId? findInstructor(instrId).name : null;
 }
 function renderLiveOccupancyBoard(dayKey){
-  const groups=liveOccupancyGroups(dayKey).filter(function(g){ return g.entries.length; });
+  // No extra filtering needed here — liveOccupancyGroups() already only returns a group when it's
+  // either occupied, or (live view only) a Pod with a shift scheduled today, so an empty group here
+  // always means "staffed, nobody in yet" rather than "nothing to show."
+  const groups=liveOccupancyGroups(dayKey);
   const podGroups=groups.filter(function(g){ return g.podId; });
   const onlineGroups=groups.filter(function(g){ return !g.podId; });
   const live = dayKey===toKey(simNow());
@@ -4778,9 +4792,12 @@ function renderCheckedInPanel(){
   // Relocated here, at the very top of the section (Sept 2026, per Allie: "move who's here right
   // now to the top of the checked in today section") — always today, since this panel only ever
   // concerns itself with today regardless of which day is picked in the Schedule section below.
-  // Skipped entirely when nobody's checked in yet — the empty-note right below already says so, no
-  // need for the board to repeat it.
-  if(todays.length){ html+=renderLiveOccupancyBoard(toKey(simNow())); }
+  // Always rendered now, even before anyone's checked in (Sept 2026, per Allie: "show the pods,
+  // (empty) but with the staff allocated to them even if there are no students check in") — the
+  // board itself shows every staffed Pod's header and instructor name with "Open" seats in that
+  // case, so front desk can see who's covering what before the first check-in of the day, rather
+  // than the whole board being skipped until someone arrives.
+  html+=renderLiveOccupancyBoard(toKey(simNow()));
   html+='<p>Exit time defaults to check-in time plus their usual session length (90 min for most, per each student\'s plan) — however late (or early) that check-in was. Both the checked-in time and exit time can be corrected here if needed — say a parent\'s pick-up plan changes, or the arrival time recorded at check-in was wrong. "Time left" counts down live against the actual clock, so it stays accurate even if you don\'t touch this page. Once a student actually leaves, use their own "Check out" button — it drops them off this list, defaulting to whichever preset time is closest to right now (adjust it if they were signed out earlier or later than that).</p>';
   if(todays.length===0){ html+='<div class="empty-note">Nobody checked in yet today.</div>'; }
   else{
