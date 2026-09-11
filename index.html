@@ -18,7 +18,7 @@
     --primary:#ef3e33; --primary-text:#ffffff; --accent:#1a1a1a; --accent-bg:#f1efec;
     --success:#2f9e58; --success-bg:#e7f5ea; --danger:#b5121b; --danger-bg:#fce6e4;
     --warning:#9a640c; --warning-bg:#fdf2e0; --info:#4a4547; --info-bg:#e3e0da; --muted-bg:#e3e0da;
-    --online:#1a6fb0; --online-bg:#dcefff;
+    --online:#1a6fb0; --online-bg:#dcefff; --purple:#7c3aed; --purple-bg:#f0e9fe;
     --radius:10px; --shadow:0 1px 2px rgba(24,21,22,.08), 0 4px 16px rgba(24,21,22,.06);
     --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --font-display: "Plus Jakarta Sans", "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
@@ -29,7 +29,7 @@
       --primary:#ff5c50; --primary-text:#1a1a1a; --accent:#e8e2da; --accent-bg:#2b2723;
       --success:#57c37e; --success-bg:#1c3325; --danger:#ff6b61; --danger-bg:#3a1815;
       --warning:#f0b94a; --warning-bg:#3a2c10; --info:#b0a89f; --info-bg:#2b2723; --muted-bg:#2b2723;
-      --online:#7fc4f5; --online-bg:#1b3a4a;
+      --online:#7fc4f5; --online-bg:#1b3a4a; --purple:#c4a3fb; --purple-bg:#2d2140;
       --shadow:0 1px 3px rgba(0,0,0,.5);
     }
   }
@@ -38,7 +38,7 @@
     --primary:#ff5c50; --primary-text:#1a1a1a; --accent:#e8e2da; --accent-bg:#2b2723;
     --success:#57c37e; --success-bg:#1c3325; --danger:#ff6b61; --danger-bg:#3a1815;
     --warning:#f0b94a; --warning-bg:#3a2c10; --info:#b0a89f; --info-bg:#2b2723; --muted-bg:#2b2723;
-    --online:#7fc4f5; --online-bg:#1b3a4a;
+    --online:#7fc4f5; --online-bg:#1b3a4a; --purple:#c4a3fb; --purple-bg:#2d2140;
     --shadow:0 1px 3px rgba(0,0,0,.5);
   }
 
@@ -123,6 +123,11 @@
   .badge.full{ background:var(--danger-bg); color:var(--danger); }
   .badge.handoff{ background:var(--accent-bg); color:var(--accent); }
   .badge.hold{ background:var(--warning-bg); color:var(--warning); }
+  /* One instructor's own custom pack-up countdown (Sept 2026, per Allie: "orange at 15 mins, red at
+     5 minutes, purple from 0" — for Harry only, see instr.packUpCustomColors). The orange/red tiers
+     reuse .badge.soon/.badge.full above (already the right colours); this is the one genuinely new
+     tier, for "leaving now" and overdue. */
+  .badge.pack-purple{ background:var(--purple-bg); color:var(--purple); }
 
   .banner{ border-radius:8px; padding:10px 12px; font-size:.8rem; margin-bottom:12px; display:flex; gap:8px; align-items:flex-start; }
   .banner.warn{ background:var(--warning-bg); color:var(--warning); }
@@ -850,6 +855,23 @@ function countdownInfo(exitMinute, soonThreshold){
   }
   if(diff>=0) return {label:(diff===0? 'Leaves now' : 'Leaves in '+diff+' min'), cls:'soon'};
   return {label:(-diff)+' min overdue', cls:'full'};
+}
+// One instructor's own custom pack-up countdown (Sept 2026, per Allie: "I want it to be orange at 15
+// mins, red at 5 minutes, purple from 0" — "this is for harry only"). A three-tier version of
+// countdownInfo() above rather than a parameter on it, since the tiers themselves differ (three
+// fixed cutoffs, not one adjustable threshold) — used only when instr.packUpCustomColors is set on
+// the instructor viewing their own "My Pod today" board (see renderInstructor()), everyone else
+// keeps the standard two-tier version untouched.
+function countdownInfoPackUpCustom(exitMinute){
+  const diff=exitMinute-nowMinutesOfDay();
+  if(diff>15){
+    const h=Math.floor(diff/60), m=diff%60;
+    return {label:'Leaves in '+(h>0? h+'h'+(m? ' '+m+'m':'') : m+' min'), cls:'available'};
+  }
+  if(diff>5) return {label:'Leaves in '+diff+' min', cls:'soon'};       // orange, 15 down to 6
+  if(diff>0) return {label:'Leaves in '+diff+' min', cls:'full'};       // red, 5 down to 1
+  if(diff===0) return {label:'Leaves now', cls:'pack-purple'};          // purple from 0...
+  return {label:(-diff)+' min overdue', cls:'pack-purple'};             // ...and overdue
 }
 
 // In live mode (a real logged-in user) "today" is the real, actual date — the BASE/offsetDays
@@ -3834,7 +3856,7 @@ function saveNewInstructor(){
 // editing a parent or staff member.
 function openEditInstructorForm(instructorId){
   const instr=findInstructor(instructorId);
-  state.editInstructorForm={instructorId, name:instr.name, email:instr.email, yearMin:instr.yearMin, yearMax:instr.yearMax, error:''};
+  state.editInstructorForm={instructorId, name:instr.name, email:instr.email, yearMin:instr.yearMin, yearMax:instr.yearMax, packUpCustomColors:!!instr.packUpCustomColors, error:''};
   render();
 }
 function closeEditInstructorForm(){ state.editInstructorForm=null; render(); }
@@ -3851,8 +3873,9 @@ function saveEditInstructor(){
   instr.email=f.email.trim();
   instr.yearMin=Number(f.yearMin);
   instr.yearMax=Number(f.yearMax);
+  instr.packUpCustomColors=!!f.packUpCustomColors;
   dbWrite('editing instructor details', function(){ return supabaseClient.from('instructors').update({
-    name:instr.name, email:instr.email, year_min:instr.yearMin, year_max:instr.yearMax
+    name:instr.name, email:instr.email, year_min:instr.yearMin, year_max:instr.yearMax, pack_up_custom_colors:instr.packUpCustomColors
   }).eq('id', instr.id); });
   toast(instr.name+'\'s details updated.');
   state.editInstructorForm=null;
@@ -3876,6 +3899,13 @@ function renderEditInstructorModal(){
   if(instr.authUserId){
     html+='<p class="small muted">They already have a login — changing the email above only updates their contact record here, not what they actually sign in with.</p>';
   }
+  // One-off, per-instructor exception (Sept 2026, per Allie: "orange at 15 mins, red at 5 minutes,
+  // purple from 0" — "this is for harry only"): everyone else keeps the standard pack-up countdown
+  // colours on their own "My Pod today" board; this checkbox is the only way this differs per
+  // instructor, rather than hardcoding a name anywhere.
+  html+='<label style="display:flex;align-items:center;gap:8px;margin-top:10px">'
+    +'<input type="checkbox" '+(f.packUpCustomColors?'checked':'')+' onchange="setEditInstructorField(\'packUpCustomColors\', this.checked)"/> '
+    +'Custom pack-up countdown colours (orange at 15 min, red at 5 min, purple from 0)</label>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeEditInstructorForm()">Cancel</button>'
@@ -6538,7 +6568,9 @@ function renderInstructor(){
         const locLabel=s.online? 'Online' : (pod? pod.name : '—');
         const exit=s.actualEnd!=null? s.actualEnd : s.start+s.duration;
         const soonThreshold=exitTimeCounts[exit]>=3? 10 : 5;
-        const cd=countdownInfo(exit, soonThreshold);
+        // Harry's own board uses his custom 3-tier scheme instead of the standard 2-tier one — see
+        // countdownInfoPackUpCustom() (Sept 2026, per Allie, for him only).
+        const cd=instr.packUpCustomColors? countdownInfoPackUpCustom(exit) : countdownInfo(exit, soonThreshold);
         // Actual (check-in-adjusted) times, not the original scheduled window — this row is only
         // ever a student who's already checked in (checkedInAtInstructorPodToday() filters to
         // status==='attended'), so actualStart/actualEnd are always set by then. Previously showed
@@ -7276,7 +7308,7 @@ function loadAllData(){
     })(0, []);
   };
   return Promise.all([
-    T('instructors','id,name,email,year_min,year_max,auth_user_id,active'),
+    T('instructors','id,name,email,year_min,year_max,auth_user_id,active,pack_up_custom_colors'),
     T('instructor_avail_rules','instructor_id,weekday,effective_from,off,start_min,end_min'),
     T('instructor_one_offs','instructor_id,the_date,off,start_min,end_min'),
     T('pods','id,name,capacity'),
@@ -7305,7 +7337,7 @@ function loadAllData(){
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
-      authUserId:r.auth_user_id, active: r.active!==false,
+      authUserId:r.auth_user_id, active: r.active!==false, packUpCustomColors: !!r.pack_up_custom_colors,
       availRules: availRows.filter(function(a){ return a.instructor_id===r.id; }).map(function(a){
         return {weekday:a.weekday, effectiveFrom:new Date(a.effective_from), off:a.off, start:a.start_min, end:a.end_min};
       }),
