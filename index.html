@@ -6738,24 +6738,22 @@ function renderParent(){
       studentCredits.forEach(function(c){ html+=renderParentCredit(c, student); });
     }
 
-    // Hold periods (Sept 2026, per Allie: "add a section at the bottom for Hold periods -
-    // displaying either pending, approved, or denied" — then, once she saw it live with a few test
-    // requests in different states: "all three options are being displayed when it should just be
-    // pending, then it should become either approved or denied"). Each request still only ever
-    // shows its own single, correct status (that part always worked) — the fix is scope, not the
-    // badge logic: once front desk decides a request, it's resolved into a real outcome elsewhere
-    // (an actual hold on the student, or nothing at all) and has no ongoing reason to keep taking up
-    // room here, so this only ever surfaces what's still awaiting a decision. A family can have more
-    // than one open hold request at once (5.20, "parents need to be able to make multiple hold
-    // requests"), so this can show more than one row — just never a resolved one.
-    const pendingHolds=enrollmentRequests.filter(function(r){ return r.studentId===sid && r.type==='hold' && r.status==='open'; })
+    // Hold periods (Sept 2026, per Allie). Every hold request this student's family has ever
+    // submitted stays visible here permanently — front desk resolving it doesn't remove the row,
+    // it just settles which single badge it shows: exactly one of Pending, Approved, or Denied,
+    // never more than one at a time (Allie: "each request visible just only one copy... not all
+    // three, and they must not disappear"). Newest first.
+    const holdHistory=enrollmentRequests.filter(function(r){ return r.studentId===sid && r.type==='hold'; })
       .sort(function(a,b){ return b.createdAt-a.createdAt; });
     html+='<div class="section-label">Hold periods</div>';
-    if(pendingHolds.length===0){ html+='<div class="empty-note">No hold request currently pending.</div>'; }
+    if(holdHistory.length===0){ html+='<div class="empty-note">No hold requests on file.</div>'; }
     else{
-      html+='<div class="session-list">'+pendingHolds.map(function(r){
+      html+='<div class="session-list">'+holdHistory.map(function(r){
+        const statusBadge = r.status==='open' ? '<span class="badge soon">Pending</span>'
+          : r.status==='approved' ? '<span class="badge available">Approved</span>'
+          : '<span class="badge full">Denied</span>';
         return '<div class="session-row"><div class="session-main"><b>'+fmtShort(r.start)+'–'+fmtShort(r.end)+'</b>'
-          +(r.note? '<div class="small muted">'+r.note+'</div>' : '')+'</div><span class="badge soon">Pending</span></div>';
+          +(r.note? '<div class="small muted">'+r.note+'</div>' : '')+'</div>'+statusBadge+'</div>';
       }).join('')+'</div>';
     }
     html+='</div>';
