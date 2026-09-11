@@ -4480,7 +4480,18 @@ function renderLiveOccupancyBoard(dayKey){
     return html;
   }
   if(podGroups.length){
-    const maxCap=Math.max.apply(null, podGroups.map(function(g){ return podCapacity(g.podId); }));
+    // Row count per column has to be the larger of the Pod's stated capacity and how many are
+    // ACTUALLY sitting in it right now — not just capacity — because a same-day Pod move is
+    // deliberately allowed to go over capacity (movePodSession() skips the capacity check entirely
+    // once isToday is true, per Allie: "on the day students can be moved to other pods, disregarding
+    // pod fullness"). Before this fix, maxCap (and each column's own effective row count below) was
+    // capacity-only, so checking a student into an already-full Pod silently dropped them off this
+    // grid entirely — seat index 8 in a capacity-8 Pod was simply never iterated over, even though
+    // the header badge above correctly showed "9/8". They were never actually removed from anywhere
+    // in the data (still 'attended', still that podId) — just never drawn (Sept 2026, per Allie:
+    // "when i check in a student, and i change the pod they are in for the day, they won't come up").
+    const effectiveCap=function(g){ return Math.max(podCapacity(g.podId), g.entries.length); };
+    const maxCap=Math.max.apply(null, podGroups.map(effectiveCap));
     html+='<div class="liveboard-grid" style="grid-template-columns:70px repeat('+podGroups.length+',1fr);'+(onlineGroups.length? 'margin-bottom:14px':'')+'">';
     html+='<div></div>'+podGroups.map(function(g){
       const cap=podCapacity(g.podId);
@@ -4498,8 +4509,11 @@ function renderLiveOccupancyBoard(dayKey){
     for(let seat=0; seat<maxCap; seat++){
       html+='<div class="cal-row-label small muted">Seat '+(seat+1)+'</div>';
       html+=podGroups.map(function(g){
-        const cap=podCapacity(g.podId);
-        if(seat>=cap) return '<div></div>'; // this Pod's capacity is narrower than the widest column needs
+        // Blank filler only once we're past BOTH this Pod's stated capacity AND how many are
+        // actually seated in it (see the maxCap comment above) — so a narrower Pod still fills
+        // blank once truly exhausted, but an over-capacity Pod keeps rendering its real occupants
+        // instead of a narrower column's own limit hiding them.
+        if(seat>=effectiveCap(g)) return '<div></div>';
         const entry=g.entries[seat];
         // A student's own name is clickable on the live (today) view only — same "only makes sense
         // for today" rule as the Pod header's quick coverage change just above (Sept 2026, per
