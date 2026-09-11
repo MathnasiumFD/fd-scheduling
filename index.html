@@ -753,6 +753,7 @@ var state={
   holdForm:null,
   checkIn:null,
   availWeekOffset:0,
+  availSessionLen:AVAIL_MIN_SESSION_LEN, // Sept 2026: front desk can match this to the actual family's session length (see setAvailSessionLen) — see the "no open slots" bug writeup near openSlotsForCredit for why this defaulting-to-90-regardless-of-duration was misleading
   availRuleForm:null,
   oneOffForm:null,
   moveForm:null,
@@ -1360,6 +1361,16 @@ function describeUncoveredSlots(slots){
   return slots.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ');
 }
 
+// Same "today's roster as a reasonable proxy for a weekly-recurring pattern" approach as
+// slotsWithoutCoverage() above, but as a plain yes/no for one single day/time — used by the parent's
+// own schedule-change-request form to show live feedback next to whichever new day/time they've
+// picked (Sept 2026, per Allie: "it needs to show the current scheduled days and times, and allow
+// for a parent to select when they would like to come in instead"), and to decide whether a "Join
+// waitlist" button belongs there instead (see joinWaitlistFromTimeChangeRequest()).
+function standingSlotHasAvailability(weekday, start, duration, year){
+  return !!pickBestPod(weekday, toKey(simNow()), start, duration, year);
+}
+
 function creditDisplayStatus(c){
   const now=simNow();
   if(c.status==='redeemed'){
@@ -1664,7 +1675,7 @@ function approveEnrollmentRequest(id){
   const req=enrollmentRequests.find(function(r){ return r.id===id; });
   if(!req) return;
   const student=findStudent(req.studentId);
-  if(req.type==='hold'){ applyHold(student, req.start, req.end, req.note); }
+  if(req.type==='hold'){ applyHold(student, req.start, req.end, req.note, !monthNoticeOk(req.start)); }
   else if(req.type==='time_change'){ applyTimeChange(student, req.effectiveFrom, req.requestedRecurring||[], req.note); }
   else { applyStopEnrollment(student, req.effectiveFrom, req.note); }
   req.status='approved';
@@ -1683,20 +1694,29 @@ function declineEnrollmentRequest(id){
 /* ---------- parent-submitted hold / cancel-enrolment requests (5.20) ---------- */
 function openHoldRequestForm(studentId){
   const start=earliestMonthNoticeDate();
-  state.holdRequestForm={studentId, start:toKey(start), end:toKey(addDays(start,7)), note:'', error:''};
+  state.holdRequestForm={studentId, start:toKey(start), end:toKey(addDays(start,7)), note:'', error:'', lateNotice:false};
   render();
 }
 function closeHoldRequestForm(){ state.holdRequestForm=null; render(); }
-function setHoldRequestField(field, value){ state.holdRequestForm[field]=value; state.holdRequestForm.error=''; render(); }
+// As with the cancellation form, a start date inside the 7-day notice window is no longer a hard
+// stop — the banner below just lights up live so it's never a surprise (Sept 2026, per Allie).
+function setHoldRequestField(field, value){
+  state.holdRequestForm[field]=value;
+  state.holdRequestForm.error='';
+  if(field==='start'){ state.holdRequestForm.lateNotice = !!(value && !monthNoticeOk(new Date(value))); }
+  render();
+}
 function submitHoldRequest(){
   const f=state.holdRequestForm;
   if(!f.start || !f.end){ f.error='Choose a start and end date.'; render(); return; }
   if(f.end<f.start){ f.error='End date must be on or after the start date.'; render(); return; }
   const start=new Date(f.start);
-  if(!monthNoticeOk(start)){
-    f.error='Hold requests need at least a week\'s notice before the 1st of the month they start in — the earliest available start is '+fmtShort(earliestMonthNoticeDate())+'.';
-    render(); return;
-  }
+  // A hold requested inside the 7-day billing-notice window still goes through — front desk just
+  // can't get a billing credit applied to this cycle in time, so make-up sessions are granted
+  // instead for whatever's missed during the hold (Sept 2026, per Allie's own wording for this
+  // case). `monthNoticeOk` is re-checked from req.start at approval time too, so nothing about
+  // "late" needs to be persisted here.
+  const late=!monthNoticeOk(start);
   const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'hold', start:start, end:new Date(f.end), effectiveFrom:null, note:f.note.trim(), status:'open', createdAt:simNow()};
   enrollmentRequests.push(req);
   dbWrite('submitting a hold request', function(){ return supabaseClient.from('enrollment_requests').insert({
@@ -1704,22 +1724,35 @@ function submitHoldRequest(){
   }); });
   state.holdRequestForm=null;
   notifyFrontDeskOfEnrollmentRequest(req.id);
-  toast('Hold request sent to front desk — you\'ll see it reflected here once it\'s reviewed.');
+  toast(late
+    ? 'Your hold can still be placed for these dates, however a credit cannot be applied as the request was made less than 7 days before the 1st of the month. Make-up sessions will be added for eligible sessions missed during the hold.'
+    : 'Hold request sent to front desk — you\'ll see it reflected here once it\'s reviewed.', late?7000:4000);
 }
 function openCancelRequestForm(studentId){
-  state.cancelRequestForm={studentId, effectiveFrom:toKey(earliestMonthNoticeDate()), note:'', error:''};
+  state.cancelRequestForm={studentId, effectiveFrom:toKey(earliestMonthNoticeDate()), note:'', error:'', lateNotice:false};
   render();
 }
 function closeCancelRequestForm(){ state.cancelRequestForm=null; render(); }
-function setCancelRequestField(field, value){ state.cancelRequestForm[field]=value; state.cancelRequestForm.error=''; render(); }
+// Picking a date inside the 7-day notice window no longer blocks the field — it just lights up the
+// "this will actually take effect a month later than you picked" banner live, so it's never a
+// surprise by the time they hit Send (Sept 2026, per Allie's own wording for this case).
+function setCancelRequestField(field, value){
+  state.cancelRequestForm[field]=value;
+  state.cancelRequestForm.error='';
+  if(field==='effectiveFrom'){ state.cancelRequestForm.lateNotice = !!(value && !monthNoticeOk(new Date(value))); }
+  render();
+}
 function submitCancelRequest(){
   const f=state.cancelRequestForm;
   if(!f.effectiveFrom){ f.error='Choose the date this should take effect from.'; render(); return; }
-  const effectiveFrom=new Date(f.effectiveFrom);
-  if(!monthNoticeOk(effectiveFrom)){
-    f.error='Cancellation requests need at least a week\'s notice before the 1st of the month they take effect in — the earliest available date is '+fmtShort(earliestMonthNoticeDate())+'.';
-    render(); return;
-  }
+  let effectiveFrom=new Date(f.effectiveFrom);
+  // A request made inside the 7-day billing-notice window used to be a hard error the parent had to
+  // fix themselves. Now it still goes through: this month's payment still runs as normal, and the
+  // cancellation is simply pushed out to take effect from the next month that does have enough
+  // notice (Sept 2026, per Allie: the request should be accepted, not blocked, with this explained
+  // plainly rather than making them guess-and-check a date).
+  const late=!monthNoticeOk(effectiveFrom);
+  if(late) effectiveFrom=earliestMonthNoticeDate();
   const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'cancel', start:null, end:null, effectiveFrom:effectiveFrom, note:f.note.trim(), status:'open', createdAt:simNow()};
   enrollmentRequests.push(req);
   dbWrite('submitting a cancellation request', function(){ return supabaseClient.from('enrollment_requests').insert({
@@ -1727,12 +1760,21 @@ function submitCancelRequest(){
   }); });
   state.cancelRequestForm=null;
   notifyFrontDeskOfEnrollmentRequest(req.id);
-  toast('Cancellation request sent to front desk.');
+  toast(late
+    ? 'This cancellation request is within the 7-day notice period for the upcoming payment cycle. Your next payment will still be processed, and your cancellation will take effect from the following month ('+fmtShort(effectiveFrom)+').'
+    : 'Cancellation request sent to front desk.', late?7000:4000);
 }
 function openTimeChangeRequestForm(studentId){
   const student=findStudent(studentId);
+  // currentRecurring is a frozen snapshot of the schedule as it stands today, kept alongside the
+  // editable `recurring` (which starts as a copy of the same thing, but changes as the parent picks
+  // a new day/time) — so the modal can always show "here's what you have now" even after they've
+  // started picking something different (Sept 2026, per Allie: "it needs to show the current
+  // scheduled days and times, and allow for a parent to select when they would like to come in
+  // instead").
   state.timeChangeRequestForm={
     studentId, effectiveFrom:toKey(earliestMonthNoticeDate()),
+    currentRecurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
     recurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
     note:'', error:''
   };
@@ -1745,6 +1787,20 @@ function setTimeChangeRecurringSlot(idx, field, value){
   state.timeChangeRequestForm.error='';
   render();
 }
+// A parent's picked day/time on the schedule-change-request form turned out to have no room
+// anywhere (see standingSlotHasAvailability(), shown live next to each row) — rather than leaving
+// them stuck, this hands straight off to the same self-service waitlist join every other "full or
+// unstaffed" slot in the app already offers, pre-filled with the exact day/time they were just
+// looking at (Sept 2026, per Allie: "if a parent selects a day/time that has no availability, then a
+// button to say 'join waitlist' should appear"). Closes the schedule-change form first — one modal
+// at a time, same as every other flow in the app.
+function joinWaitlistFromTimeChangeRequest(idx){
+  const f=state.timeChangeRequestForm;
+  const slot=f.recurring[idx];
+  const studentId=f.studentId;
+  state.timeChangeRequestForm=null;
+  openParentWaitlistForm(studentId, slot.weekday, slot.start);
+}
 function submitTimeChangeRequest(){
   const f=state.timeChangeRequestForm;
   if(!f.effectiveFrom){ f.error='Choose the date this should take effect from.'; render(); return; }
@@ -1754,7 +1810,16 @@ function submitTimeChangeRequest(){
     render(); return;
   }
   if(!f.recurring || f.recurring.length===0){ f.error='Add at least one day/time.'; render(); return; }
+  const student=findStudent(f.studentId);
   const recurring=f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; });
+  // Every row came from a dropdown already filtered to open times (see
+  // renderTimeChangeRecurringPickers), so this is almost always true by construction — it's only
+  // false if a picked time went full in the moments between opening the form and hitting Send, or
+  // it was force-kept because it was the family's existing time. Front desk still has to be the one
+  // to click Approve (only staff can write the actual schedule change — see
+  // renderEnrollmentRequestsPanel's "Ready to approve" flag), but when every slot is open there's
+  // nothing for them to check first, so approval is just a formality rather than research.
+  const allAvailable=recurring.every(function(r){ return standingSlotHasAvailability(r.weekday, r.start, student.duration, student.year); });
   const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'time_change', start:null, end:null, effectiveFrom:effectiveFrom, requestedRecurring:recurring, note:f.note.trim(), status:'open', createdAt:simNow()};
   enrollmentRequests.push(req);
   dbWrite('submitting a schedule-change request', function(){
@@ -1769,7 +1834,9 @@ function submitTimeChangeRequest(){
   });
   state.timeChangeRequestForm=null;
   notifyFrontDeskOfEnrollmentRequest(req.id);
-  toast('Schedule change request sent to front desk — you\'ll see it reflected here once it\'s reviewed.');
+  toast(allAvailable
+    ? 'Request sent — every time you picked is open right now, so this should be confirmed shortly.'
+    : 'Schedule change request sent to front desk — you\'ll see it reflected here once it\'s reviewed.');
 }
 
 // Everything a parent should be told is changing about a child's schedule (5.20) — any front-desk-
@@ -2825,10 +2892,22 @@ function cancelBookMakeUp(){ state.parentBookingCreditId=null; render(); }
 // same-day cutoff. Split out from openSlotsForCredit so the picker can explain a missing "today"
 // rather than just silently starting the list at tomorrow.
 function sameDayMakeUpCutoffPassed(){ return nowMinutesOfDay()>=MAKEUP_SAME_DAY_CUTOFF; }
+// Sept 2026, per Allie: a parent trying to book a make-up saw "No open slots in the next two weeks
+// for this program" while front desk was confident there was room. Two real gaps contributed (see
+// the Availability Lookup fix above for the other one — this app never assumed there was only one
+// cause): this function only ever considered a physical Pod, never Online, even though the app has
+// let a student sit Online for months now (5.32+) and front desk can already put a one-off booking
+// there by hand. A physical-Pod-only make-up search misses room that genuinely exists whenever every
+// Pod is full/unstaffed at a given time but an on-shift instructor still has headroom under the
+// combined Online ratio. This now checks Online too, exactly the same way a manual staff booking's
+// location picker already does (see confirmBooking's isOnline branch) — physical Pods first (a
+// parent already knows how a Pod session works), Online only as a fallback for a given date/time
+// when no Pod fits.
 function openSlotsForCredit(credit){
   // Parents choose a date + time only — never which Pod or instructor, and never a duration
   // (that's fixed to the student's usual session length). The system auto-assigns a specific
-  // qualified, available, under-capacity Pod behind the scenes (see pickBestPod).
+  // qualified, available, under-capacity Pod (or, failing that, an available Online instructor)
+  // behind the scenes.
   const student=findStudent(credit.studentId);
   const duration=student.duration;
   const now=simNow();
@@ -2849,7 +2928,17 @@ function openSlotsForCredit(credit){
         const podId=pickBestPod(weekday, dateKey, start, duration, student.year);
         if(podId){
           const cov=podCoverageDetail(podId, weekday, start, duration, date); // tolerant of a short unattended gap, same as pickBestPod just validated
-          opts.push({date, start, duration, podId, instructorId:cov.primaryInstructorId});
+          opts.push({date, start, duration, podId, online:false, instructorId:cov.primaryInstructorId});
+          return;
+        }
+        // No physical Pod fits — try Online before giving up on this date/time entirely. Any
+        // instructor genuinely on shift somewhere (instructorsOnShift) with combined headroom
+        // (!instructorOnlineBlocked) can take one more Online student; first eligible wins, same
+        // "predictable, no ranking" approach pickBestPod itself uses for Pods.
+        const onlineInstr=instructorsOnShift(weekday, start, duration, date)
+          .find(function(instr){ return !instructorOnlineBlocked(instr.id, dateKey, start, duration); });
+        if(onlineInstr){
+          opts.push({date, start, duration, podId:null, online:true, instructorId:onlineInstr.id});
         }
       });
     }
@@ -2858,10 +2947,21 @@ function openSlotsForCredit(credit){
   return opts;
 }
 
-function bookSlot(creditId, dateKey, start, duration, podId, instructorId){
+// `online` (added Sept 2026, see openSlotsForCredit) forces podId to real null and stamps the
+// session as an Online booking — `podId` still arrives from the onclick as a string either way
+// (HTML attributes are always strings), and for a null Pod that string is literally "null", not an
+// actual null, so it's ignored outright whenever `online` is true rather than trusted.
+function bookSlot(creditId, dateKey, start, duration, podId, instructorId, online){
   const credit=findCredit(creditId);
   const student=findStudent(credit.studentId);
-  const sess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId, instructorId, date:new Date(dateKey), start:Number(start), duration:Number(duration), status:'scheduled', bookedBy:'parent', creditId};
+  if(online && instructorOnlineBlocked(instructorId, dateKey, Number(start), Number(duration))){
+    // Rare race — someone else filled the last Online seat between opening this picker and clicking
+    // Book. Same courtesy as confirmBooking()'s own guard: refuse cleanly and let them try again
+    // rather than silently overbooking.
+    toast("That Online slot just filled up — refresh and pick another time.");
+    return;
+  }
+  const sess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId: online? null : podId, instructorId, instructorId2:null, handoff:null, online:!!online, date:new Date(dateKey), start:Number(start), duration:Number(duration), status:'scheduled', bookedBy:'parent', creditId};
   sessions.push(sess);
   credit.status='redeemed';
   credit.redeemedSessionId=sess.id;
@@ -2871,14 +2971,14 @@ function bookSlot(creditId, dateKey, start, duration, podId, instructorId){
   // (Sept 2026, same root cause as confirmBooking()'s own credit redemption and the earlier
   // saveNewStudent fix — just for the parent's self-service make-up flow this time).
   dbWrite('booking a make-up session and redeeming its credit', function(){ return supabaseClient.from('sessions').insert({
-    id:sess.id, student_id:sess.studentId, pod_id:sess.podId, instructor_id:sess.instructorId, the_date:toKey(sess.date),
+    id:sess.id, student_id:sess.studentId, pod_id:sess.podId, instructor_id:sess.instructorId, instructor_id_2:null, handoff_min:null, online:sess.online, the_date:toKey(sess.date),
     start_min:sess.start, duration:sess.duration, status:sess.status, booked_by:sess.bookedBy, credit_id:sess.creditId
   }).then(function(r){
     if(r.error) return r;
     return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sess.id}).eq('id', credit.id);
   }); });
   state.parentBookingCreditId=null;
-  toast('Make-up booked for '+fmtShort(sess.date)+', '+rangeLabel(sess.start,sess.duration)+'.');
+  toast('Make-up booked for '+fmtShort(sess.date)+', '+rangeLabel(sess.start,sess.duration)+(online? ' — Online.' : '.'));
 }
 
 function cancelMakeUp(creditId){
@@ -3136,6 +3236,19 @@ function setAvailWeek(w){
   if(state.collapsedSections && state.collapsedSections.availability){ state.collapsedSections.availability=false; }
   render();
 }
+// Sept 2026, per Allie's report of a parent seeing "no open slots" for a make-up while front desk
+// was confident there was room: the Lookup grid always checked a fixed 90-minute window
+// (AVAIL_MIN_SESSION_LEN) no matter how long the family's actual sessions run, while the real
+// make-up-booking check (openSlotsForCredit) always used that student's real duration. A 90-minute
+// read can show "open" for a start time that a real 120-minute session wouldn't actually fit into
+// (the shift ends, or someone else's session starts, partway through the extra 30 minutes) — so
+// front desk saw green where the parent's own duration-aware check correctly saw none. Letting
+// front desk match the grid to the specific family's length closes that gap.
+function setAvailSessionLen(len){
+  state.availSessionLen=Number(len);
+  if(state.collapsedSections && state.collapsedSections.availability){ state.collapsedSections.availability=false; }
+  render();
+}
 
 /* ---------- waitlist for full day/time slots (5.17) ---------- */
 // The soonest upcoming date that falls on a given weekday, from a given date (inclusive) — used to
@@ -3289,9 +3402,12 @@ function currentParentRecord(){
   const parentId = supabaseClient ? (currentUser && currentUser.parentId) : state.parentLoggedIn;
   return parents.find(function(p){ return p.id===parentId; }) || null;
 }
-function openParentWaitlistForm(studentId){
+// weekday/start are optional pre-fills — used when a parent lands here from a specific slot they
+// already picked elsewhere (e.g. an unavailable choice on the schedule-change-request form, see
+// joinWaitlistFromTimeChangeRequest()) rather than starting from the default Monday/opening-time.
+function openParentWaitlistForm(studentId, weekday, start){
   const student=findStudent(studentId);
-  state.parentWaitlistForm={studentId:studentId, weekday:'Mon', start:AVAIL_BLOCKS[0], duration:student.duration, note:'', error:''};
+  state.parentWaitlistForm={studentId:studentId, weekday:weekday||'Mon', start:start!=null? start : AVAIL_BLOCKS[0], duration:student.duration, note:'', error:''};
   render();
 }
 function closeParentWaitlistForm(){ state.parentWaitlistForm=null; render(); }
@@ -3825,7 +3941,11 @@ function closeHoldForm(){ state.holdForm=null; render(); }
 function setHoldField(field, value){ state.holdForm[field]=value; state.holdForm.error=''; render(); }
 // Shared by front desk placing a hold directly (saveHold) and front desk approving a parent's
 // hold request (approveEnrollmentRequest) — same effect either way, just a different entry point.
-function applyHold(student, start, end, note){
+// grantMakeupCredits is true only for a hold requested inside the 7-day billing-notice window —
+// billing can't be pulled back in time for this cycle, so instead of just freeing the slot, each
+// affected standing session gets a make-up credit issued (same mechanism as an excused absence),
+// so the family still gets the sessions they're paying for (Sept 2026, per Allie).
+function applyHold(student, start, end, note, grantMakeupCredits){
   const hold={id:newId()||('hold'+(nextSessionId++)), start:start, end:end, note:(note||'').trim()};
   student.holds=student.holds||[];
   student.holds.push(hold);
@@ -3836,7 +3956,7 @@ function applyHold(student, start, end, note){
   // standing or one-off alike — so those Pod slots immediately show as available. A session paid
   // for with a make-up credit gets its credit restored (unless already past its own expiry),
   // same as any other cancelled make-up.
-  let cancelledCount=0;
+  let cancelledCount=0, madeUpCount=0;
   sessions.forEach(function(s){
     if(s.studentId!==student.id || s.status!=='scheduled') return;
     const dk=toKey(s.date);
@@ -3850,9 +3970,20 @@ function applyHold(student, start, end, note){
         credit.status='available'; credit.redeemedSessionId=null;
         dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', credit.id); });
       }
+    } else if(grantMakeupCredits){
+      const issued=simNow(), expiry=addMonths(issued,3);
+      const c={id:newId()||('c'+(nextCreditId++)), studentId:student.id, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:'Missed during a late-notice hold ('+fmtShort(hold.start)+'–'+fmtShort(hold.end)+')'};
+      credits.push(c);
+      madeUpCount++;
+      dbWrite('issuing a make-up credit (hold)', function(){ return supabaseClient.from('credits').insert({
+        id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
+        status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
+      }); });
     }
   });
-  toast(student.name+' placed on hold '+fmtShort(hold.start)+'–'+fmtShort(hold.end)+(cancelledCount>0? ' — '+cancelledCount+' session(s) freed up for one-off bookings.' : '.'));
+  toast(student.name+' placed on hold '+fmtShort(hold.start)+'–'+fmtShort(hold.end)
+    +(cancelledCount>0? ' — '+cancelledCount+' session(s) freed up for one-off bookings.' : '.')
+    +(madeUpCount>0? ' '+madeUpCount+' make-up credit(s) issued (late-notice hold).' : ''));
   return hold;
 }
 function saveHold(){
@@ -4776,10 +4907,18 @@ function renderEnrollmentRequestsPanel(){
   open.forEach(function(r){
     const student=findStudent(r.studentId);
     const parent=parents.find(function(p){ return p.id===student.parentId; });
+    // Parents can only ever submit a request (RLS blocks a parent from approving their own), so
+    // this stays a human click either way — but for a time-change request, flagging up front that
+    // every slot they picked is still open right now means front desk can hit Approve without
+    // having to go check availability themselves first (Sept 2026, per Allie: "it should become
+    // automatically approved, not require front desk 'ok' as long as there's availability" — this
+    // is the closest safe equivalent, since only staff logins can actually write a schedule change).
+    const readyToApprove = r.type==='time_change' && (r.requestedRecurring||[]).length>0
+      && r.requestedRecurring.every(function(rec){ return standingSlotHasAvailability(rec.weekday, rec.start, student.duration, student.year); });
     const detail = r.type==='hold'
       ? 'Hold: '+fmtShort(r.start)+'–'+fmtShort(r.end)
       : r.type==='time_change'
-      ? 'Change to '+recurringSummary({recurring:r.requestedRecurring||[]})+' from '+fmtShort(r.effectiveFrom)
+      ? 'Change to '+recurringSummary({recurring:r.requestedRecurring||[]})+' from '+fmtShort(r.effectiveFrom)+(readyToApprove? ' <span class="badge available">All times open — ready to approve</span>' : '')
       : '<span class="badge full">Cancel enrolment</span> from '+fmtShort(r.effectiveFrom);
     html+='<tr><td>'+student.name+'</td><td class="small">'+(parent?parent.name:'—')+'</td>'
       +'<td>'+detail+'</td>'
@@ -4843,12 +4982,21 @@ function renderCheckedInPanel(){
 function renderAvailabilityLookup(){
   const monday=addDays(getMonday(simNow()), state.availWeekOffset*7);
   const days=[0,1,2,3,4].map(function(i){ return addDays(monday,i); });
+  const sessionLen=state.availSessionLen||AVAIL_MIN_SESSION_LEN;
   let html=sectionOpen('availability','Availability lookup',
     '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
       +'<button class="btn sm'+(state.availWeekOffset===0?' primary':'')+'" onclick="setAvailWeek(0)">This week</button>'
       +'<button class="btn sm'+(state.availWeekOffset===1?' primary':'')+'" onclick="setAvailWeek(1)">Next week</button>'
+      +'<select class="btn sm" style="padding:5px 8px" onchange="setAvailSessionLen(this.value)" title="Check against a specific session length">'
+        +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===sessionLen?' selected':'')+'>'+d+' min</option>'; }).join('')
+      +'</select>'
     +'</div>');
-  html+='<p>Open seats in 30-minute columns, up to 6:00pm, summed across every Pod with an assigned instructor covering that half-hour — a quick reference for sales calls, so front desk can tell a parent on the spot whether there\'s room, for any year (every instructor can teach any year, 5.3). A column only counts a seat as open if it stays open for at least '+AVAIL_MIN_SESSION_LEN+' minutes from that start time, not just that one half-hour — otherwise it could show "open" right before filling back up mid-session. “No staff” means no Pod has an instructor assigned that half-hour; “Full” means staffed but at capacity (for the full session length). Click a full or unstaffed slot to add someone to the waitlist for it.</p>';
+  // Sept 2026: this now checks whatever length is selected above, not a fixed 90 minutes — a parent
+  // whose sessions actually run 120 minutes can have no real make-up slot in the next two weeks
+  // (openSlotsForCredit checks their real duration) even on a half-hour where the OLD fixed 90-min
+  // grid would have shown "open", since the extra 30 minutes past 90 might run into a shift ending
+  // or someone else's session starting. Match the selector to the family you're helping.
+  html+='<p>Open seats in 30-minute columns, up to 6:00pm, summed across every Pod with an assigned instructor covering that half-hour — a quick reference for sales calls, so front desk can tell a parent on the spot whether there\'s room, for any year (every instructor can teach any year, 5.3). A column only counts a seat as open if it stays open for at least the selected session length ('+sessionLen+' minutes) from that start time, not just that one half-hour — otherwise it could show "open" right before filling back up mid-session. Match the length to whichever family you\'re checking for — a slot that\'s open for a 60-minute session isn\'t necessarily open for a 120-minute one. “No staff” means no Pod has an instructor assigned that half-hour; “Full” means staffed but at capacity (for the full session length). Click a full or unstaffed slot to add someone to the waitlist for it.</p>';
   html+='<div class="avail-grid" style="grid-template-columns:90px repeat('+AVAIL_BLOCKS.length+',1fr)">';
   html+='<div></div>'+AVAIL_BLOCKS.map(function(hb){ return '<div class="cal-head">'+minToLabel(hb)+'</div>'; }).join('');
   days.forEach(function(d,i){
@@ -4856,7 +5004,7 @@ function renderAvailabilityLookup(){
     const dateKey=toKey(d);
     html+='<div class="cal-row-label">'+weekday+' <span class="small muted" style="font-weight:400">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></div>';
     AVAIL_BLOCKS.forEach(function(hb){
-      const r=openSeatsAt(dateKey, weekday, hb, '', AVAIL_MIN_SESSION_LEN);
+      const r=openSeatsAt(dateKey, weekday, hb, '', sessionLen);
       let cls='avail-cell', label;
       if(r.staffed===0){ cls+=' nostaff-cell'; label='No staff'; }
       else if(r.seats===0){ cls+=' full-cell'; label='Full'; }
@@ -4871,7 +5019,7 @@ function renderAvailabilityLookup(){
     // aggregate seats available across every instructor on shift for that window (see onlineSeatsAt).
     html+='<div class="cal-row-label small muted">↳ Online</div>';
     AVAIL_BLOCKS.forEach(function(hb){
-      const seats=onlineSeatsAt(dateKey, weekday, hb, AVAIL_MIN_SESSION_LEN);
+      const seats=onlineSeatsAt(dateKey, weekday, hb, sessionLen);
       const cls='avail-cell small online-cell'+(seats===0?' full-cell':'');
       html+='<div class="'+cls+'">'+(seats===0?'Full':seats+' open')+'</div>';
     });
@@ -5647,6 +5795,31 @@ function renderRecurringPickers(slots, starts, setter, podSetter){
         +pods.map(function(p){ return '<option value="'+p.id+'"'+(p.id===s.preferredPodId?' selected':'')+'>'+p.name+'</option>'; }).join('')
       +'</select></div>';
     }
+  });
+  return html;
+}
+
+// Parent-facing schedule-change-request picker (Sept 2026, per Allie: "Only available session
+// times will be shown") — unlike renderRecurringPickers (used by front desk, who need to see and
+// set up any time regardless of current live capacity), this one filters the Time dropdown itself
+// down to whatever standingSlotHasAvailability() currently says is open for that weekday. The
+// slot's own already-picked time is always kept in the list even if it's since gone full, so
+// changing the Day dropdown never silently strands the Time dropdown on a now-invalid value — the
+// per-row "Full right now" + join-waitlist affordance below the picker (in
+// renderTimeChangeRequestModal) covers that case instead.
+function renderTimeChangeRecurringPickers(slots, duration, year){
+  const allStarts=possibleStarts(duration);
+  let html='';
+  slots.forEach(function(s, idx){
+    const openStarts=allStarts.filter(function(t){ return standingSlotHasAvailability(s.weekday, t, duration, year); });
+    const starts = openStarts.indexOf(s.start)>=0 ? openStarts : openStarts.concat([s.start]).sort(function(a,b){ return a-b; });
+    html+='<div class="row2 recurring-row"><div><label>Day '+(idx+1)+'</label><select onchange="setTimeChangeRecurringSlot('+idx+',\'weekday\',this.value)">'
+        +WEEKDAY_KEYS.map(function(d){ return '<option value="'+d+'"'+(d===s.weekday?' selected':'')+'>'+d+'</option>'; }).join('')
+      +'</select></div>'
+      +'<div><label>Time</label><select onchange="setTimeChangeRecurringSlot('+idx+',\'start\',this.value)">'
+        +(starts.length? starts.map(function(t){ return '<option value="'+t+'"'+(t===s.start?' selected':'')+'>'+minToLabel(t)+(openStarts.indexOf(t)>=0?'':' (full)')+'</option>'; }).join('')
+          : '<option value="'+s.start+'">No open times this day right now</option>')
+      +'</select></div></div>';
   });
   return html;
 }
@@ -6476,14 +6649,22 @@ function renderParent(){
     const initials=student.name.split(' ').filter(Boolean).slice(0,2).map(function(w){ return w[0]; }).join('').toUpperCase();
 
     html+='<div class="card parent-card">';
-    const pendingHold=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='hold' && r.status==='open'; });
+    // Holds are the one request type a parent can have more than one open at once (Sept 2026, per
+    // Allie: "parents need to be able to make multiple hold requests") — e.g. a family with two
+    // separate trips planned this term shouldn't have to wait for the first hold to be reviewed
+    // before asking about the second. So "Request a hold" always stays clickable; a pending count
+    // is just shown alongside it rather than replacing the link. Schedule-change and cancellation
+    // requests are still one-at-a-time, since a second one before the first is resolved would just
+    // be ambiguous about which the parent actually wants.
+    const openHoldCount=enrollmentRequests.filter(function(r){ return r.studentId===sid && r.type==='hold' && r.status==='open'; }).length;
     const pendingTimeChange=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='time_change' && r.status==='open'; });
     const pendingCancel=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='cancel' && r.status==='open'; });
     html+='<div class="parent-header"><div class="avatar-circle">'+initials+'</div>'
       +'<div><h2>'+student.name+'</h2><div class="small muted">'+yearLabel(student.year)+' · '+student.sessionsPerWeek+'x/week · '+student.duration+'-min sessions</div>'
       +'<div class="small muted">Regular schedule: '+recurringSummary(student)+'</div></div>'
       +'<div style="margin-left:auto;display:flex;flex-direction:column;gap:4px;align-items:flex-end">'
-        +(pendingHold? '<span class="small muted">Hold request pending</span>' : '<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>')
+        +'<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>'
+        +(openHoldCount>0? '<span class="small muted">'+openHoldCount+' hold request'+(openHoldCount===1?'':'s')+' pending</span>' : '')
         +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Request a permanent day/time change</a>')
         +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>')
         +'<a href="#" class="small" onclick="openParentWaitlistForm(\''+sid+'\');return false;">Join the waitlist for another day/time</a>'
@@ -6556,6 +6737,24 @@ function renderParent(){
       }
       studentCredits.forEach(function(c){ html+=renderParentCredit(c, student); });
     }
+
+    // Hold periods (Sept 2026, per Allie: "add a section at the bottom for Hold periods -
+    // displaying either pending, approved, or denied") — every hold request this student's family
+    // has ever submitted, newest first, whatever its outcome. `type==='hold'` requests double as
+    // this history: 'open' reads as pending, 'approved' as approved, 'declined' as denied.
+    const holdHistory=enrollmentRequests.filter(function(r){ return r.studentId===sid && r.type==='hold'; })
+      .sort(function(a,b){ return b.createdAt-a.createdAt; });
+    html+='<div class="section-label">Hold periods</div>';
+    if(holdHistory.length===0){ html+='<div class="empty-note">No hold requests on file.</div>'; }
+    else{
+      html+='<div class="session-list">'+holdHistory.map(function(r){
+        const statusBadge = r.status==='open' ? '<span class="badge soon">Pending</span>'
+          : r.status==='approved' ? '<span class="badge available">Approved</span>'
+          : '<span class="badge full">Denied</span>';
+        return '<div class="session-row"><div class="session-main"><b>'+fmtShort(r.start)+'–'+fmtShort(r.end)+'</b>'
+          +(r.note? '<div class="small muted">'+r.note+'</div>' : '')+'</div>'+statusBadge+'</div>';
+      }).join('')+'</div>';
+    }
     html+='</div>';
   });
   html+=renderHoldRequestModal();
@@ -6571,8 +6770,11 @@ function renderHoldRequestModal(){
   const student=findStudent(f.studentId);
   let html='<div class="overlay" onclick="if(event.target===this) closeHoldRequestForm()"><div class="modal">';
   html+='<h3>Request a hold for '+student.name+'</h3>';
-  html+='<p>Front desk will review this before anything changes. Hold requests need at least a week\'s notice before the 1st of the month they start in.</p>';
+  // Sept 2026, per Allie's own wording for this box.
+  html+='<p>Our team will review your request and confirm it with you before any changes are made.</p>'
+    +'<p>Hold requests must be submitted at least 7 days before your next monthly payment cycle. All monthly payment cycles are processed on the 1st of each month.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  if(f.lateNotice) html+='<div class="banner warn">Your hold can still be placed for these dates, however a credit cannot be applied as the request was made less than 7 days before the 1st of the month. Make-up sessions will be added for eligible sessions missed during the hold.</div>';
   html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.start+'" onchange="setHoldRequestField(\'start\',this.value)"/></div>'
     +'<div><label>End date</label><input type="date" value="'+f.end+'" onchange="setHoldRequestField(\'end\',this.value)"/></div></div>';
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. family vacation" value="'+f.note+'" oninput="setHoldRequestField(\'note\',this.value)"/>';
@@ -6589,9 +6791,29 @@ function renderTimeChangeRequestModal(){
   const starts=possibleStarts(student.duration);
   let html='<div class="overlay" onclick="if(event.target===this) closeTimeChangeRequestForm()"><div class="modal">';
   html+='<h3>Request a permanent day/time change for '+student.name+'</h3>';
-  html+='<p>Pick the new regular day(s)/time(s) — the number of sessions per week stays the same ('+f.recurring.length+'x/week). Front desk will review this before anything changes; schedule change requests need at least a week\'s notice before the 1st of the month they take effect in.</p>';
+  // Sept 2026, per Allie's own wording for this box.
+  html+='<p>Select the new regular day(s) and time(s) you would like. Only available session times will be shown.</p>'
+    +'<p>Once confirmed, your new schedule will be updated automatically.</p>';
+  // Current schedule shown as its own, un-editable reference point (Sept 2026, per Allie: "it needs
+  // to show the current scheduled days and times, and allow for a parent to select when they would
+  // like to come in instead") — pulled from currentRecurring, a frozen snapshot taken when the form
+  // opened, so it keeps reading correctly even after the picker below has been changed.
+  html+='<div class="small muted" style="margin-bottom:12px"><b>Currently:</b> '
+    +(f.currentRecurring.length? f.currentRecurring.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ') : 'no regular schedule on file')
+  +'</div>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
-  html+=renderRecurringPickers(f.recurring, starts, 'setTimeChangeRecurringSlot');
+  // The time dropdown itself is filtered to only genuinely-open times per day (Sept 2026, per
+  // Allie: "Only available session times will be shown") rather than showing every time slot with a
+  // badge after the fact. The one exception: whatever the parent currently has selected always stays
+  // in the list even if it's since gone full, so the dropdown never silently discards their pick out
+  // from under them — that case is instead flagged right below with a "Join waitlist" button.
+  html+=renderTimeChangeRecurringPickers(f.recurring, student.duration, student.year);
+  html+='<div style="margin:-8px 0 14px">'+f.recurring.map(function(slot, idx){
+    const available=standingSlotHasAvailability(slot.weekday, slot.start, student.duration, student.year);
+    return available? '' : '<div class="small" style="margin-bottom:6px">'+slot.weekday+' '+minToLabel(slot.start)+' — '
+      +'<span class="badge full">Full right now</span> <button class="btn sm ghost" style="margin-left:6px" onclick="joinWaitlistFromTimeChangeRequest('+idx+')">Join waitlist for this time</button>'
+    +'</div>';
+  }).join('')+'</div>';
   html+='<label>Effective from</label><input type="date" value="'+f.effectiveFrom+'" onchange="setTimeChangeRequestField(\'effectiveFrom\',this.value)"/>';
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. school sport moved to Tuesdays" value="'+f.note+'" oninput="setTimeChangeRequestField(\'note\',this.value)"/>';
   html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
@@ -6606,8 +6828,11 @@ function renderCancelRequestModal(){
   const student=findStudent(f.studentId);
   let html='<div class="overlay" onclick="if(event.target===this) closeCancelRequestForm()"><div class="modal">';
   html+='<h3>Request to cancel '+student.name+'’s enrolment</h3>';
-  html+='<p>Front desk will review this before anything changes. Cancellation requests need at least a week\'s notice before the 1st of the month they take effect in.</p>';
+  // Sept 2026, per Allie's own wording for this box.
+  html+='<p>Our team will review your request and confirm it with you before any changes are made.</p>'
+    +'<p>Cancellation requests must be submitted at least 7 days before your next monthly payment cycle. All monthly payment cycles are processed on the 1st of each month.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  if(f.lateNotice) html+='<div class="banner warn">This cancellation request is within the 7-day notice period for the upcoming payment cycle. Your next payment will still be processed, and your cancellation will take effect from the following month.</div>';
   html+='<label>Effective from</label><input type="date" value="'+f.effectiveFrom+'" onchange="setCancelRequestField(\'effectiveFrom\',this.value)"/>';
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. moving away, taking a break" value="'+f.note+'" oninput="setCancelRequestField(\'note\',this.value)"/>';
   html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
@@ -6623,7 +6848,10 @@ function renderParentWaitlistModal(){
   const student=findStudent(f.studentId);
   let html='<div class="overlay" onclick="if(event.target===this) closeParentWaitlistForm()"><div class="modal">';
   html+='<h3>Join the waitlist for '+student.name+'</h3>';
-  html+='<p>Logs your interest in a day/time that\'s currently full or unstaffed — it doesn\'t book anything. Front desk will reach out the moment a seat opens up, first-come-first-served against anyone else already waiting for that same slot.</p>';
+  // Sept 2026, per Allie's own wording for this box.
+  html+='<p><b>Can’t find the day or time you need?</b></p>'
+    +'<p>Join the waitlist and let us know your preferred day and time. If a suitable session becomes available, our team will contact you.</p>'
+    +'<p>Joining the waitlist does not book or guarantee a session, and places are offered in the order requests are received.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<label>Weekday</label><select onchange="setParentWaitlistField(\'weekday\',this.value)">'
     +WEEKDAY_KEYS.map(function(wd){ return '<option value="'+wd+'"'+(wd===f.weekday?' selected':'')+'>'+wd+'</option>'; }).join('')
@@ -6631,10 +6859,12 @@ function renderParentWaitlistModal(){
   html+='<label>Start time</label><select onchange="setParentWaitlistField(\'start\',this.value)">'
     +AVAIL_BLOCKS.map(function(hb){ return '<option value="'+hb+'"'+(hb===f.start?' selected':'')+'>'+minToLabel(hb)+'</option>'; }).join('')
     +'</select>';
-  html+='<label>Duration</label><select onchange="setParentWaitlistField(\'duration\',this.value)">'
-    +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===f.duration?' selected':'')+'>'+d+' min</option>'; }).join('')
-    +'</select>';
-  html+='<label>Note (optional)</label><input type="text" placeholder="e.g. flexible on 60 vs 90 min" value="'+f.note+'" oninput="setParentWaitlistField(\'note\',this.value)"/>';
+  // No duration picker here — a student's session length is set by front desk at enrollment, not
+  // something a parent chooses for themselves (Sept 2026, per Allie: "parents shouldn't get to
+  // select the duration of their session, this has been pre-determined by us"). Shown as plain text
+  // instead, just so it's clear which length this waitlist entry is actually for.
+  html+='<label>Session length</label><div class="small muted" style="margin-bottom:10px">'+f.duration+' min — '+student.name+'\'s usual session length</div>';
+  html+='<label>Note (optional)</label><input type="text" placeholder="e.g. after 4pm works best most days" value="'+f.note+'" oninput="setParentWaitlistField(\'note\',this.value)"/>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeParentWaitlistForm()">Cancel</button>'
     +'<button class="btn primary" onclick="saveParentWaitlistForm()">Add to waitlist</button>'
@@ -6686,8 +6916,12 @@ function renderSlotPicker(credit){
   if(sameDayMakeUpCutoffPassed()) html+='<div class="small muted" style="margin-bottom:6px">It\'s past 10:00am, so today isn\'t offered for a make-up — the earliest option below is tomorrow.</div>';
   if(opts.length===0) html+='<div class="empty-note">No open slots in the next two weeks for this program.</div>';
   opts.slice(0,10).forEach(function(o){
-    html+='<div class="slot-opt"><span>'+fmtShort(o.date)+' · '+rangeLabel(o.start,o.duration)+'</span>'
-      +'<button class="btn sm primary" onclick="bookSlot(\''+credit.id+'\',\''+toKey(o.date)+'\','+o.start+','+o.duration+',\''+o.podId+'\',\''+o.instructorId+'\')">Book</button></div>';
+    // An Online option's podId is a real null — pass '' through the onclick (never the string
+    // "null", which bookSlot would otherwise treat as a truthy Pod id) and let the trailing `true`
+    // tell bookSlot to force it null itself and stamp the session as Online.
+    const locationLabel = o.online? ' <span class="pill online" style="margin-left:6px">Online — '+findInstructor(o.instructorId).name+'</span>' : '';
+    html+='<div class="slot-opt"><span>'+fmtShort(o.date)+' · '+rangeLabel(o.start,o.duration)+locationLabel+'</span>'
+      +'<button class="btn sm primary" onclick="bookSlot(\''+credit.id+'\',\''+toKey(o.date)+'\','+o.start+','+o.duration+',\''+(o.online?'':o.podId)+'\',\''+o.instructorId+'\','+(!!o.online)+')">Book</button></div>';
   });
   html+='<button class="btn sm ghost" onclick="cancelBookMakeUp()">Back</button></div>';
   return html;
