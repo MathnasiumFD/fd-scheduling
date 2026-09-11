@@ -1797,9 +1797,10 @@ function setTimeChangeRecurringSlot(idx, field, value){
 function joinWaitlistFromTimeChangeRequest(idx){
   const f=state.timeChangeRequestForm;
   const slot=f.recurring[idx];
+  const currentSlot=f.currentRecurring[idx]; // the exact current session this row was trying to replace
   const studentId=f.studentId;
   state.timeChangeRequestForm=null;
-  openParentWaitlistForm(studentId, slot.weekday, slot.start);
+  openParentWaitlistForm(studentId, slot.weekday, slot.start, currentSlot);
 }
 function submitTimeChangeRequest(){
   const f=state.timeChangeRequestForm;
@@ -1820,7 +1821,12 @@ function submitTimeChangeRequest(){
   // renderEnrollmentRequestsPanel's "Ready to approve" flag), but when every slot is open there's
   // nothing for them to check first, so approval is just a formality rather than research.
   const allAvailable=recurring.every(function(r){ return standingSlotHasAvailability(r.weekday, r.start, student.duration, student.year); });
-  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'time_change', start:null, end:null, effectiveFrom:effectiveFrom, requestedRecurring:recurring, note:f.note.trim(), status:'open', createdAt:simNow()};
+  // previousRecurring is f.currentRecurring — the frozen snapshot taken when the form opened —
+  // carried onto the request itself so front desk's approval view can show the swap pairing
+  // (Sept 2026, per Allie: "we need to be aware of which" day is being given up) without relying on
+  // the student's live record, which could in principle have moved on by the time someone reviews it.
+  const previousRecurring=f.currentRecurring.map(function(r){ return {weekday:r.weekday, start:r.start}; });
+  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'time_change', start:null, end:null, effectiveFrom:effectiveFrom, previousRecurring:previousRecurring, requestedRecurring:recurring, note:f.note.trim(), status:'open', createdAt:simNow()};
   enrollmentRequests.push(req);
   dbWrite('submitting a schedule-change request', function(){
     return supabaseClient.from('enrollment_requests').insert({
@@ -1828,6 +1834,11 @@ function submitTimeChangeRequest(){
     }).then(function(r){
       if(r.error) return r;
       return supabaseClient.from('enrollment_request_recurring').insert(recurring.map(function(rec){
+        return {request_id:req.id, weekday:rec.weekday, start_min:rec.start};
+      }));
+    }).then(function(r){
+      if(r.error || !previousRecurring.length) return r;
+      return supabaseClient.from('enrollment_request_previous_recurring').insert(previousRecurring.map(function(rec){
         return {request_id:req.id, weekday:rec.weekday, start_min:rec.start};
       }));
     });
@@ -2112,6 +2123,31 @@ function regenerateAllRecurring(){
 function recurringSummary(student){
   if(!student.recurring || student.recurring.length===0) return 'Not set';
   return student.recurring.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ');
+}
+// Shared "current -> desired" pairing text for the waitlist and permanent-change-request swap
+// displays below (Sept 2026, per Allie: "the function needs to be: swap (current day) for (desired
+// day)... and we need to be aware of which [day is being given up]") — a bare new day/time request
+// gives front desk no way to tell a genuine swap (a family moving one standing slot to another)
+// apart from someone asking to simply add a session, so both flows now say explicitly which current
+// slot funds the new one.
+function swapLabel(fromWeekday, fromStart, toWeekday, toStart){
+  return fromWeekday+' '+minToLabel(fromStart)+' → '+toWeekday+' '+minToLabel(toStart);
+}
+// Pairs a time-change request's previous schedule against its requested one, positionally (the form
+// never adds/removes rows — frequency stays fixed, only day/time per row can change, see
+// applyTimeChange's comment) — so index i's "before" is always index i's "after". Falls back to a
+// plain summary for a request submitted before previousRecurring existed (legacy data with nothing
+// to pair against) or the rare case the lengths don't line up.
+function timeChangeSwapDetail(req){
+  const prev=req.previousRecurring||[];
+  const next=req.requestedRecurring||[];
+  if(prev.length===0 || prev.length!==next.length) return 'Change to '+recurringSummary({recurring:next});
+  return next.map(function(n,i){
+    const p=prev[i];
+    return (p.weekday===n.weekday && p.start===n.start)
+      ? p.weekday+' '+minToLabel(p.start)+' (unchanged)'
+      : 'Swap: '+swapLabel(p.weekday, p.start, n.weekday, n.start);
+  }).join(', ');
 }
 
 /* ---------- automatic school-year promotion ---------- */
@@ -3334,19 +3370,43 @@ function waitlistWouldFitIgnoringQueue(entry){
   return !!pickBestPodWithClaims(entry.weekday, dateKey, entry.start, entry.duration, year, []);
 }
 function openWaitlistForm(weekday, start){
-  state.waitlistForm={mode:'existing', studentId:'', name:'', year:1, weekday: weekday||'Mon', start: start!=null? start : AVAIL_BLOCKS[0], duration:60, note:'', error:''};
+  state.waitlistForm={mode:'existing', studentId:'', name:'', year:1, weekday: weekday||'Mon', start: start!=null? start : AVAIL_BLOCKS[0], duration:60, note:'', error:'', swapWeekday:'', swapStart:null};
   render();
 }
 function closeWaitlistForm(){ state.waitlistForm=null; render(); }
 function setWaitlistMode(mode){
   state.waitlistForm.mode=mode;
+  // A "new enquiry" has no current session to give up — there's nothing to swap (Sept 2026, per
+  // Allie: swap pairing only applies when there's an existing student/session on the other end of it).
+  if(mode==='new'){ state.waitlistForm.swapWeekday=''; state.waitlistForm.swapStart=null; }
   state.waitlistForm.error='';
   render();
 }
 function setWaitlistField(field, value){
   const f=state.waitlistForm;
-  f[field] = (field==='start'||field==='duration'||field==='year')? Number(value): value;
-  if(field==='studentId' && value){ f.duration=findStudent(value).duration; } // match their usual length
+  f[field] = (field==='start'||field==='duration'||field==='year'||field==='swapStart')? Number(value): value;
+  if(field==='studentId' && value){
+    const st=findStudent(value);
+    f.duration=st.duration; // match their usual length
+    // Picking a different student resets which of THEIR current sessions is being swapped out —
+    // defaults to their first standing slot if they have one, otherwise there's nothing to swap.
+    const firstSlot=(st.recurring && st.recurring.length)? st.recurring[0] : null;
+    f.swapWeekday=firstSlot? firstSlot.weekday : '';
+    f.swapStart=firstSlot? firstSlot.start : null;
+  }
+  f.error='';
+  render();
+}
+// A single dropdown value (the index into the chosen student's recurring array) sets both
+// swapWeekday and swapStart together in one go, so the pairing is always internally consistent
+// rather than risking a mismatched weekday/start from two separate selects (Sept 2026, per Allie:
+// "swap (current day) for (desired day)... we need to be aware of which").
+function setWaitlistSwapSlot(idx){
+  const f=state.waitlistForm;
+  const student=f.studentId? findStudent(f.studentId) : null;
+  const slot=student && student.recurring? student.recurring[Number(idx)] : null;
+  f.swapWeekday=slot? slot.weekday : '';
+  f.swapStart=slot? slot.start : null;
   f.error='';
   render();
 }
@@ -3354,18 +3414,31 @@ function saveWaitlistForm(){
   const f=state.waitlistForm;
   if(f.mode==='existing' && !f.studentId){ f.error='Choose a student.'; render(); return; }
   if(f.mode==='new' && !f.name.trim()){ f.error='Enter a name.'; render(); return; }
+  // Every existing-student waitlist join must say which of their current sessions it would replace
+  // (Sept 2026, per Allie: "I need each request to be visible... swap (current day) for (desired
+  // day)... always required") — skipped only for a student with no standing sessions at all to give
+  // up (e.g. mid-enrolment setup), since there's genuinely nothing to pair against there.
+  if(f.mode==='existing'){
+    const swapStudent=findStudent(f.studentId);
+    if(swapStudent.recurring && swapStudent.recurring.length && !f.swapWeekday){
+      f.error='Choose which of their current sessions this would replace.'; render(); return;
+    }
+  }
   const entry={
     id:newId()||('wl'+(nextWaitlistId++)),
     studentId: f.mode==='existing'? f.studentId : null,
     name: f.mode==='existing'? findStudent(f.studentId).name : f.name.trim(),
     year: f.mode==='existing'? findStudent(f.studentId).year : f.year,
     weekday:f.weekday, start:f.start, duration:f.duration,
+    swapWeekday: f.mode==='existing'? (f.swapWeekday||null) : null,
+    swapStart: f.mode==='existing'? (f.swapStart!=null? f.swapStart : null) : null,
     note:f.note, dateAdded:new Date(simNow()), notified:false, status:'waiting',
   };
   waitlist.push(entry);
   dbWrite('adding to waitlist', function(){ return supabaseClient.from('waitlist_entries').insert({
     id:entry.id, student_id:entry.studentId, name:entry.name, year:entry.year, weekday:entry.weekday,
-    start_min:entry.start, duration:entry.duration, note:entry.note, status:'waiting', notified:false,
+    start_min:entry.start, duration:entry.duration, swap_weekday:entry.swapWeekday, swap_start_min:entry.swapStart,
+    note:entry.note, status:'waiting', notified:false,
     date_added:entry.dateAdded.toISOString()
   }); });
   toast(entry.name+' added to the waitlist for '+f.weekday+' '+rangeLabel(f.start,f.duration)+'.');
@@ -3405,9 +3478,17 @@ function currentParentRecord(){
 // weekday/start are optional pre-fills — used when a parent lands here from a specific slot they
 // already picked elsewhere (e.g. an unavailable choice on the schedule-change-request form, see
 // joinWaitlistFromTimeChangeRequest()) rather than starting from the default Monday/opening-time.
-function openParentWaitlistForm(studentId, weekday, start){
+// swapSlot is optional — passed by joinWaitlistFromTimeChangeRequest() when the parent lands here
+// from a specific "my current X isn't open at the new time" row, so the exact current session
+// they were trying to move pre-fills rather than just guessing their first standing slot.
+function openParentWaitlistForm(studentId, weekday, start, swapSlot){
   const student=findStudent(studentId);
-  state.parentWaitlistForm={studentId:studentId, weekday:weekday||'Mon', start:start!=null? start : AVAIL_BLOCKS[0], duration:student.duration, note:'', error:''};
+  // Defaults to the family's first standing session as the one being swapped out — always required
+  // below on submit (Sept 2026, per Allie: "swap (current day) for (desired day)... always
+  // required"), skipped only if this child genuinely has no current standing session to give up.
+  const defaultSwap=swapSlot || ((student.recurring && student.recurring.length)? student.recurring[0] : null);
+  state.parentWaitlistForm={studentId:studentId, weekday:weekday||'Mon', start:start!=null? start : AVAIL_BLOCKS[0], duration:student.duration, note:'', error:'',
+    swapWeekday: defaultSwap? defaultSwap.weekday : '', swapStart: defaultSwap? defaultSwap.start : null};
   render();
 }
 function closeParentWaitlistForm(){ state.parentWaitlistForm=null; render(); }
@@ -3417,19 +3498,39 @@ function setParentWaitlistField(field, value){
   f.error='';
   render();
 }
+// Mirrors setWaitlistSwapSlot() on the front-desk form — one dropdown (the index into this child's
+// recurring array) sets weekday+start together so the pairing can't come apart into a mismatched
+// combination.
+function setParentWaitlistSwapSlot(idx){
+  const f=state.parentWaitlistForm;
+  const student=findStudent(f.studentId);
+  const slot=student.recurring? student.recurring[Number(idx)] : null;
+  f.swapWeekday=slot? slot.weekday : '';
+  f.swapStart=slot? slot.start : null;
+  f.error='';
+  render();
+}
 function saveParentWaitlistForm(){
   const f=state.parentWaitlistForm;
   const student=findStudent(f.studentId);
+  // Required whenever this child actually has a current standing session to name (Sept 2026, per
+  // Allie: "I need each request to be visible... swap (current day) for (desired day)... not all
+  // three, and they must not disappear" — the always-required half of that instruction).
+  if(student.recurring && student.recurring.length && !f.swapWeekday){
+    f.error='Choose which current session this would replace.'; render(); return;
+  }
   const entry={
     id:newId()||('wl'+(nextWaitlistId++)),
     studentId:student.id, name:student.name, year:student.year,
     weekday:f.weekday, start:f.start, duration:f.duration,
+    swapWeekday: f.swapWeekday||null, swapStart: f.swapStart!=null? f.swapStart : null,
     note:f.note, dateAdded:new Date(simNow()), notified:false, status:'waiting',
   };
   waitlist.push(entry);
   dbWrite('adding to waitlist (parent)', function(){ return supabaseClient.from('waitlist_entries').insert({
     id:entry.id, student_id:entry.studentId, name:entry.name, year:entry.year, weekday:entry.weekday,
-    start_min:entry.start, duration:entry.duration, note:entry.note, status:'waiting', notified:false,
+    start_min:entry.start, duration:entry.duration, swap_weekday:entry.swapWeekday, swap_start_min:entry.swapStart,
+    note:entry.note, status:'waiting', notified:false,
     date_added:entry.dateAdded.toISOString()
   }); });
   toast(student.name+' added to the waitlist for '+f.weekday+' '+rangeLabel(f.start,f.duration)+'.');
@@ -4042,7 +4143,16 @@ function render(){
     const scope = restore.inModal ? app.querySelector('.modal') : app;
     const el = scope && scope.querySelectorAll('input, textarea')[restore.idx];
     if(el){
-      el.focus();
+      // {preventScroll:true} matters here (Sept 2026 fix — "click anywhere and the page jumps
+      // halfway down on its own"): focus() on an element outside the current viewport otherwise
+      // scrolls it into view as a side effect. That's fine right after a keystroke (the field IS
+      // the viewport), but this restore also fires after a click on something else entirely —
+      // clicking a non-focusable control (a collapsible section header, a plain label) never blurs
+      // whatever text field was last focused, e.g. the check-in search box, so `active` above is
+      // still that field even though the user's attention has clearly moved on. Without
+      // preventScroll, every one of those unrelated clicks yanked the page back to wherever that
+      // stale field happened to be sitting.
+      el.focus({preventScroll:true});
       if(restore.start!=null && restore.end!=null && typeof el.setSelectionRange==='function'){
         try{ el.setSelectionRange(restore.start, restore.end); }catch(e){}
       }
@@ -4918,7 +5028,7 @@ function renderEnrollmentRequestsPanel(){
     const detail = r.type==='hold'
       ? 'Hold: '+fmtShort(r.start)+'–'+fmtShort(r.end)
       : r.type==='time_change'
-      ? 'Change to '+recurringSummary({recurring:r.requestedRecurring||[]})+' from '+fmtShort(r.effectiveFrom)+(readyToApprove? ' <span class="badge available">All times open — ready to approve</span>' : '')
+      ? timeChangeSwapDetail(r)+' from '+fmtShort(r.effectiveFrom)+(readyToApprove? ' <span class="badge available">All times open — ready to approve</span>' : '')
       : '<span class="badge full">Cancel enrolment</span> from '+fmtShort(r.effectiveFrom);
     html+='<tr><td>'+student.name+'</td><td class="small">'+(parent?parent.name:'—')+'</td>'
       +'<td>'+detail+'</td>'
@@ -5037,15 +5147,22 @@ function renderWaitlistPanel(){
   html+='<p>Families waiting for a Mon–Fri day/time that\'s currently full or unstaffed — matched on day, time, and session length, not a specific Pod, the same way a regular booking auto-picks whichever Pod fits (5.8). First in, first served: when a slot opens up, whoever\'s been waiting longest for it gets flagged first — a later entry won\'t show that same opening until the family ahead of them is booked or removed. When a matching seat opens up, reach out and finish the booking through the usual booking (5.1) or new-student (5.6) flow — this list is just what tells you it\'s worth the call.</p>';
   if(waiting.length===0){ html+='<div class="empty-note">Nobody currently waiting.</div>'; }
   else{
-    html+='<table><tr><th>Day / time</th><th>Name</th><th>Year</th><th>Added</th><th>Note</th><th>Status</th><th></th></tr>';
+    html+='<table><tr><th>Day / time wanted</th><th>Swapping out</th><th>Name</th><th>Year</th><th>Added</th><th>Note</th><th>Status</th><th></th></tr>';
     waiting.forEach(function(w){
       const seat=waitlistOpenSeat(w);
       const kindTag = w.studentId? '' : ' <span class="small muted">(new enquiry)</span>';
       const displayYear = w.studentId? findStudent(w.studentId).year : w.year; // live for an existing student, so a promotion (5.9) is reflected here too
+      // Which current session this join would give up if the wanted slot opens — a bare new-slot
+      // request left front desk with no way to tell a genuine swap apart from an added session
+      // (Sept 2026, per Allie: "swap (current day) for (desired day)... we need to be aware of which").
+      const swapCell = w.swapWeekday
+        ? w.swapWeekday+' '+minToLabel(w.swapStart)
+        : (w.studentId? '<span class="small muted">—</span>' : '<span class="small muted">New enquiry</span>');
       const statusCell = seat
         ? '<span class="badge available">Seat open — '+findPod(seat.podId).name+' '+fmtShort(seat.date)+'</span>'+(w.notified? ' <span class="small muted">(contacted)</span>' : '')
         : (waitlistWouldFitIgnoringQueue(w)? '<span class="small muted">Open, but someone ahead of you in line for it</span>' : '<span class="small muted">Still full</span>');
       html+='<tr><td>'+w.weekday+' '+rangeLabel(w.start,w.duration)+'</td>'
+        +'<td>'+swapCell+'</td>'
         +'<td>'+w.name+kindTag+'</td>'
         +'<td>'+displayYear+'</td>'
         +'<td class="small muted">'+fmtShort(w.dateAdded)+'</td>'
@@ -5114,6 +5231,19 @@ function renderWaitlistModal(){
     html+='<label>Student</label><select onchange="setWaitlistField(\'studentId\',this.value)"><option value="">Choose…</option>'
       +students.map(function(s){ return '<option value="'+s.id+'"'+(s.id===f.studentId?' selected':'')+'>'+s.name+' ('+yearLabel(s.year)+')</option>'; }).join('')
       +'</select>';
+    // Which of THEIR current sessions this join would swap out — required whenever they have one
+    // (Sept 2026, per Allie: "swap (current day) for (desired day)... we need to be aware of which").
+    if(f.studentId){
+      const swapStudent=findStudent(f.studentId);
+      if(swapStudent.recurring && swapStudent.recurring.length){
+        const selectedIdx=swapStudent.recurring.findIndex(function(r){ return r.weekday===f.swapWeekday && r.start===f.swapStart; });
+        html+='<label>Swap out which current session?</label><select onchange="setWaitlistSwapSlot(this.value)"><option value="">Choose…</option>'
+          +swapStudent.recurring.map(function(r,i){ return '<option value="'+i+'"'+(i===selectedIdx?' selected':'')+'>'+r.weekday+' '+minToLabel(r.start)+'</option>'; }).join('')
+          +'</select>';
+      } else {
+        html+='<div class="small muted" style="margin-bottom:10px">'+swapStudent.name+' has no current standing session to swap out.</div>';
+      }
+    }
   } else {
     html+='<label>Name</label><input type="text" placeholder="Family or student name" value="'+f.name+'" oninput="setWaitlistField(\'name\',this.value)"/>';
     html+='<label>School year</label><select onchange="setWaitlistField(\'year\',this.value)">'
@@ -6682,6 +6812,7 @@ function renderParent(){
           ? '<span class="badge available">Seat open — let front desk know you\'d like it</span>'
           : '<span class="small muted">Still waiting</span>';
         return '<div class="session-row"><div class="session-main"><b>'+w.weekday+' '+rangeLabel(w.start,w.duration)+'</b>'
+          +(w.swapWeekday? '<div class="small muted">Swapping out: '+w.swapWeekday+' '+minToLabel(w.swapStart)+'</div>' : '')
           +(w.note? '<div class="small muted">'+w.note+'</div>' : '')+'</div>'+statusNote
           +'<button class="btn sm ghost" onclick="parentRemoveWaitlistEntry(\''+w.id+'\')">Leave waitlist</button></div>';
       }).join('')+'</div>';
@@ -6854,6 +6985,15 @@ function renderParentWaitlistModal(){
     +'<p>Join the waitlist and let us know your preferred day and time. If a suitable session becomes available, our team will contact you.</p>'
     +'<p>Joining the waitlist does not book or guarantee a session, and places are offered in the order requests are received.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  // Which current session this join would replace — always required when there is one (Sept 2026,
+  // per Allie: "swap (current day) for (desired day)... always required"), so front desk sees a
+  // genuine swap request rather than a bare "wants this new time" with no idea what's being freed up.
+  if(student.recurring && student.recurring.length){
+    const selectedIdx=student.recurring.findIndex(function(r){ return r.weekday===f.swapWeekday && r.start===f.swapStart; });
+    html+='<label>Which current session would this replace?</label><select onchange="setParentWaitlistSwapSlot(this.value)"><option value="">Choose…</option>'
+      +student.recurring.map(function(r,i){ return '<option value="'+i+'"'+(i===selectedIdx?' selected':'')+'>'+r.weekday+' '+minToLabel(r.start)+'</option>'; }).join('')
+      +'</select>';
+  }
   html+='<label>Weekday</label><select onchange="setParentWaitlistField(\'weekday\',this.value)">'
     +WEEKDAY_KEYS.map(function(wd){ return '<option value="'+wd+'"'+(wd===f.weekday?' selected':'')+'>'+wd+'</option>'; }).join('')
     +'</select>';
@@ -7049,7 +7189,7 @@ var LIVE_SYNC_TABLES=['instructors','instructor_avail_rules','instructor_one_off
   'pod_shift_assignments','pod_shift_one_off_coverage','students','student_recurring_slots','student_holds',
   'student_pod_assignments','student_plan_changes','student_plan_change_recurring','parents','sessions',
   'credits','coverage_requests','coverage_request_notified_instructors','waitlist_entries','closed_days',
-  'enrollment_requests','enrollment_request_recurring','staff_members'];
+  'enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring','staff_members'];
 function subscribeToLiveUpdates(){
   let channel=supabaseClient.channel('live-updates');
   LIVE_SYNC_TABLES.forEach(function(t){
@@ -7154,13 +7294,14 @@ function loadAllData(){
     T('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note'),
     T('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
     T('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
-    T('waitlist_entries','id,student_id,name,year,weekday,start_min,duration,note,status,notified,date_added'),
+    T('waitlist_entries','id,student_id,name,year,weekday,start_min,duration,swap_weekday,swap_start_min,note,status,notified,date_added'),
     T('closed_days','id,the_date,label,recurring'),
     T('enrollment_requests','id,student_id,type,start_date,end_date,effective_from,note,status,created_at'),
     T('enrollment_request_recurring','id,request_id,weekday,start_min'),
+    T('enrollment_request_previous_recurring','id,request_id,weekday,start_min'),
     T('staff_members','id,name,email,auth_user_id'),
   ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,staffMemberRows]=t;
+    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows]=t;
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
@@ -7227,6 +7368,7 @@ function loadAllData(){
 
     waitlist=waitlistRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, name:r.name, year:r.year, weekday:r.weekday, start:r.start_min, duration:r.duration,
+      swapWeekday:r.swap_weekday||null, swapStart: r.swap_start_min!=null? r.swap_start_min : null,
       note:r.note||'', dateAdded:new Date(r.date_added), notified:r.notified, status:r.status,
     }; });
 
@@ -7240,6 +7382,8 @@ function loadAllData(){
       end: r.end_date? new Date(r.end_date) : null,
       effectiveFrom: r.effective_from? new Date(r.effective_from) : null,
       requestedRecurring: enrollRequestRecurRows.filter(function(rr){ return rr.request_id===r.id; })
+        .map(function(rr){ return {weekday:rr.weekday, start:rr.start_min}; }),
+      previousRecurring: enrollRequestPrevRecurRows.filter(function(rr){ return rr.request_id===r.id; })
         .map(function(rr){ return {weekday:rr.weekday, start:rr.start_min}; }),
       note:r.note||'', status:r.status, createdAt:new Date(r.created_at),
     }; });
