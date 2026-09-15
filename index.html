@@ -1521,6 +1521,13 @@ function openPlanChangeForm(studentId){
     studentId, mode:'stop', effectiveFrom:toKey(simNow()),
     sessionsPerWeek: student.sessionsPerWeek,
     recurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
+    // Untouched snapshot of the row-for-row CURRENT pattern, purely for display (see
+    // renderRecurringPickers' originals param) — recurring above is the editable copy and gets
+    // overwritten in place as rows change, so without this there'd be nothing left showing what a
+    // row used to be once you'd already changed it (Sept 2026, per Allie: "it needs to state his
+    // currently scheduled sessions... particularly necessary for students who might only need to
+    // move one session, not both").
+    originalRecurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
     error:''
   };
   render();
@@ -4238,7 +4245,11 @@ function openRecurringForm(studentId){
   let slots = (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; });
   while(slots.length<student.sessionsPerWeek) slots.push({weekday:'Mon', start:starts[0]});
   slots=slots.slice(0,student.sessionsPerWeek);
-  state.recurringForm={studentId, slots};
+  // Snapshot of what each row actually was BEFORE this edit, kept untouched for the life of the
+  // form purely to show "Currently: ..." next to each picker (see renderRecurringPickers) — slots
+  // itself gets overwritten row by row as the pickers change, so without a separate copy there'd be
+  // nothing left to compare against once you started editing.
+  state.recurringForm={studentId, slots, originalSlots: slots.map(function(s){ return {weekday:s.weekday, start:s.start}; })};
   render();
 }
 function closeRecurringForm(){ state.recurringForm=null; render(); }
@@ -6556,9 +6567,22 @@ function renderHoldModal(){
 // a plan/time-change request) omits it and gets the plain day/time-only row it always has, since
 // Preferred Pod is specifically an enrollment-time convenience — an existing student's Pod is
 // changed via "Change Pod" instead, which already supports per-weekday pins.
-function renderRecurringPickers(slots, starts, setter, podSetter){
+//
+// originals is also optional — the student's day/time BEFORE this edit, matched positionally to
+// slots (Sept 2026, per Allie: "it needs to state his currently scheduled sessions... particularly
+// necessary for students who might only need to move one session, not both" — with several rows on
+// screen and no reminder of which was which, it was easy to lose track of which day was actually
+// meant to change and which was supposed to stay put). Only the two callers editing an EXISTING
+// student's schedule (renderRecurringModal, renderPlanChangeModal) pass this; enrollment has no
+// "currently" to show. originals[idx] missing (the row is new, beyond what they already had) reads
+// as "New session" rather than a currently-blank line.
+function renderRecurringPickers(slots, starts, setter, podSetter, originals){
   let html='';
   slots.forEach(function(s, idx){
+    if(originals){
+      const orig=originals[idx];
+      html+='<div class="small muted" style="margin-bottom:2px">'+(orig? 'Currently: '+orig.weekday+' '+minToLabel(orig.start) : 'New session')+'</div>';
+    }
     html+='<div class="row2 recurring-row"><div><label>Day '+(idx+1)+'</label><select onchange="'+setter+'('+idx+',\'weekday\',this.value)">'
         +WEEKDAY_KEYS.map(function(d){ return '<option value="'+d+'"'+(d===s.weekday?' selected':'')+'>'+d+'</option>'; }).join('')
       +'</select></div>'
@@ -6673,7 +6697,7 @@ function renderRecurringModal(){
   let html='<div class="overlay" onclick="if(event.target===this) closeRecurringForm()"><div class="modal">';
   html+='<h3>'+student.name+'’s regular schedule</h3>';
   html+='<p>The system pre-books actual sessions from this automatically, using the same qualification, availability, and capacity rules as any other booking. Front desk can still move or cancel any individual session.</p>';
-  html+=renderRecurringPickers(f.slots, starts, 'setRecurringSlot');
+  html+=renderRecurringPickers(f.slots, starts, 'setRecurringSlot', null, f.originalSlots);
   html+='<div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeRecurringForm()">Cancel</button>'
     +'<button class="btn primary" onclick="saveRecurringForm()">Save schedule</button>'
@@ -6835,6 +6859,10 @@ function renderPlanChangeModal(){
   html+='<h3>Stop or change '+student.name+'’s plan</h3>';
   html+='<p>Schedules a change to take effect from a chosen future date, without disturbing anything between now and then — the same way a regular Pod pin or a hold works. Sessions already booked before the effective date are left alone; regular sessions from that date on regenerate to match automatically.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  // Sept 2026, per Allie: state what they're currently on up front, before front desk touches
+  // anything — "used to come on Mondays, now Tuesdays" only reads clearly if the "used to" half is
+  // right there too, not just implied by whatever the pickers happened to default to.
+  html+='<div class="small muted" style="margin-bottom:8px">Currently: '+(f.originalRecurring.length? f.originalRecurring.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ') : 'Not currently on a standing schedule')+'</div>';
   html+='<div style="display:flex;gap:14px;margin-bottom:8px;font-size:.8rem">'
     +'<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0"><input type="radio" name="pcmode" style="width:auto" '+(f.mode==='stop'?'checked':'')+' onchange="setPlanChangeMode(\'stop\')"/> Stop attending</label>'
     +'<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0"><input type="radio" name="pcmode" style="width:auto" '+(f.mode==='frequency'?'checked':'')+' onchange="setPlanChangeMode(\'frequency\')"/> Change frequency</label>'
@@ -6845,7 +6873,7 @@ function renderPlanChangeModal(){
       +SESSIONS_PER_WEEK_OPTIONS.map(function(n){ return '<option value="'+n+'"'+(n===f.sessionsPerWeek?' selected':'')+'>'+n+'x/week</option>'; }).join('')
       +'</select>';
     html+='<label>New regular schedule</label>';
-    html+=renderRecurringPickers(f.recurring, starts, 'setPlanChangeRecurringSlot');
+    html+=renderRecurringPickers(f.recurring, starts, 'setPlanChangeRecurringSlot', null, f.originalRecurring);
   }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closePlanChangeForm()">Cancel</button>'
