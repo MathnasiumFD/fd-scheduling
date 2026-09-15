@@ -132,6 +132,10 @@
   .badge.full{ background:var(--danger-bg); color:var(--danger); }
   .badge.handoff{ background:var(--accent-bg); color:var(--accent); }
   .badge.hold{ background:var(--warning-bg); color:var(--warning); }
+  /* Distinct from .badge.hold's amber "pausing" look — stopping outright is the more final of the
+     two, so it borrows the same red used for "Full"/danger elsewhere (Sept 2026, per Allie: "when a
+     student stops attending, much like when they are on hold, writing under name finishing date"). */
+  .badge.stopping{ background:var(--danger-bg); color:var(--danger); }
   /* One instructor's own custom pack-up countdown (Sept 2026, per Allie: "orange at 15 mins, red at
      5 minutes, purple from 0" — for Harry only, see instr.packUpCustomColors). The orange/red tiers
      reuse .badge.soon/.badge.full above (already the right colours); this is the one genuinely new
@@ -5263,9 +5267,15 @@ function renderStaff(){
     html+=renderCoverageRequestsPanel();
     html+=renderEnrollmentRequestsPanel();
     html+=renderCheckedInPanel();
-    html+=renderWaitlistPanel();
     html+=renderClosedDaysPanel();
   } else if(tab==='schedule'){
+    // Availability lookup and Waitlist sit at the very top of Schedule, above the day-by-day
+    // Schedule card itself (Sept 2026, per Allie: "move waitlist to schedule" + "move availability
+    // lookup to the top of the schedule tab") — both are forward-looking planning tools (what's
+    // regularly open, who's waiting for a slot), distinct from the day-to-day coverage grid below,
+    // so they lead the tab rather than trailing after it.
+    html+=renderAvailabilityLookup();
+    html+=renderWaitlistPanel();
     html+=sectionOpen('schedule','Schedule',
         '<div style="display:flex;gap:6px;align-items:center">'
           +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
@@ -5300,11 +5310,6 @@ function renderStaff(){
       +'<p class="small muted">Move a student here and it sticks — every '+weekday+' from '+fmtShort(selectedDate)+' onward, not just '+fmtShort(selectedDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead.</p>'
       +renderPodSummaryStrip(dayKey, weekday)
       +'</div>';
-
-    // Moved here from Today (Sept 2026, per Allie: "availability lookup needs to get moved to
-    // schedule") — a day/time-slot lookup tool belongs with the rest of the scheduling machinery,
-    // not the daily operational panels.
-    html+=renderAvailabilityLookup();
   } else if(tab==='students'){
     html+=renderStudentsPanel();
   } else if(tab==='parents'){
@@ -5984,7 +5989,18 @@ function renderStudentsPanel(){
     const short = booked < s.sessionsPerWeek;
     const hold=currentOrUpcomingHold(s.id);
     const holdActive = hold && toKey(hold.start)<=toKey(simNow());
-    html+='<tr><td>'+s.name+(hold? ' <span class="badge hold">'+(holdActive?'On hold':'Hold from '+fmtShort(hold.start))+'</span>' : '')+'</td><td>'+yearLabel(s.year)+'</td><td>'+s.sessionsPerWeek+'x/week · '+s.duration+' min</td>'
+    // A scheduled-but-not-yet-effective "stop attending" plan change (savePlanChange/
+    // applyStopEnrollment) — once its effective date actually arrives, applyPlanChanges() promotes
+    // it and the student drops off this list entirely (isStudentInactive), so this only ever shows
+    // for a stop that's still ahead of us, same window as the "Hold from <date>" badge above (Sept
+    // 2026, per Allie: "when a student stops attending, much like when they are on hold, writing
+    // under name finishing date").
+    const upcomingStop=currentOrUpcomingPlanChange(s.id);
+    const stopping = upcomingStop && upcomingStop.stopped;
+    html+='<tr><td>'+s.name
+        +(hold? ' <span class="badge hold">'+(holdActive?'On hold':'Hold from '+fmtShort(hold.start))+'</span>' : '')
+        +(stopping? ' <span class="badge stopping">Finishing '+fmtShort(new Date(upcomingStop.effectiveFrom))+'</span>' : '')
+      +'</td><td>'+yearLabel(s.year)+'</td><td>'+s.sessionsPerWeek+'x/week · '+s.duration+' min</td>'
       +'<td class="small">'+recurringSummary(s)+'</td>'
       +'<td>'+(short? '<span class="badge soon">'+booked+' / '+s.sessionsPerWeek+'</span>' : '<span class="badge available">'+booked+' / '+s.sessionsPerWeek+'</span>')+'</td>'
       +'<td class="small">'+(parent? parent.name : '—')+'</td>'
