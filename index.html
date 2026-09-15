@@ -136,6 +136,11 @@
      two, so it borrows the same red used for "Full"/danger elsewhere (Sept 2026, per Allie: "when a
      student stops attending, much like when they are on hold, writing under name finishing date"). */
   .badge.stopping{ background:var(--danger-bg); color:var(--danger); }
+  /* A brand-new student's very first day (Sept 2026, per Allie: "when enroling a new student, i need
+     it to let me set start date... i then need it to come up as a warning... i also want it to say
+     first day during their first session when sitting with an instructor") — its own colour so it
+     reads as a friendly heads-up, distinct from the hold/stopping badges above. */
+  .badge.firstday{ background:var(--purple-bg); color:var(--purple); }
   /* One instructor's own custom pack-up countdown (Sept 2026, per Allie: "orange at 15 mins, red at
      5 minutes, purple from 0" — for Harry only, see instr.packUpCustomColors). The orange/red tiers
      reuse .badge.soon/.badge.full above (already the right colours); this is the one genuinely new
@@ -1518,6 +1523,21 @@ function currentOrUpcomingPlanChange(studentId){
   return (student.planChanges||[]).slice().sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); })[0] || null;
 }
 
+// Every active student whose enrolment officially starts today (student.startDate, set at
+// enrollment — see openNewStudentForm/saveNewStudent) — drives both the Today-tab "First day"
+// warning (renderFirstDayPanel) and the instructor-side "First day!" tag on their session (Sept
+// 2026, per Allie: "i need it to let me set start date... it come up as a warning on the top of
+// today tab... first day during their first session when sitting with an instructor"). A student
+// enrolled with no start date on file at all (legacy data from before this feature) never matches —
+// nothing to warn about.
+function isStudentStartingToday(student){
+  return !!(student && student.startDate && toKey(student.startDate)===toKey(simNow()));
+}
+function studentsStartingToday(){
+  return students.filter(function(s){ return !isStudentInactive(s) && isStudentStartingToday(s); })
+    .sort(function(a,b){ return a.name.localeCompare(b.name); });
+}
+
 /* ---------- plan changes: stop or change frequency from a future date (5.16b) ---------- */
 function openPlanChangeForm(studentId){
   const student=findStudent(studentId);
@@ -2113,6 +2133,12 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
     WEEKDAY_KEYS.forEach(function(weekday, dayIdx){
       const date=addDays(monday, dayIdx);
       if(date < new Date(toKey(simNow()))) return; // never backfill the past
+      // Compared as YYYY-MM-DD strings, not raw Date objects — `date` here is built via local-time
+      // arithmetic (addDays) while `new Date(toKey(student.startDate))` would parse as UTC midnight,
+      // and in any timezone ahead of UTC that makes a same-calendar-day Date compare as "earlier"
+      // than its own UTC-midnight parse, silently skipping the start date's own occurrence (and
+      // starting a week late for a weekly recurring slot). toKey() on both sides avoids that entirely.
+      if(student.startDate && toKey(date) < toKey(student.startDate)) return; // not enrolled yet — nothing to book before their first day (Sept 2026, per Allie: "its not always straight away")
       if(isClosedDate(date)) return; // centre's closed this day — never pre-book a regular session onto it
       const dateKey=toKey(date);
       if(isStudentOnHold(student.id, date)) return; // on hold — leave this occurrence unbooked
@@ -3937,7 +3963,11 @@ function defaultRecurring(count, duration){
 
 function openNewStudentForm(){
   const dur=90, spw=2;
-  state.newStudentForm={ parentMode:'existing', parentId: parents[0]? parents[0].id : '', parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), error:'' };
+  // startDate defaults to today (the common case — starting right away) but front desk can push it
+  // out to whenever the family's actually starting (Sept 2026, per Allie: "its not always straight
+  // away"); generateRecurringSessions() won't pre-book anything before it, and it's what drives the
+  // Today-tab "first day" warning and the instructor-side "First day!" tag once that date arrives.
+  state.newStudentForm={ parentMode:'existing', parentId: parents[0]? parents[0].id : '', parentName:'', parentEmail:'', studentName:'', year:1, startDate:toKey(simNow()), sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), error:'' };
   render();
 }
 function closeNewStudentForm(){ state.newStudentForm=null; render(); }
@@ -3975,6 +4005,8 @@ function saveNewStudent(){
   const f=state.newStudentForm;
   if(!f.studentName.trim()){ f.error='Enter the student\'s name.'; render(); return; }
   if(!f.year){ f.error='Choose a school year.'; render(); return; }
+  if(!f.startDate){ f.error='Choose a start date.'; render(); return; }
+  if(toKey(new Date(f.startDate))<toKey(simNow())){ f.error='Start date can\'t be in the past.'; render(); return; }
   let parentId=null;
   // Set only when creating a brand-new parent alongside this student — its actual remote insert is
   // deferred and chained as the FIRST step of the student's own dbWrite below (see there for why:
@@ -3998,7 +4030,7 @@ function saveNewStudent(){
     newParentInsert=function(){ return supabaseClient.from('parents').insert({id:newParent.id, name:newParent.name, email:newParent.email}); };
     parentId=newParent.id;
   }
-  const newStudent={id:newId()||('s'+(nextStudentId++)), name:f.studentName.trim(), year:Number(f.year), baseYear:Number(f.year), yearBaseline:schoolYearIndex(simNow()), duration:Number(f.duration), sessionsPerWeek:Number(f.sessionsPerWeek), parentId, recurring:f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; }), holds:[]};
+  const newStudent={id:newId()||('s'+(nextStudentId++)), name:f.studentName.trim(), year:Number(f.year), baseYear:Number(f.year), yearBaseline:schoolYearIndex(simNow()), duration:Number(f.duration), sessionsPerWeek:Number(f.sessionsPerWeek), parentId, startDate:new Date(f.startDate), recurring:f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; }), holds:[]};
   // A Preferred Pod chosen at enrollment (5.30, per Allie) isn't a separate field/column — it's just
   // one of the student's very first standing Pod pins, written the same way "Change Pod"
   // (openStudentPodForm/saveStudentPodAssignment) writes any other one, effective from day one. That
@@ -4037,7 +4069,8 @@ function saveNewStudent(){
       if(r && r.error) return r;
       return supabaseClient.from('students').insert({
         id:newStudent.id, parent_id:newStudent.parentId, name:newStudent.name, year:newStudent.year, base_year:newStudent.baseYear,
-        year_baseline:newStudent.yearBaseline, duration:newStudent.duration, sessions_per_week:newStudent.sessionsPerWeek
+        year_baseline:newStudent.yearBaseline, duration:newStudent.duration, sessions_per_week:newStudent.sessionsPerWeek,
+        start_date:toKey(newStudent.startDate)
       });
     }).then(function(r){
       if(r.error || !newStudent.recurring.length) return r;
@@ -4072,7 +4105,8 @@ function saveNewStudent(){
     const pinnedNames=preferredPodAssignments.map(function(a){ return findPod(a.podId).name; }).filter(function(n,i,arr){ return arr.indexOf(n)===i; });
     toast(newStudent.name+' enrolled, but the Preferred Pod'+(pinnedNames.length>1?'s':'')+' chosen ('+pinnedNames.join(', ')+') don\'t have room (or coverage) at '+describeUncoveredSlots(newStudent.recurring)+' — 0 session(s) pre-booked. Pick different Preferred Pods via "Change Pod", or leave sessions on auto-assign.', 9000);
   } else {
-    toast(newStudent.name+' enrolled — '+f.sessionsPerWeek+'x/week, '+f.duration+' min, with '+parent.name+'. '+made+' standing session(s) pre-booked.');
+    const startingToday = toKey(newStudent.startDate)===toKey(simNow());
+    toast(newStudent.name+' enrolled'+(startingToday? '' : ' — starting '+fmtShort(newStudent.startDate))+' — '+f.sessionsPerWeek+'x/week, '+f.duration+' min, with '+parent.name+'. '+made+' standing session(s) pre-booked.');
   }
   state.newStudentForm=null;
   render();
@@ -5263,6 +5297,7 @@ function renderStaff(){
   let html=renderFrontTabsBar(tab);
 
   if(tab==='today'){
+    html+=renderFirstDayPanel();
     html+=renderCheckInSearchPanel();
     html+=renderCoverageRequestsPanel();
     html+=renderEnrollmentRequestsPanel();
@@ -5612,6 +5647,26 @@ function renderWaitlistPanel(){
     html+='</table>';
   }
   html+='</div>';
+  return html;
+}
+
+// Front-desk heads-up for any active student whose enrolment starts today (Sept 2026, per Allie: "i
+// then need it to come up as a warning on the top of today tab saying student first day"). A plain
+// banner rather than a collapsible section — like the closure banner, it's meant to be seen the
+// moment the tab opens, not tucked away behind a header someone has to expand.
+function renderFirstDayPanel(){
+  const starting=studentsStartingToday();
+  if(starting.length===0) return '';
+  const todayKey=toKey(simNow());
+  let html='<div class="banner info" style="flex-direction:column;align-items:stretch">';
+  html+='<div style="display:flex;align-items:center;gap:8px"><b>🌟 First day today</b></div>';
+  html+='<div class="small" style="margin-top:4px">'+starting.map(function(s){
+    const sess=sessions.find(function(x){ return x.studentId===s.id && toKey(x.date)===todayKey && x.status!=='cancelled'; });
+    const detail = sess
+      ? rangeLabel(sess.start, sess.duration)+' · '+(sess.online? 'Online' : (sess.podId? findPod(sess.podId).name : 'Unassigned'))+(sess.instructorId? ' with '+findInstructor(sess.instructorId).name : '')
+      : 'no session booked today';
+    return '<b>'+s.name+'</b> ('+yearLabel(s.year)+') — '+detail;
+  }).join('<br>')+'</div></div>';
   return html;
 }
 
@@ -6087,7 +6142,7 @@ function saveNewParent(){
   // its own isn't useful for anything else in the app, so there's no reason to make this a
   // separate trip back to the Students panel and having to find them in the dropdown.
   const dur=90, spw=2;
-  state.newStudentForm={ parentMode:'existing', parentId:newParent.id, parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), error:'' };
+  state.newStudentForm={ parentMode:'existing', parentId:newParent.id, parentName:'', parentEmail:'', studentName:'', year:1, startDate:toKey(simNow()), sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), error:'' };
   toast(newParent.name+' added — now add their first child below.');
   state.newParentForm=null;
   render();
@@ -6662,6 +6717,8 @@ function renderNewStudentModal(){
   html+='<label>School year</label><select onchange="setNSF(\'year\', Number(this.value))">'
     +YEARS.map(function(y){ return '<option value="'+y+'"'+(y===f.year?' selected':'')+'>'+yearLabel(y)+'</option>'; }).join('')
     +'</select>';
+  html+='<label>Start date</label><input type="date" value="'+f.startDate+'" min="'+toKey(simNow())+'" onchange="setNSF(\'startDate\', this.value)"/>';
+  html+='<p class="small muted" style="margin-top:-6px">Their actual first day — leave as today if starting right away. Nothing gets pre-booked before this date, and front desk gets a heads-up on the Today tab (instructors see it too, right on their first session) once it arrives.</p>';
   html+='<div class="row2"><div><label>Sessions per week</label><select onchange="setNSFSessionsPerWeek(this.value)">'
     +SESSIONS_PER_WEEK_OPTIONS.map(function(n){ return '<option value="'+n+'"'+(n===f.sessionsPerWeek?' selected':'')+'>'+n+'x/week</option>'; }).join('')
     +'</select></div>'
@@ -7239,7 +7296,12 @@ function renderInstructor(){
         // late/early or its exit time was manually adjusted (Sept 2026, per Allie: "the instructor
         // view of sign out times are different to front staff view").
         const timeLabel=(s.actualStart!=null && s.actualEnd!=null)? minToLabel(s.actualStart)+'–'+minToLabel(s.actualEnd) : rangeLabel(s.start,s.duration);
-        return '<tr><td>'+student.name+' <span class="small muted">'+yearLabel(student.year)+'</span></td><td>'+locLabel+'</td><td>'+timeLabel+'</td>'
+        // Flags this as the student's very first session at the centre — worth an instructor
+        // knowing on sight, not just something front desk sees on their own Today tab (Sept 2026,
+        // per Allie: "i also want it to say first day during their first session when sitting with
+        // an instructor").
+        const firstDayTag=isStudentStartingToday(student)? ' <span class="badge firstday">First day!</span>' : '';
+        return '<tr><td>'+student.name+firstDayTag+' <span class="small muted">'+yearLabel(student.year)+'</span></td><td>'+locLabel+'</td><td>'+timeLabel+'</td>'
           +'<td><span class="badge '+cd.cls+'">'+cd.label+'</span></td>'
           +'<td><button class="btn sm" onclick="openCheckOut(\''+s.id+'\')">Check out</button> '
           +'<button class="btn sm ghost" onclick="openMoveForm(\''+s.id+'\')">Move pod</button></td></tr>';
@@ -7989,7 +8051,7 @@ function loadAllData(){
     T('pod_shift_blocks','id,pod_id,weekday,start_min,end_min'),
     T('pod_shift_assignments','block_id,instructor_id,effective_from'),
     T('pod_shift_one_off_coverage','block_id,the_date,instructor_id'),
-    T('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes'),
+    T('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date'),
     T('student_recurring_slots','student_id,weekday,start_min'),
     T('student_holds','id,student_id,start_date,end_date,note'),
     T('student_pod_assignments','id,student_id,pod_id,effective_from,weekday,online,instructor_id'),
@@ -8041,7 +8103,7 @@ function loadAllData(){
 
     students=studentRows.map(function(r){ return {
       id:r.id, parentId:r.parent_id, name:r.name, year:r.year, baseYear:r.base_year, yearBaseline:r.year_baseline,
-      duration:r.duration, sessionsPerWeek:r.sessions_per_week,
+      duration:r.duration, sessionsPerWeek:r.sessions_per_week, startDate: r.start_date? new Date(r.start_date) : null,
       recurring: slotRows.filter(function(s){ return s.student_id===r.id; }).map(function(s){ return {weekday:s.weekday, start:s.start_min}; }),
       holds: holdRows.filter(function(h){ return h.student_id===r.id; }).map(function(h){ return {id:h.id, start:new Date(h.start_date), end:new Date(h.end_date), note:h.note||''}; }),
       podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from), weekday:a.weekday||null, online:a.online||false, instructorId:a.instructor_id||null}; }),
