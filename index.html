@@ -674,7 +674,18 @@ var parents=[
 // front-desk (staff-role) access — this is an identity list, not a separate permission tier.
 var staffMembers=[];
 
-var nextSessionId=100, nextCreditId=100, nextStudentId=100, nextParentId=100, nextInstructorId=10, nextPlanChangeId=1, nextStaffMemberId=1;
+// A front-desk staff member's rostered weekly hours (Sept 2026, per Allie: "I also need front staff
+// to have a section where we can check in/out staff") — deliberately a plain flat weekly pattern
+// (one row per working day; no row at all = off that day), unlike instructor availability's
+// dated-history model — a front-desk person's rostered shift doesn't get individually reassigned to
+// someone else the way a Pod shift does, so there's no coverage-swap machinery to support here.
+var staffRosteredShifts=[];
+// The actual check-in/check-out log — one record per staff member per stint on site, mirroring
+// sessions' actualStart/actualEnd/checkedOut fields. checkOut stays null while they're still
+// checked in.
+var staffAttendance=[];
+
+var nextSessionId=100, nextCreditId=100, nextStudentId=100, nextParentId=100, nextInstructorId=10, nextPlanChangeId=1, nextStaffMemberId=1, nextStaffShiftId=1, nextStaffAttendanceId=1;
 
 // Sessions record podId (the bookable resource) plus the instructor(s) actually covering it,
 // snapshotted at booking time from the pod's schedule — so editing the pod schedule later never
@@ -780,7 +791,7 @@ var state={
   // Checked-in-today starts UNCOLLAPSED (Sept 2026, per Allie: "checked in today uncollapsed by
   // default") — it now also carries the "Who's here right now" board at its top, so front desk
   // wants it open on page load rather than needing an extra click to see who's actually present.
-  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, podSeating:true, creditsSettled:true},
+  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, podSeating:true, creditsSettled:true, staffTimesheet:true},
   // Quick check-in/out student search (Sept 2026, per Allie: a search bar that suggests the closest
   // matched student name so front desk doesn't have to hunt through the Schedule list) — just the
   // live query text; matching happens fresh on every render from `sessions`/`students`, nothing else
@@ -2928,6 +2939,119 @@ function confirmCheckOut(){
   render();
 }
 
+// Auto-checks-out anyone still checked in (and not yet checked out) once the centre's own closing
+// time has actually arrived (Sept 2026, per Allie: "Automatically check out any kids past 7pm") —
+// front desk (or an instructor) can simply forget the last check-out of the day, leaving a session
+// showing as still "in progress" indefinitely otherwise. Runs off the same periodic heartbeat that
+// already re-checks promotions/plan changes as real time ticks forward (see afterLogin(), and the
+// offline-mode bootstrap below) — there's no server-side cron here, so this only actually fires while
+// at least one staff/instructor tab happens to be open past close, same limitation those other two
+// already have. Scoped to TODAY only, same as the live "Checked in today" board itself — this
+// doesn't reach back to clean up a forgotten check-out left over from a previous day, only catches
+// one in real time as close actually arrives today. Records the exit as exactly closing time, not
+// whatever moment the heartbeat happened to tick at — sessions are never bookable to run past
+// CENTER_CLOSE in the first place (see possibleStarts()), so there's never a legitimate reason for
+// anyone to still be "in progress" once it's past close.
+function autoCheckOutPastClose(){
+  if(nowMinutesOfDay()<CENTER_CLOSE) return 0;
+  const overdue=checkedInTodayStillPresent();
+  overdue.forEach(function(s){
+    s.actualEnd=CENTER_CLOSE;
+    s.checkedOut=true;
+    dbWrite('auto-checking out at close', function(){ return supabaseClient.from('sessions').update({actual_end_min:s.actualEnd, checked_out:true}).eq('id', s.id); });
+  });
+  if(overdue.length){
+    toast(overdue.length+' student'+(overdue.length===1?'':'s')+' automatically checked out at close ('+minToLabel(CENTER_CLOSE)+').');
+  }
+  return overdue.length;
+}
+
+/* ---------- Front-desk staff check-in/out + timesheet (Sept 2026, per Allie) ---------- */
+function staffShiftsFor(staffId){
+  return staffRosteredShifts.filter(function(s){ return s.staffId===staffId; });
+}
+// weekday -> {start,end} — only present for days they're actually rostered on.
+function staffWeeklyPattern(staffId){
+  const pattern={};
+  staffShiftsFor(staffId).forEach(function(s){ pattern[s.weekday]={start:s.start, end:s.end}; });
+  return pattern;
+}
+function staffRosteredOn(staffId, weekday){
+  return staffShiftsFor(staffId).find(function(s){ return s.weekday===weekday; }) || null;
+}
+function staffAttendanceRecordsFor(staffId, dateKey){
+  return staffAttendance.filter(function(a){ return a.staffId===staffId && toKey(a.date)===dateKey; })
+    .sort(function(a,b){ return a.checkIn-b.checkIn; });
+}
+function staffOpenRecord(staffId, dateKey){
+  return staffAttendance.find(function(a){ return a.staffId===staffId && toKey(a.date)===dateKey && a.checkOut==null; }) || null;
+}
+// Minutes worked for one record — still ticking (measured against now) while checked in, fixed once
+// checked out. Null when there's no check-in at all.
+function staffMinutesWorked(rec){
+  if(!rec || rec.checkIn==null) return null;
+  const end = rec.checkOut!=null? rec.checkOut : nowMinutesOfDay();
+  return Math.max(0, end-rec.checkIn);
+}
+function staffHoursLabel(mins){ return mins==null? '—' : (mins/60).toFixed(1)+'h'; }
+// Everything the front-desk check-in board needs for one staff member, today: their rostered shift
+// (if any), every stint they've clocked today, whether they're currently on site, and how many
+// minutes late their first check-in was against their rostered start (null if on time / not rostered
+// / not checked in yet).
+function staffStatusToday(staffId){
+  const today=simNow();
+  const todayKey=toKey(today);
+  const weekday=WEEKDAY_KEYS[(today.getDay()+6)%7];
+  const rostered=staffRosteredOn(staffId, weekday);
+  const records=staffAttendanceRecordsFor(staffId, todayKey);
+  const openRec=staffOpenRecord(staffId, todayKey);
+  let lateMin=null;
+  if(rostered && records.length && records[0].checkIn>rostered.start) lateMin=records[0].checkIn-rostered.start;
+  let state;
+  if(openRec) state='on-site';
+  else if(records.length) state='checked-out';
+  else if(!rostered) state='not-rostered';
+  else state = nowMinutesOfDay()>rostered.start? 'late-not-in' : 'not-in-yet';
+  return {rostered, records, openRec, lateMin, state};
+}
+function checkInStaff(staffId){
+  const todayKey=toKey(simNow());
+  if(staffOpenRecord(staffId, todayKey)){ toast(findStaffMember(staffId).name+' is already checked in today.'); render(); return; }
+  const nowMin=nowMinutesOfDay();
+  const newRec={id:newId()||('sattend'+(nextStaffAttendanceId++)), staffId:staffId, date:new Date(todayKey), checkIn:nowMin, checkOut:null};
+  staffAttendance.push(newRec);
+  dbWrite('checking in staff', function(){ return supabaseClient.from('staff_attendance').insert({id:newRec.id, staff_id:staffId, the_date:todayKey, check_in_min:nowMin}); });
+  toast(findStaffMember(staffId).name+' checked in at '+minToLabel(nowMin)+'.');
+  render();
+}
+function checkOutStaff(staffId){
+  const todayKey=toKey(simNow());
+  const rec=staffOpenRecord(staffId, todayKey);
+  if(!rec){ toast(findStaffMember(staffId).name+" isn't currently checked in."); render(); return; }
+  const nowMin=nowMinutesOfDay();
+  rec.checkOut=nowMin;
+  dbWrite('checking out staff', function(){ return supabaseClient.from('staff_attendance').update({check_out_min:nowMin}).eq('id', rec.id); });
+  toast(findStaffMember(staffId).name+' checked out at '+minToLabel(nowMin)+' ('+staffHoursLabel(staffMinutesWorked(rec))+').');
+  render();
+}
+// Rostered-but-never-clocked-in days over the last `days` days (today excluded — its shift may not
+// be over yet, so it's not a no-show until the "not checked in yet" state above has had its chance).
+function staffNoShowsSince(days){
+  const today=simNow();
+  const list=[];
+  staffMembers.forEach(function(st){
+    for(let i=1;i<=days;i++){
+      const d=addDays(today, -i);
+      const dKey=toKey(d);
+      const weekday=WEEKDAY_KEYS[(d.getDay()+6)%7];
+      const rostered=staffRosteredOn(st.id, weekday);
+      if(!rostered) continue;
+      if(staffAttendanceRecordsFor(st.id, dKey).length===0) list.push({staffId:st.id, date:d, rostered:rostered});
+    }
+  });
+  return list.sort(function(a,b){ return new Date(b.date)-new Date(a.date); });
+}
+
 function parentLoginSubmit(email){
   const p=parents.find(function(p){ return p.email.toLowerCase()===String(email).trim().toLowerCase(); });
   if(!p){ state.loginForm.error='No parent account found with that email. Try one of the sample emails below.'; render(); return; }
@@ -4913,6 +5037,7 @@ function renderStaff(){
   const closure=closedDayFor(selectedDate);
 
   let html=renderCheckInSearchPanel();
+  html+=renderStaffCheckInPanel();
   html+=renderCoverageRequestsPanel();
   html+=renderEnrollmentRequestsPanel();
   html+=renderCheckedInPanel();
@@ -4965,6 +5090,7 @@ function renderStaff(){
   html+=renderInstructorsPanel();
   html+=renderParentsPanel();
   html+=renderFrontStaffPanel();
+  html+=renderStaffTimesheetPanel();
   html+=renderCreditsReport();
   html+=renderSettledCreditsPanel();
   html+=renderInactiveStudentsPanel();
@@ -5792,12 +5918,37 @@ function renderParentsPanel(){
 }
 
 /* ---------- Named front-desk staff (5.22) ---------- */
+function defaultStaffShiftForm(staffId){
+  const shifts={};
+  const pattern=staffId? staffWeeklyPattern(staffId) : {};
+  WEEKDAY_KEYS.forEach(function(day){
+    const existing=pattern[day];
+    shifts[day]=existing? {off:false, start:existing.start, end:existing.end} : {off:true, start:900, end:1140};
+  });
+  return shifts;
+}
 function openNewStaffForm(){
-  state.newStaffForm={ name:'', email:'', inviteNow:true, error:'' };
+  state.newStaffForm={ name:'', email:'', inviteNow:true, shifts:defaultStaffShiftForm(null), error:'' };
   render();
 }
 function closeNewStaffForm(){ state.newStaffForm=null; render(); }
 function setNewStaffField(field, value){ state.newStaffForm[field]=value; state.newStaffForm.error=''; render(); }
+function setNewStaffShift(weekday, field, value){
+  const a=state.newStaffForm.shifts[weekday];
+  a[field] = field==='off'? value : Number(value);
+  if(a.end<=a.start){
+    if(field==='start') a.end=Math.min(CENTER_CLOSE, a.start+START_STEP);
+    else a.start=Math.max(CENTER_OPEN, a.end-START_STEP);
+  }
+  state.newStaffForm.error='';
+  render();
+}
+// Turns a {Mon:{off,start,end}, ...} form object into the flat staffRosteredShifts rows
+// (staffShiftsFor()'s shape) for the working days only — no row at all means "off" that day.
+function shiftFormToRows(shiftForm){
+  return WEEKDAY_KEYS.filter(function(day){ return !shiftForm[day].off; })
+    .map(function(day){ return {weekday:day, start:shiftForm[day].start, end:shiftForm[day].end}; });
+}
 function saveNewStaff(){
   const f=state.newStaffForm;
   if(!f.name.trim()){ f.error='Enter their name.'; render(); return; }
@@ -5807,22 +5958,40 @@ function saveNewStaff(){
   }
   const newStaff={id:newId()||('staff'+(nextStaffMemberId++)), name:f.name.trim(), email:f.email.trim(), authUserId:null};
   staffMembers.push(newStaff);
-  dbWrite('adding a new staff member', function(){ return supabaseClient.from('staff_members').insert({id:newStaff.id, name:newStaff.name, email:newStaff.email}); });
-  toast(newStaff.name+' added to front desk staff.');
+  const rows=shiftFormToRows(f.shifts);
+  rows.forEach(function(r){ staffRosteredShifts.push({id:newId()||('sshift'+(nextStaffShiftId++)), staffId:newStaff.id, weekday:r.weekday, start:r.start, end:r.end}); });
+  dbWrite('adding a new staff member', function(){ return supabaseClient.from('staff_members').insert({id:newStaff.id, name:newStaff.name, email:newStaff.email}).then(function(r){
+    if(r.error || !rows.length) return r;
+    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:newStaff.id, weekday:row.weekday, start_min:row.start, end_min:row.end}; }));
+  }); });
+  const workingDays=rows.map(function(r){ return r.weekday; });
+  toast(newStaff.name+' added to front desk staff'+(workingDays.length? ' — rostered '+workingDays.join(', ') : '')+'.');
   state.newStaffForm=null;
   render();
   if(f.inviteNow) inviteLogin(newStaff.email, 'staff', newStaff.id, newStaff.name);
 }
 
 // Editing an existing front-desk staff member's name/email (5.31, per Allie) — same caveat as
-// editing a parent's email: it only updates the contact record, not an already-active login.
+// editing a parent's email: it only updates the contact record, not an already-active login. Also
+// where their rostered weekly shift is set (Sept 2026, per Allie: "front staff... check in/out
+// staff" — the check-in board needs somewhere to learn each person's expected hours from).
 function openEditStaffForm(staffId){
   const staff=findStaffMember(staffId);
-  state.editStaffForm={staffId, name:staff.name, email:staff.email, error:''};
+  state.editStaffForm={staffId, name:staff.name, email:staff.email, shifts:defaultStaffShiftForm(staffId), error:''};
   render();
 }
 function closeEditStaffForm(){ state.editStaffForm=null; render(); }
 function setEditStaffField(field, value){ state.editStaffForm[field]=value; state.editStaffForm.error=''; render(); }
+function setEditStaffShift(weekday, field, value){
+  const a=state.editStaffForm.shifts[weekday];
+  a[field] = field==='off'? value : Number(value);
+  if(a.end<=a.start){
+    if(field==='start') a.end=Math.min(CENTER_CLOSE, a.start+START_STEP);
+    else a.start=Math.max(CENTER_OPEN, a.end-START_STEP);
+  }
+  state.editStaffForm.error='';
+  render();
+}
 function saveEditStaff(){
   const f=state.editStaffForm;
   const staff=findStaffMember(f.staffId);
@@ -5832,10 +6001,42 @@ function saveEditStaff(){
   if(clash){ f.error='Another staff member already uses that email.'; render(); return; }
   staff.name=f.name.trim();
   staff.email=f.email.trim();
-  dbWrite('editing staff member details', function(){ return supabaseClient.from('staff_members').update({name:staff.name, email:staff.email}).eq('id', staff.id); });
+  const rows=shiftFormToRows(f.shifts);
+  staffRosteredShifts=staffRosteredShifts.filter(function(s){ return s.staffId!==staff.id; });
+  rows.forEach(function(r){ staffRosteredShifts.push({id:newId()||('sshift'+(nextStaffShiftId++)), staffId:staff.id, weekday:r.weekday, start:r.start, end:r.end}); });
+  dbWrite('editing staff member details', function(){ return supabaseClient.from('staff_members').update({name:staff.name, email:staff.email}).eq('id', staff.id).then(function(r){
+    if(r.error) return r;
+    return supabaseClient.from('staff_rostered_shifts').delete().eq('staff_id', staff.id);
+  }).then(function(r){
+    if(!r || r.error || !rows.length) return r;
+    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:staff.id, weekday:row.weekday, start_min:row.start, end_min:row.end}; }));
+  }); });
   toast(staff.name+'\'s details updated.');
   state.editStaffForm=null;
   render();
+}
+// Shared weekday-loop editor for a staff member's rostered shift, reused by both the "Add staff
+// member" and "Edit details" forms — same layout as an instructor's "Starting weekly availability".
+function renderStaffShiftFields(shifts, setterName){
+  let html='<label>Rostered shift</label>';
+  WEEKDAY_KEYS.forEach(function(day){
+    const a=shifts[day];
+    html+='<div class="row2 recurring-row" style="align-items:center">'
+      +'<label style="display:flex;align-items:center;gap:6px;font-weight:400;margin:0"><input type="checkbox" style="width:auto" '+(a.off?'':'checked')+' onchange="'+setterName+'(\''+day+'\',\'off\',!this.checked)"/> '+day+'</label>';
+    if(!a.off){
+      html+='<div style="display:flex;gap:6px">'
+        +'<select onchange="'+setterName+'(\''+day+'\',\'start\',this.value)">'
+          +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +'</select>'
+        +'<select onchange="'+setterName+'(\''+day+'\',\'end\',this.value)">'
+          +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +'</select></div>';
+    } else {
+      html+='<div class="small muted">Off</div>';
+    }
+    html+='</div>';
+  });
+  return html;
 }
 function renderEditStaffModal(){
   const f=state.editStaffForm;
@@ -5848,6 +6049,7 @@ function renderEditStaffModal(){
   if(staff.authUserId){
     html+='<p class="small muted">They already have a login — changing the email above only updates their contact record here, not what they actually sign in with.</p>';
   }
+  html+=renderStaffShiftFields(f.shifts, 'setEditStaffShift');
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeEditStaffForm()">Cancel</button>'
@@ -5864,6 +6066,7 @@ function renderNewStaffModal(){
   html+='<h3>Add a front desk staff member</h3>';
   html+='<label>Name</label><input type="text" value="'+f.name+'" oninput="setNewStaffField(\'name\', this.value)"/>';
   html+='<label>Email</label><input type="text" value="'+f.email+'" oninput="setNewStaffField(\'email\', this.value)"/>';
+  html+=renderStaffShiftFields(f.shifts, 'setNewStaffShift');
   if(supabaseClient){
     html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;margin-top:10px"><input type="checkbox" style="width:auto;margin:0" '+(f.inviteNow?'checked':'')+' onchange="setNewStaffField(\'inviteNow\',this.checked)"/> Email them an invite to set up their login now</label>';
   }
@@ -5891,6 +6094,88 @@ function renderFrontStaffPanel(){
   html+='</table></div>';
   html+=renderNewStaffModal();
   html+=renderEditStaffModal();
+  return html;
+}
+
+// Live "who's on site right now" board for front desk staff themselves (Sept 2026, per Allie: "I
+// also need front staff to have a section where we can check in/out staff") — deliberately
+// front-desk staff only, not instructors, who already check students in/out through a different
+// part of the app entirely. Rostered hours come from each person's "Edit details" form
+// (renderStaffShiftFields()); a rostered person who hasn't checked in yet is flagged the moment
+// their shift start passes, same "make lateness visible without anyone having to go looking for it"
+// spirit as the live occupancy board.
+function renderStaffCheckInPanel(){
+  let html='<div class="card"><h2>Staff check-in/out</h2>'
+    +'<p class="small muted">Front desk staff only. Rostered hours come from each person\'s "Edit details" form below.</p>';
+  if(staffMembers.length===0){
+    html+='<div class="empty-note">No named front desk staff yet — add one in the Front Desk Staff section below.</div></div>';
+    return html;
+  }
+  html+='<table><tr><th>Name</th><th>Rostered today</th><th>Status</th><th>Hours today</th><th></th></tr>';
+  staffMembers.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(st){
+    const s=staffStatusToday(st.id);
+    const rosteredLabel = s.rostered? rangeLabel(s.rostered.start, s.rostered.end-s.rostered.start) : '<span class="small muted">Off today</span>';
+    let statusCell;
+    if(s.state==='on-site'){
+      statusCell='<span class="badge available">On site since '+minToLabel(s.records[0].checkIn)+'</span>'+(s.lateMin? ' <span class="small muted">('+s.lateMin+'m late)</span>' : '');
+    } else if(s.state==='checked-out'){
+      const last=s.records[s.records.length-1];
+      statusCell='<span class="small muted">Checked out at '+minToLabel(last.checkOut)+'</span>'+(s.lateMin? ' <span class="small muted">(was '+s.lateMin+'m late)</span>' : '');
+    } else if(s.state==='late-not-in'){
+      statusCell='<span class="badge full">Not checked in — '+(nowMinutesOfDay()-s.rostered.start)+'m late</span>';
+    } else if(s.state==='not-in-yet'){
+      statusCell='<span class="small muted">Not checked in yet</span>';
+    } else {
+      statusCell='<span class="small muted">Not rostered today</span>';
+    }
+    const totalMinsToday=s.records.reduce(function(sum,r){ return sum+(staffMinutesWorked(r)||0); },0);
+    const hoursCell = s.records.length? staffHoursLabel(totalMinsToday) : '—';
+    const actionCell = s.openRec
+      ? '<button class="btn sm ghost" onclick="checkOutStaff(\''+st.id+'\')">Check out</button>'
+      : '<button class="btn sm" onclick="checkInStaff(\''+st.id+'\')">Check in</button>';
+    html+='<tr><td>'+st.name+'</td><td class="small">'+rosteredLabel+'</td><td>'+statusCell+'</td><td>'+hoursCell+'</td><td>'+actionCell+'</td></tr>';
+  });
+  html+='</table></div>';
+  return html;
+}
+// How many days back the historical timesheet (and its no-show flagging) looks.
+var STAFF_TIMESHEET_LOOKBACK_DAYS=14;
+// Historical hours log across all front desk staff, plus anyone rostered on a day they never
+// clocked in for at all — collapsed by default, same "settled record, not a daily-use panel"
+// treatment as the make-up-credits history or inactive-students sections.
+function renderStaffTimesheetPanel(){
+  const days=STAFF_TIMESHEET_LOOKBACK_DAYS;
+  let html=sectionOpen('staffTimesheet','Staff timesheet');
+  html+='<p class="small muted">Every staff check-in/check-out over the last '+days+' days, plus any rostered day nobody clocked in for at all.</p>';
+  const noShows=staffNoShowsSince(days);
+  if(noShows.length){
+    html+='<div class="banner danger" style="margin-bottom:10px">'+noShows.map(function(n){
+      const st=findStaffMember(n.staffId);
+      return (st? st.name : '—')+' — no-show '+fmtShort(n.date)+' (rostered '+rangeLabel(n.rostered.start, n.rostered.end-n.rostered.start)+')';
+    }).join('<br>')+'</div>';
+  }
+  const cutoffKey=toKey(addDays(simNow(), -days));
+  const recent=staffAttendance.filter(function(a){ return toKey(a.date)>=cutoffKey; })
+    .slice().sort(function(a,b){ return new Date(b.date)-new Date(a.date) || b.checkIn-a.checkIn; });
+  if(recent.length===0 && noShows.length===0){
+    html+='<div class="empty-note">No staff attendance recorded yet.</div>';
+  } else if(recent.length){
+    html+='<table><tr><th>Date</th><th>Staff</th><th>Check-in</th><th>Check-out</th><th>Hours</th><th>Vs roster</th></tr>'
+      +recent.map(function(r){
+        const st=findStaffMember(r.staffId);
+        const weekday=WEEKDAY_KEYS[(new Date(r.date).getDay()+6)%7];
+        const rostered=staffRosteredOn(r.staffId, weekday);
+        let vsRoster='<span class="small muted">Not rostered</span>';
+        if(rostered){
+          vsRoster = r.checkIn>rostered.start? '<span class="badge full">'+(r.checkIn-rostered.start)+'m late</span>' : '<span class="badge available">On time</span>';
+        }
+        return '<tr><td>'+fmtShort(r.date)+'</td><td>'+(st? st.name : '—')+'</td><td>'+minToLabel(r.checkIn)+'</td>'
+          +'<td>'+(r.checkOut!=null? minToLabel(r.checkOut) : '<span class="small muted">Still on site</span>')+'</td>'
+          +'<td>'+staffHoursLabel(staffMinutesWorked(r))+'</td><td>'+vsRoster+'</td></tr>';
+      }).join('')
+      +'</table>';
+  }
+  html+='</div>';
   return html;
 }
 
@@ -7295,7 +7580,8 @@ var LIVE_SYNC_TABLES=['instructors','instructor_avail_rules','instructor_one_off
   'pod_shift_assignments','pod_shift_one_off_coverage','students','student_recurring_slots','student_holds',
   'student_pod_assignments','student_plan_changes','student_plan_change_recurring','parents','sessions',
   'credits','coverage_requests','coverage_request_notified_instructors','waitlist_entries','closed_days',
-  'enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring','staff_members'];
+  'enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring','staff_members',
+  'staff_rostered_shifts','staff_attendance'];
 function subscribeToLiveUpdates(){
   let channel=supabaseClient.channel('live-updates');
   LIVE_SYNC_TABLES.forEach(function(t){
@@ -7326,6 +7612,7 @@ function afterLogin(){
         applyPromotions();
         applyPlanChanges();
         regenerateAllRecurring();
+        autoCheckOutPastClose();
         render();
         // Live mode has no demo-clock button to trigger applyPromotions()/applyPlanChanges() as
         // days actually pass — real time just ticks forward on its own. Re-checking both on this
@@ -7341,7 +7628,7 @@ function afterLogin(){
         // other's changes within about a second; worst case without it, within 30 seconds; either
         // way, never "not until someone reloads the page" again.
         setInterval(function(){
-          loadAllData().then(function(){ applyPromotions(); applyPlanChanges(); render(); })
+          loadAllData().then(function(){ applyPromotions(); applyPlanChanges(); autoCheckOutPastClose(); render(); })
             .catch(function(err){ console.error('Heartbeat refresh failed', err); });
         }, 30000);
         subscribeToLiveUpdates();
@@ -7406,8 +7693,10 @@ function loadAllData(){
     T('enrollment_request_recurring','id,request_id,weekday,start_min'),
     T('enrollment_request_previous_recurring','id,request_id,weekday,start_min'),
     T('staff_members','id,name,email,auth_user_id'),
+    T('staff_rostered_shifts','id,staff_id,weekday,start_min,end_min'),
+    T('staff_attendance','id,staff_id,the_date,check_in_min,check_out_min'),
   ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows]=t;
+    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows,staffShiftRows,staffAttendanceRows]=t;
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
@@ -7497,6 +7786,14 @@ function loadAllData(){
     staffMembers=staffMemberRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, authUserId:r.auth_user_id,
     }; });
+
+    staffRosteredShifts=staffShiftRows.map(function(r){ return {
+      id:r.id, staffId:r.staff_id, weekday:r.weekday, start:r.start_min, end:r.end_min,
+    }; });
+
+    staffAttendance=staffAttendanceRows.map(function(r){ return {
+      id:r.id, staffId:r.staff_id, date:new Date(r.the_date), checkIn:r.check_in_min, checkOut:r.check_out_min,
+    }; });
   });
 }
 
@@ -7531,11 +7828,14 @@ if(supabaseClient){
   // Offline / test-harness fallback — exactly the original demo bootstrap, untouched.
   students.forEach(function(s){ s.baseYear=s.year; s.yearBaseline=schoolYearIndex(BASE); s.holds=s.holds||[]; });
   regenerateAllRecurring();
+  autoCheckOutPastClose();
   render();
   // Keeps the checked-in "time left" countdown ticking against the real clock without anyone
   // touching the page — a plain re-render every 30s is plenty of resolution for a minutes-level
-  // countdown, and cheap enough for a page this size.
-  setInterval(render, 30000);
+  // countdown, and cheap enough for a page this size. Also sweeps for anyone still checked in
+  // past closing time (see autoCheckOutPastClose()) so a forgotten check-out doesn't sit "in
+  // progress" forever once close has actually arrived.
+  setInterval(function(){ autoCheckOutPastClose(); render(); }, 30000);
 }
 </script>
 </body>
