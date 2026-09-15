@@ -5044,7 +5044,6 @@ function renderStaff(){
 
   if(tab==='today'){
     html+=renderCheckInSearchPanel();
-    html+=renderStaffCheckInPanel();
     html+=renderCoverageRequestsPanel();
     html+=renderEnrollmentRequestsPanel();
     html+=renderCheckedInPanel();
@@ -5095,6 +5094,7 @@ function renderStaff(){
   } else if(tab==='staff'){
     html+=renderFrontStaffPanel();
   } else if(tab==='timesheet'){
+    html+=renderStaffCheckInPanel();
     html+=renderStaffTimesheetPanel();
   } else if(tab==='credits'){
     html+=renderCreditsReport();
@@ -6117,6 +6117,9 @@ function renderFrontStaffPanel(){
 // (renderStaffShiftFields()) or, for an instructor, their own existing availability; a rostered
 // person who hasn't checked in yet is flagged the moment their shift start passes, same "make
 // lateness visible without anyone having to go looking for it" spirit as the live occupancy board.
+// Lives on the Timesheet tab, directly above the historical log (Sept 2026, per Allie: "put
+// check-in/out in the timesheet tab") — moved off Today so all time-tracking, live and historical,
+// sits in one place.
 function renderStaffCheckInPanel(){
   let html='<div class="card"><h2>Check-in/out</h2>'
     +'<p class="small muted">Front desk staff and instructors. Rostered hours come from each front-desk person\'s "Edit details" form below, or from each instructor\'s own availability.</p>';
@@ -6161,24 +6164,19 @@ var STAFF_TIMESHEET_LOOKBACK_DAYS=14;
 // Historical hours log across front desk staff AND instructors (Sept 2026, per Allie: "I want
 // instructors to be on the list", then "can we have a timesheet tab also?" — this now has its own
 // top-level tab rather than living as a collapsed sub-section of Staff, so work history is one
-// click away instead of buried), plus anyone rostered on a day they never clocked in for at all.
+// click away instead of buried). Deliberately actual attendance only — no no-show banner (Sept
+// 2026, per Allie: "I don't need to see all no-shows, just the actual shows and late arrivals");
+// staffNoShowsSince()/instructorNoShowsSince() are left in place (still exercised directly by the
+// test suite) in case a no-show view is wanted again elsewhere later, they're just not surfaced
+// here any more. Late arrivals still show, via the "Vs roster" column below.
 function renderStaffTimesheetPanel(){
   const days=STAFF_TIMESHEET_LOOKBACK_DAYS;
   let html=sectionOpen('staffTimesheet','Timesheet');
-  html+='<p class="small muted">Every check-in/check-out over the last '+days+' days for front desk staff and instructors, plus any rostered day nobody clocked in for at all.</p>';
-  const noShows=staffNoShowsSince(days).map(function(n){ return {kind:'staff', id:n.staffId, date:n.date, rostered:n.rostered}; })
-    .concat(instructorNoShowsSince(days).map(function(n){ return {kind:'instructor', id:n.instructorId, date:n.date, rostered:n.rostered}; }))
-    .sort(function(a,b){ return new Date(b.date)-new Date(a.date); });
-  if(noShows.length){
-    html+='<div class="banner danger" style="margin-bottom:10px">'+noShows.map(function(n){
-      const person = n.kind==='instructor'? findInstructor(n.id) : findStaffMember(n.id);
-      return (person? person.name : '—')+' — no-show '+fmtShort(n.date)+' (rostered '+rangeLabel(n.rostered.start, n.rostered.end-n.rostered.start)+')';
-    }).join('<br>')+'</div>';
-  }
+  html+='<p class="small muted">Every check-in/check-out over the last '+days+' days for front desk staff and instructors.</p>';
   const cutoffKey=toKey(addDays(simNow(), -days));
   const recent=staffAttendance.filter(function(a){ return toKey(a.date)>=cutoffKey; })
     .slice().sort(function(a,b){ return new Date(b.date)-new Date(a.date) || b.checkIn-a.checkIn; });
-  if(recent.length===0 && noShows.length===0){
+  if(recent.length===0){
     html+='<div class="empty-note">No attendance recorded yet.</div>';
   } else if(recent.length){
     html+='<table><tr><th>Date</th><th>Name</th><th>Check-in</th><th>Check-out</th><th>Hours</th><th>Vs roster</th></tr>'
