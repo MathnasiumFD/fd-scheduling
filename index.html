@@ -808,7 +808,7 @@ var state={
   // one long page together — now each is the sole reason to click into its own tab, so they start
   // expanded (Sept 2026, tabs redesign). Pod seating/Settled credits/Staff timesheet stay collapsed
   // by default — secondary/historical sub-panels within a tab, not the tab's main attraction.
-  collapsedSections:{podSeating:true, creditsSettled:true, staffTimesheet:true},
+  collapsedSections:{podSeating:true, creditsSettled:true},
   // Quick check-in/out student search (Sept 2026, per Allie: a search bar that suggests the closest
   // matched student name so front desk doesn't have to hunt through the Schedule list) — just the
   // live query text; matching happens fresh on every render from `sessions`/`students`, nothing else
@@ -3057,6 +3057,75 @@ function staffNoShowsSince(days){
   return list.sort(function(a,b){ return new Date(b.date)-new Date(a.date); });
 }
 
+/* ---------- Instructors on the shared check-in/out board (Sept 2026, per Allie: "I want
+   instructors to be on the list") ---------- */
+// Same staff_attendance table as front-desk staff (see add_instructor_attendance.sql), just keyed
+// by instructorId instead of staffId — never both on one row. Front desk still does the actual
+// checking in/out; instructors never self-service it, same as staff. "Rostered today" reuses each
+// instructor's OWN existing dated availability (instructorAvailabilityOn) — the same source their
+// booking/coverage already relies on — rather than a second, separate roster of their own; that
+// comparison is surfaced only here, on this front-desk board, never shown to the instructor
+// themselves.
+function instructorAttendanceRecordsFor(instructorId, dateKey){
+  return staffAttendance.filter(function(a){ return a.instructorId===instructorId && toKey(a.date)===dateKey; })
+    .sort(function(a,b){ return a.checkIn-b.checkIn; });
+}
+function instructorOpenRecord(instructorId, dateKey){
+  return staffAttendance.find(function(a){ return a.instructorId===instructorId && toKey(a.date)===dateKey && a.checkOut==null; }) || null;
+}
+function instructorCheckinStatusToday(instructorId){
+  const today=simNow();
+  const todayKey=toKey(today);
+  const rostered=instructorAvailabilityOn(instructorId, today); // {start,end} or null
+  const records=instructorAttendanceRecordsFor(instructorId, todayKey);
+  const openRec=instructorOpenRecord(instructorId, todayKey);
+  let lateMin=null;
+  if(rostered && records.length && records[0].checkIn>rostered.start) lateMin=records[0].checkIn-rostered.start;
+  let state;
+  if(openRec) state='on-site';
+  else if(records.length) state='checked-out';
+  else if(!rostered) state='not-rostered';
+  else state = nowMinutesOfDay()>rostered.start? 'late-not-in' : 'not-in-yet';
+  return {rostered, records, openRec, lateMin, state};
+}
+function checkInInstructor(instructorId){
+  const todayKey=toKey(simNow());
+  if(instructorOpenRecord(instructorId, todayKey)){ toast(findInstructor(instructorId).name+' is already checked in today.'); render(); return; }
+  const nowMin=nowMinutesOfDay(); // exact current minute — never rounded, same precision as staff check-in
+  const newRec={id:newId()||('sattend'+(nextStaffAttendanceId++)), staffId:null, instructorId:instructorId, date:new Date(todayKey), checkIn:nowMin, checkOut:null};
+  staffAttendance.push(newRec);
+  dbWrite('checking in instructor', function(){ return supabaseClient.from('staff_attendance').insert({id:newRec.id, instructor_id:instructorId, the_date:todayKey, check_in_min:nowMin}); });
+  toast(findInstructor(instructorId).name+' checked in at '+minToLabel(nowMin)+'.');
+  render();
+}
+function checkOutInstructor(instructorId){
+  const todayKey=toKey(simNow());
+  const rec=instructorOpenRecord(instructorId, todayKey);
+  if(!rec){ toast(findInstructor(instructorId).name+" isn't currently checked in."); render(); return; }
+  const nowMin=nowMinutesOfDay();
+  rec.checkOut=nowMin;
+  dbWrite('checking out instructor', function(){ return supabaseClient.from('staff_attendance').update({check_out_min:nowMin}).eq('id', rec.id); });
+  toast(findInstructor(instructorId).name+' checked out at '+minToLabel(nowMin)+' ('+staffHoursLabel(staffMinutesWorked(rec))+').');
+  render();
+}
+// Rostered-but-never-clocked-in days over the last `days` days, for instructors on the shared
+// board — same shape/logic as staffNoShowsSince, checked against each instructor's own
+// availability instead of a staff roster row.
+function instructorNoShowsSince(days){
+  const today=simNow();
+  const list=[];
+  instructors.forEach(function(instr){
+    for(let i=1;i<=days;i++){
+      const d=addDays(today, -i);
+      const dKey=toKey(d);
+      const rostered=instructorAvailabilityOn(instr.id, d);
+      if(!rostered) continue;
+      if(instructorAttendanceRecordsFor(instr.id, dKey).length===0) list.push({instructorId:instr.id, date:d, rostered:rostered});
+    }
+  });
+  return list.sort(function(a,b){ return new Date(b.date)-new Date(a.date); });
+}
+
 function parentLoginSubmit(email){
   const p=parents.find(function(p){ return p.email.toLowerCase()===String(email).trim().toLowerCase(); });
   if(!p){ state.loginForm.error='No parent account found with that email. Try one of the sample emails below.'; render(); return; }
@@ -4946,6 +5015,7 @@ var FRONT_TABS=[
   {id:'instructors', label:'Instructors'},
   {id:'parents', label:'Parents'},
   {id:'staff', label:'Staff'},
+  {id:'timesheet', label:'Timesheet'},
   {id:'credits', label:'Credits'},
 ];
 function setFrontTab(id){ state.frontTab=id; render(); }
@@ -5024,6 +5094,7 @@ function renderStaff(){
     html+=renderParentsPanel();
   } else if(tab==='staff'){
     html+=renderFrontStaffPanel();
+  } else if(tab==='timesheet'){
     html+=renderStaffTimesheetPanel();
   } else if(tab==='credits'){
     html+=renderCreditsReport();
@@ -6039,23 +6110,27 @@ function renderFrontStaffPanel(){
   return html;
 }
 
-// Live "who's on site right now" board for front desk staff themselves (Sept 2026, per Allie: "I
-// also need front staff to have a section where we can check in/out staff") — deliberately
-// front-desk staff only, not instructors, who already check students in/out through a different
-// part of the app entirely. Rostered hours come from each person's "Edit details" form
-// (renderStaffShiftFields()); a rostered person who hasn't checked in yet is flagged the moment
-// their shift start passes, same "make lateness visible without anyone having to go looking for it"
-// spirit as the live occupancy board.
+// Live "who's on site right now" board — front desk staff AND instructors (Sept 2026, per Allie:
+// "I also need front staff to have a section where we can check in/out staff", then later "I want
+// instructors to be on the list" — the same board, one merged list, still entirely operated by
+// front desk). Rostered hours come from each front-desk person's "Edit details" form
+// (renderStaffShiftFields()) or, for an instructor, their own existing availability; a rostered
+// person who hasn't checked in yet is flagged the moment their shift start passes, same "make
+// lateness visible without anyone having to go looking for it" spirit as the live occupancy board.
 function renderStaffCheckInPanel(){
-  let html='<div class="card"><h2>Staff check-in/out</h2>'
-    +'<p class="small muted">Front desk staff only. Rostered hours come from each person\'s "Edit details" form below.</p>';
-  if(staffMembers.length===0){
-    html+='<div class="empty-note">No named front desk staff yet — add one in the Front Desk Staff section below.</div></div>';
+  let html='<div class="card"><h2>Check-in/out</h2>'
+    +'<p class="small muted">Front desk staff and instructors. Rostered hours come from each front-desk person\'s "Edit details" form below, or from each instructor\'s own availability.</p>';
+  const roster=staffMembers.map(function(s){ return {kind:'staff', id:s.id, name:s.name}; })
+    .concat(instructors.map(function(i){ return {kind:'instructor', id:i.id, name:i.name}; }))
+    .sort(function(a,b){ return a.name.localeCompare(b.name); });
+  if(roster.length===0){
+    html+='<div class="empty-note">Nobody to check in yet — add a front desk staff member in the Front Desk Staff section below, or an instructor in the Instructors tab.</div></div>';
     return html;
   }
   html+='<table><tr><th>Name</th><th>Rostered today</th><th>Status</th><th>Hours today</th><th></th></tr>';
-  staffMembers.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(st){
-    const s=staffStatusToday(st.id);
+  roster.forEach(function(p){
+    const isInstr=p.kind==='instructor';
+    const s=isInstr? instructorCheckinStatusToday(p.id) : staffStatusToday(p.id);
     const rosteredLabel = s.rostered? rangeLabel(s.rostered.start, s.rostered.end-s.rostered.start) : '<span class="small muted">Off today</span>';
     let statusCell;
     if(s.state==='on-site'){
@@ -6073,45 +6148,51 @@ function renderStaffCheckInPanel(){
     const totalMinsToday=s.records.reduce(function(sum,r){ return sum+(staffMinutesWorked(r)||0); },0);
     const hoursCell = s.records.length? staffHoursLabel(totalMinsToday) : '—';
     const actionCell = s.openRec
-      ? '<button class="btn sm ghost" onclick="checkOutStaff(\''+st.id+'\')">Check out</button>'
-      : '<button class="btn sm" onclick="checkInStaff(\''+st.id+'\')">Check in</button>';
-    html+='<tr><td>'+st.name+'</td><td class="small">'+rosteredLabel+'</td><td>'+statusCell+'</td><td>'+hoursCell+'</td><td>'+actionCell+'</td></tr>';
+      ? '<button class="btn sm ghost" onclick="'+(isInstr?'checkOutInstructor':'checkOutStaff')+'(\''+p.id+'\')">Check out</button>'
+      : '<button class="btn sm" onclick="'+(isInstr?'checkInInstructor':'checkInStaff')+'(\''+p.id+'\')">Check in</button>';
+    const roleTag = isInstr? ' <span class="small muted">(Instructor)</span>' : '';
+    html+='<tr><td>'+p.name+roleTag+'</td><td class="small">'+rosteredLabel+'</td><td>'+statusCell+'</td><td>'+hoursCell+'</td><td>'+actionCell+'</td></tr>';
   });
   html+='</table></div>';
   return html;
 }
 // How many days back the historical timesheet (and its no-show flagging) looks.
 var STAFF_TIMESHEET_LOOKBACK_DAYS=14;
-// Historical hours log across all front desk staff, plus anyone rostered on a day they never
-// clocked in for at all — collapsed by default, same "settled record, not a daily-use panel"
-// treatment as the make-up-credits history or inactive-students sections.
+// Historical hours log across front desk staff AND instructors (Sept 2026, per Allie: "I want
+// instructors to be on the list", then "can we have a timesheet tab also?" — this now has its own
+// top-level tab rather than living as a collapsed sub-section of Staff, so work history is one
+// click away instead of buried), plus anyone rostered on a day they never clocked in for at all.
 function renderStaffTimesheetPanel(){
   const days=STAFF_TIMESHEET_LOOKBACK_DAYS;
-  let html=sectionOpen('staffTimesheet','Staff timesheet');
-  html+='<p class="small muted">Every staff check-in/check-out over the last '+days+' days, plus any rostered day nobody clocked in for at all.</p>';
-  const noShows=staffNoShowsSince(days);
+  let html=sectionOpen('staffTimesheet','Timesheet');
+  html+='<p class="small muted">Every check-in/check-out over the last '+days+' days for front desk staff and instructors, plus any rostered day nobody clocked in for at all.</p>';
+  const noShows=staffNoShowsSince(days).map(function(n){ return {kind:'staff', id:n.staffId, date:n.date, rostered:n.rostered}; })
+    .concat(instructorNoShowsSince(days).map(function(n){ return {kind:'instructor', id:n.instructorId, date:n.date, rostered:n.rostered}; }))
+    .sort(function(a,b){ return new Date(b.date)-new Date(a.date); });
   if(noShows.length){
     html+='<div class="banner danger" style="margin-bottom:10px">'+noShows.map(function(n){
-      const st=findStaffMember(n.staffId);
-      return (st? st.name : '—')+' — no-show '+fmtShort(n.date)+' (rostered '+rangeLabel(n.rostered.start, n.rostered.end-n.rostered.start)+')';
+      const person = n.kind==='instructor'? findInstructor(n.id) : findStaffMember(n.id);
+      return (person? person.name : '—')+' — no-show '+fmtShort(n.date)+' (rostered '+rangeLabel(n.rostered.start, n.rostered.end-n.rostered.start)+')';
     }).join('<br>')+'</div>';
   }
   const cutoffKey=toKey(addDays(simNow(), -days));
   const recent=staffAttendance.filter(function(a){ return toKey(a.date)>=cutoffKey; })
     .slice().sort(function(a,b){ return new Date(b.date)-new Date(a.date) || b.checkIn-a.checkIn; });
   if(recent.length===0 && noShows.length===0){
-    html+='<div class="empty-note">No staff attendance recorded yet.</div>';
+    html+='<div class="empty-note">No attendance recorded yet.</div>';
   } else if(recent.length){
-    html+='<table><tr><th>Date</th><th>Staff</th><th>Check-in</th><th>Check-out</th><th>Hours</th><th>Vs roster</th></tr>'
+    html+='<table><tr><th>Date</th><th>Name</th><th>Check-in</th><th>Check-out</th><th>Hours</th><th>Vs roster</th></tr>'
       +recent.map(function(r){
-        const st=findStaffMember(r.staffId);
+        const isInstr=r.instructorId!=null;
+        const person = isInstr? findInstructor(r.instructorId) : findStaffMember(r.staffId);
         const weekday=WEEKDAY_KEYS[(new Date(r.date).getDay()+6)%7];
-        const rostered=staffRosteredOn(r.staffId, weekday);
+        const rostered = isInstr? instructorAvailabilityOn(r.instructorId, r.date) : staffRosteredOn(r.staffId, weekday);
         let vsRoster='<span class="small muted">Not rostered</span>';
         if(rostered){
           vsRoster = r.checkIn>rostered.start? '<span class="badge full">'+(r.checkIn-rostered.start)+'m late</span>' : '<span class="badge available">On time</span>';
         }
-        return '<tr><td>'+fmtShort(r.date)+'</td><td>'+(st? st.name : '—')+'</td><td>'+minToLabel(r.checkIn)+'</td>'
+        const roleTag = isInstr? ' <span class="small muted">(Instructor)</span>' : '';
+        return '<tr><td>'+fmtShort(r.date)+'</td><td>'+(person? person.name : '—')+roleTag+'</td><td>'+minToLabel(r.checkIn)+'</td>'
           +'<td>'+(r.checkOut!=null? minToLabel(r.checkOut) : '<span class="small muted">Still on site</span>')+'</td>'
           +'<td>'+staffHoursLabel(staffMinutesWorked(r))+'</td><td>'+vsRoster+'</td></tr>';
       }).join('')
@@ -7574,7 +7655,7 @@ function loadAllData(){
     T('enrollment_request_previous_recurring','id,request_id,weekday,start_min'),
     T('staff_members','id,name,email,auth_user_id'),
     T('staff_rostered_shifts','id,staff_id,weekday,start_min,end_min'),
-    T('staff_attendance','id,staff_id,the_date,check_in_min,check_out_min'),
+    T('staff_attendance','id,staff_id,instructor_id,the_date,check_in_min,check_out_min'),
   ]).then(function(t){
     const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows,staffShiftRows,staffAttendanceRows]=t;
 
@@ -7672,7 +7753,7 @@ function loadAllData(){
     }; });
 
     staffAttendance=staffAttendanceRows.map(function(r){ return {
-      id:r.id, staffId:r.staff_id, date:new Date(r.the_date), checkIn:r.check_in_min, checkOut:r.check_out_min,
+      id:r.id, staffId:r.staff_id, instructorId:r.instructor_id, date:new Date(r.the_date), checkIn:r.check_in_min, checkOut:r.check_out_min,
     }; });
   });
 }
