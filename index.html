@@ -152,6 +152,7 @@
   .avail-cell{ border:1px solid var(--border); border-radius:8px; padding:8px 4px; text-align:center; font-size:.72rem; background:var(--surface-2); color:var(--text-muted); }
   .avail-cell.on{ background:var(--success-bg); color:var(--success); border-color:var(--success); font-weight:700; }
   .avail-cell.full-cell{ background:var(--danger-bg); color:var(--danger); border-color:var(--danger); font-weight:700; }
+  .avail-cell.opening-cell{ background:var(--warning-bg); color:var(--warning); border-color:var(--warning); font-weight:700; }
   .avail-cell.nostaff-cell{ font-style:italic; }
   .avail-cell.online-cell{ background:var(--online-bg); color:var(--online); border-color:var(--online); font-weight:700; }
   .cal-head{ font-size:.72rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:.03em; padding:6px 4px; }
@@ -781,7 +782,6 @@ var state={
   recurringForm:null,
   holdForm:null,
   checkIn:null,
-  availWeekOffset:0,
   availSessionLen:AVAIL_MIN_SESSION_LEN, // Sept 2026: front desk can match this to the actual family's session length (see setAvailSessionLen) — see the "no open slots" bug writeup near openSlotsForCredit for why this defaulting-to-90-regardless-of-duration was misleading
   availRuleForm:null,
   oneOffForm:null,
@@ -3559,11 +3559,75 @@ function onlineSeatsAt(dateKey, weekday, blockStart, blockLen){
   });
   return seats;
 }
-// Same collapse-guard as setWeek() above, for the Availability lookup section's own toggle.
-function setAvailWeek(w){
-  state.availWeekOffset=w;
-  if(state.collapsedSections && state.collapsedSections.availability){ state.collapsedSections.availability=false; }
-  render();
+// Sept 2026, per Allie: "I want the availability lookup to be an overview of regularly scheduled
+// sessions - not be so week-by-week" — front desk used to flip between "This week"/"Next week" and
+// see different seat counts for the exact same weekday/time, since a one-off booking, a hold, or a
+// closure landing in one particular week could make that week's real numbers look better or worse
+// than the standing pattern actually is. There's now exactly one reference date per weekday — the
+// next real occurrence of it, skipping a closed day — so the grid always answers "what does a normal
+// Monday at 3pm look like", not "what does the Monday two Tuesdays from now happen to look like".
+function nextRegularOccurrence(weekday){
+  let d=nextDateForWeekday(simNow(), weekday);
+  while(closedDayFor(d)){ d=addDays(d,7); }
+  return d;
+}
+// Same shape as peakInWindow, but returns which students are actually occupying the window instead
+// of just the peak count — used only to work out whose seat a "opening soon" slot belongs to, never
+// for capacity math itself (openSeatsAt/peakInWindow, above, are untouched).
+function occupantsInWindow(podId, dateKey, winStart, winEnd){
+  return sessionsForDay(podId, dateKey)
+    .filter(function(s){ return s.start<winEnd && winStart<s.start+s.duration; })
+    .map(function(s){ return s.studentId; });
+}
+// Does this student have a dated schedule change, already on file and taking effect within the next
+// 14 days, that actually removes them from this exact weekday/window — a real "finishing up" (a
+// stop, or a move to a different day/time) rather than a temporary hold (holds don't touch
+// student.planChanges at all, so they're correctly invisible here; a hold freeing a seat is a
+// temporary blip, not the standing pattern changing). Returns the change's effective date, or null.
+function upcomingSlotDeparture(studentId, weekday, blockStart, blockLen){
+  const student=findStudent(studentId);
+  if(!student) return null;
+  const nowKey=toKey(simNow()), horizonKey=toKey(addDays(simNow(),14));
+  const upcoming=(student.planChanges||[])
+    .filter(function(pc){ const k=toKey(pc.effectiveFrom); return k>nowKey && k<=horizonKey; })
+    .sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); });
+  for(let i=0;i<upcoming.length;i++){
+    const pc=upcoming[i];
+    const newRecurring=pc.stopped? [] : (pc.recurring||[]);
+    const stillHasSlot=newRecurring.some(function(r){ return r.weekday===weekday && r.start<blockStart+blockLen && blockStart<r.start+student.duration; });
+    if(!stillHasSlot) return pc.effectiveFrom;
+  }
+  return null;
+}
+// "There are no waitlists on that time slot" (Allie's own wording) — a plain day+time match, same
+// granularity the waitlist itself is matched on elsewhere (waitlistOpenSeat/pickBestPodWithClaims
+// don't pin a Pod either); if anyone's already queued for it, the first real opening is already
+// spoken for, so it's not something to advertise to a brand-new inquiry.
+function weekdaySlotHasWaitlist(weekday, start){
+  return waitlist.some(function(w){ return w.status==='waiting' && w.weekday===weekday && w.start===start; });
+}
+// For a currently-full weekday/time slot: is anyone occupying it due to leave within 14 days, with
+// nobody already waitlisted for it? Walks the same staffed-Pods loop as openSeatsAt so it only ever
+// looks at Pods that actually count toward that cell's number. Returns {count, date} (date = the
+// earliest departure) or null.
+function regularSlotOpeningSoon(dateKey, weekday, blockStart, blockLen){
+  if(weekdaySlotHasWaitlist(weekday, blockStart)) return null;
+  const date=new Date(dateKey);
+  const blockEnd=blockStart+blockLen;
+  const studentIds=[];
+  pods.forEach(function(pod){
+    const cov=podCoverageBoundary(pod.id, weekday, blockStart, blockLen, date);
+    if(!cov.instructorId) return;
+    const winEnd=Math.min(blockEnd, cov.boundary);
+    if(winEnd<=blockStart) return;
+    occupantsInWindow(pod.id, dateKey, blockStart, winEnd).forEach(function(sid){
+      if(studentIds.indexOf(sid)===-1) studentIds.push(sid);
+    });
+  });
+  const departures=studentIds.map(function(sid){ return upcomingSlotDeparture(sid, weekday, blockStart, blockLen); }).filter(Boolean);
+  if(departures.length===0) return null;
+  departures.sort(function(a,b){ return toKey(a).localeCompare(toKey(b)); });
+  return {count:departures.length, date:departures[0]};
 }
 // Sept 2026, per Allie's report of a parent seeing "no open slots" for a make-up while front desk
 // was confident there was room: the Lookup grid always checked a fixed 90-minute window
@@ -5438,13 +5502,9 @@ function renderCheckedInPanel(){
 }
 
 function renderAvailabilityLookup(){
-  const monday=addDays(getMonday(simNow()), state.availWeekOffset*7);
-  const days=[0,1,2,3,4].map(function(i){ return addDays(monday,i); });
   const sessionLen=state.availSessionLen||AVAIL_MIN_SESSION_LEN;
   let html=sectionOpen('availability','Availability lookup',
     '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
-      +'<button class="btn sm'+(state.availWeekOffset===0?' primary':'')+'" onclick="setAvailWeek(0)">This week</button>'
-      +'<button class="btn sm'+(state.availWeekOffset===1?' primary':'')+'" onclick="setAvailWeek(1)">Next week</button>'
       +'<select class="btn sm" style="padding:5px 8px" onchange="setAvailSessionLen(this.value)" title="Check against a specific session length">'
         +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===sessionLen?' selected':'')+'>'+d+' min</option>'; }).join('')
       +'</select>'
@@ -5456,19 +5516,32 @@ function renderAvailabilityLookup(){
   // or someone else's session starting. Match the selector to the family you're helping.
   // Descriptive blurb removed per Allie ("no blurb") — the grid explains itself well enough via its
   // own "No staff"/"Full"/"N open" labels.
+  // Sept 2026, per Allie: "an overview of regularly scheduled sessions - not so week-by-week" — each
+  // weekday now has exactly one reference date (the next real occurrence of it, see
+  // nextRegularOccurrence), not a This-week/Next-week toggle that could show two different numbers
+  // for the same weekday depending which one you happened to click.
   html+='<div class="avail-grid" style="grid-template-columns:90px repeat('+AVAIL_BLOCKS.length+',1fr)">';
   html+='<div></div>'+AVAIL_BLOCKS.map(function(hb){ return '<div class="cal-head">'+minToLabel(hb)+'</div>'; }).join('');
-  days.forEach(function(d,i){
-    const weekday=WEEKDAY_KEYS[i];
+  WEEKDAY_KEYS.forEach(function(weekday){
+    const d=nextRegularOccurrence(weekday);
     const dateKey=toKey(d);
     html+='<div class="cal-row-label">'+weekday+' <span class="small muted" style="font-weight:400">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></div>';
     AVAIL_BLOCKS.forEach(function(hb){
       const r=openSeatsAt(dateKey, weekday, hb, '', sessionLen);
-      let cls='avail-cell', label;
-      if(r.staffed===0){ cls+=' nostaff-cell'; label='No staff'; }
-      else if(r.seats===0){ cls+=' full-cell'; label='Full'; }
+      let cls='avail-cell', label, clickable=false;
+      if(r.staffed===0){ cls+=' nostaff-cell'; label='No staff'; clickable=true; }
+      else if(r.seats===0){
+        // Sept 2026, per Allie: "if a child is finishing up within 2 weeks, and their slot will
+        // become available... display 1 open from date" — a genuinely full slot stays "Full" and
+        // clickable to the waitlist, same as ever; one about to free up because of a real, dated
+        // schedule change (not a temporary hold — see upcomingSlotDeparture) gets its own look
+        // instead, and isn't pushed toward the waitlist since it's about to just be bookable outright.
+        const opening=regularSlotOpeningSoon(dateKey, weekday, hb, sessionLen);
+        if(opening){ cls+=' opening-cell'; label=opening.count+' open from '+fmtShort(opening.date); }
+        else { cls+=' full-cell'; label='Full'; clickable=true; }
+      }
       else { cls+=' on'; label=r.seats+' open'; }
-      if(r.staffed===0 || r.seats===0){
+      if(clickable){
         html+='<div class="'+cls+'" style="cursor:pointer" title="Add someone to the waitlist for '+weekday+' '+minToLabel(hb)+'" onclick="openWaitlistForm(\''+weekday+'\','+hb+')">'+label+'</div>';
       } else {
         html+='<div class="'+cls+'">'+label+'</div>';
