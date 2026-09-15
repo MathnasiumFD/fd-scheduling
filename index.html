@@ -611,6 +611,200 @@ function removeClosedDay(id){
   toast('Closure removed — future regular sessions will fill back in automatically.');
 }
 
+// Seasonal "summer hours" override (Sept 2026, per Allie: "between the 18th of December and the 26th
+// of January we will be switching to our summer times, which means the centre will be open in the
+// mornings from 8-12"). NOT a closure — the centre is still open, just on a different Mon-Fri window
+// than its usual afternoon hours, and only for whichever Pods actually have someone rostered to cover
+// it (a smaller, holiday-sized team — "all pods, reduced roster" — Allie assigns the roster herself
+// once the break exists). Every student's regular standing session simply doesn't get pre-booked for
+// a date inside the range (see generateRecurringSessions' own isClosedDate-style check below) — there's
+// nothing to "hold" per student since this is centre-wide and temporary, and the normal afternoon
+// pattern resumes entirely on its own the moment a date falls after `endDate`, since student.recurring
+// itself is never touched. Parents self-book whichever morning session(s) they want during the break
+// (see openTermBreakBookingForm below) using the exact same fixed half-hour grid style as term time,
+// just against this window's own hours instead of CENTER_OPEN/CENTER_CLOSE. At most one of these
+// should realistically ever be active at once, but nothing here assumes that.
+var termBreaks=[];
+var nextTermBreakId=1;
+// The term break (if any) whose date range covers this exact date — its own Mon-Fri window applies
+// every weekday in range; the centre isn't open weekends regardless, so no need to special-case that.
+function termBreakOn(date){
+  const dateKey=toKey(date);
+  return termBreaks.find(function(t){ return toKey(t.startDate)<=dateKey && dateKey<=toKey(t.endDate); }) || null;
+}
+// Which instructor (if any) covers a given Pod on a given weekday for a specific term break —
+// deliberately just one flat instructor per Pod/weekday for the whole break, no handoffs and no
+// dated assignment history like the regular podSchedule blocks use, since this is a short one-off
+// holiday roster front desk sets up once, not an ongoing weekly shift needing that machinery.
+function termBreakCoverageFor(termBreak, podId, weekday){
+  return (termBreak && termBreak.coverage && termBreak.coverage[podId] && termBreak.coverage[podId][weekday]) || null;
+}
+function setTermBreakCoverage(termBreakId, podId, weekday, instructorId){
+  const t=termBreaks.find(function(x){ return x.id===termBreakId; });
+  if(!t) return;
+  t.coverage=t.coverage||{};
+  t.coverage[podId]=t.coverage[podId]||{};
+  t.coverage[podId][weekday]=instructorId||null;
+  if(instructorId){
+    dbWrite('setting summer-hours coverage', function(){ return supabaseClient.from('term_break_coverage').upsert({
+      term_break_id:t.id, pod_id:podId, weekday:weekday, instructor_id:instructorId
+    }, {onConflict:'term_break_id,pod_id,weekday'}); });
+  } else {
+    dbWrite('clearing summer-hours coverage', function(){ return supabaseClient.from('term_break_coverage').delete()
+      .eq('term_break_id', t.id).eq('pod_id', podId).eq('weekday', weekday); });
+  }
+  regenerateAllRecurring(); // a session left Unassigned only because nothing covered it yet can now self-heal
+  render();
+}
+// Bookable start times within a term break's own window — mirrors possibleStarts(), just scoped to
+// the break's morning hours instead of the centre's normal CENTER_OPEN/CENTER_CLOSE.
+function termBreakPossibleStarts(termBreak, duration){
+  const arr=[];
+  for(let t=termBreak.morningStart; t+duration<=termBreak.morningEnd; t+=START_STEP) arr.push(t);
+  return arr;
+}
+// Same "first staffed, under-capacity Pod wins" approach as pickBestPod, just checked against this
+// term break's own coverage instead of the regular weekly podSchedule — reuses podCapacityBlocked
+// directly since capacity math itself doesn't care how a Pod came to be staffed for the window.
+function termBreakPickBestPod(termBreak, weekday, dateKey, start, duration){
+  for(let i=0;i<pods.length;i++){
+    const podId=pods[i].id;
+    const instructorId=termBreakCoverageFor(termBreak, podId, weekday);
+    if(!instructorId) continue;
+    if(podCapacityBlocked(podId, dateKey, {start, duration})) continue;
+    return {podId:podId, instructorId:instructorId};
+  }
+  return null;
+}
+// Aggregate open seats across every Pod covered during this window of this term break — the summer-
+// hours counterpart to openSeatsAt(), reusing the exact same peakInWindow/podCapacity/unassigned-
+// headcount math, just driven by termBreakCoverageFor() instead of the regular podCoverageBoundary.
+function termBreakOpenSeatsAt(termBreak, weekday, dateKey, blockStart, blockLen){
+  let seats=0, staffed=0;
+  const blockEnd=blockStart+blockLen;
+  pods.forEach(function(pod){
+    if(!termBreakCoverageFor(termBreak, pod.id, weekday)) return;
+    staffed++;
+    const peak=peakInWindow(pod.id, dateKey, blockStart, blockEnd);
+    seats += Math.max(0, podCapacity(pod.id)-peak);
+  });
+  seats = Math.max(0, seats - unassignedPeakInWindow(dateKey, blockStart, blockEnd));
+  return {seats, staffed};
+}
+function openAddTermBreakForm(){
+  state.termBreakForm={label:'Summer hours', startDate:'', endDate:'', morningStart:480, morningEnd:720, error:''};
+  render();
+}
+function closeAddTermBreakForm(){ state.termBreakForm=null; render(); }
+function setTermBreakField(field, value){
+  const f=state.termBreakForm; if(!f) return;
+  f[field] = (field==='morningStart' || field==='morningEnd') ? Number(value) : value;
+  f.error='';
+  render();
+}
+function saveTermBreakForm(){
+  const f=state.termBreakForm; if(!f) return;
+  if(!f.startDate || !f.endDate){ f.error='Pick a start and end date.'; render(); return; }
+  if(f.endDate<f.startDate){ f.error='End date must be on or after the start date.'; render(); return; }
+  if(f.morningEnd<=f.morningStart){ f.error='The end time must be after the start time.'; render(); return; }
+  addTermBreak(f.label, new Date(f.startDate), new Date(f.endDate), f.morningStart, f.morningEnd);
+  state.termBreakForm=null;
+}
+function addTermBreak(label, startDate, endDate, morningStart, morningEnd){
+  const t={id:newId()||('tb'+(nextTermBreakId++)), label:(label||'').trim()||'Summer hours', startDate:startDate, endDate:endDate, morningStart:morningStart, morningEnd:morningEnd, coverage:{}};
+  termBreaks.push(t);
+  dbWrite('adding summer hours', function(){ return supabaseClient.from('term_breaks').insert({
+    id:t.id, label:t.label, start_date:toKey(t.startDate), end_date:toKey(t.endDate), morning_start:t.morningStart, morning_end:t.morningEnd
+  }); });
+  // Anything already pre-booked into the new window (only possible if this was set up less than
+  // HORIZON_WEEKS out) is cancelled outright — no make-up credit, since nothing was actually missed;
+  // the family just has a morning slot to book instead — then the standing generator re-runs so it
+  // correctly skips the rest of the range going forward.
+  const startKey=toKey(t.startDate), endKey=toKey(t.endDate);
+  let cancelled=0;
+  sessions.forEach(function(s){
+    if(s.status!=='scheduled' || !s.recurring) return;
+    const dk=toKey(s.date);
+    if(dk<startKey || dk>endKey) return;
+    s.status='cancelled';
+    cancelled++;
+    dbWrite('cancelling a standing session for summer hours', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
+  });
+  regenerateAllRecurring();
+  toast('Summer hours added: '+fmtShort(t.startDate)+'–'+fmtShort(t.endDate)+', '+minToLabel(t.morningStart)+'–'+minToLabel(t.morningEnd)+(cancelled>0? ' — '+cancelled+' already-booked standing session'+(cancelled===1?'':'s')+' in that range cleared (no make-up credit — parents can book a morning session instead).' : '.'));
+  return t;
+}
+function removeTermBreak(id){
+  termBreaks=termBreaks.filter(function(t){ return t.id!==id; });
+  dbWrite('removing summer hours', function(){ return supabaseClient.from('term_breaks').delete().eq('id', id); });
+  regenerateAllRecurring();
+  toast('Summer hours removed — the regular standing schedule will fill back into that range automatically.');
+}
+// A parent-booked morning session during an active term break (Sept 2026, per Allie: "I need your
+// help setting this up so that when I give parents access to their accounts, they can schedule
+// themselves over the holiday period"). Deliberately its own function rather than reusing the normal
+// booking pipeline (confirmBooking/openBooking) — those assume the regular podSchedule/CENTER_OPEN
+// hours, while this is scoped entirely to the active break's own coverage/window.
+function openTermBreakBookingForm(studentId){
+  const now=simNow();
+  const tb=termBreakOn(now) || termBreaks.find(function(t){ return toKey(t.startDate)>=toKey(now); }); // current, or the soonest upcoming one
+  if(!tb){ toast('No summer hours period is set up right now.'); render(); return; }
+  const student=findStudent(studentId);
+  state.termBreakBookingForm={studentId:studentId, termBreakId:tb.id, date:toKey(tb.startDate)<toKey(now)? toKey(now) : toKey(tb.startDate), start:null, duration:student.duration, error:''};
+  // Land on the first real weekday >= the default date, same idea as the rest of the app's date pickers.
+  while(WEEKDAY_KEYS.indexOf(WEEKDAY_KEYS[(new Date(state.termBreakBookingForm.date).getDay()+6)%7])===-1 || isClosedDate(new Date(state.termBreakBookingForm.date))){
+    state.termBreakBookingForm.date=toKey(addDays(new Date(state.termBreakBookingForm.date),1));
+    if(state.termBreakBookingForm.date>toKey(tb.endDate)) break; // give up — renderer will just show "no slots" for an all-closed range
+  }
+  render();
+}
+function closeTermBreakBookingForm(){ state.termBreakBookingForm=null; render(); }
+function setTermBreakBookingField(field, value){
+  const f=state.termBreakBookingForm; if(!f) return;
+  f[field] = (field==='duration' || field==='start') ? (value===''? null : Number(value)) : value;
+  if(field==='date'){ f.start=null; } // whichever time was picked may no longer even be on the grid for a new date
+  f.error='';
+  render();
+}
+function confirmTermBreakBooking(){
+  const f=state.termBreakBookingForm; if(!f) return;
+  const tb=termBreaks.find(function(t){ return t.id===f.termBreakId; });
+  if(!tb){ f.error='This summer hours period no longer exists.'; render(); return; }
+  if(!f.date || f.start==null){ f.error='Choose a date and a time.'; render(); return; }
+  const dateKey=f.date;
+  if(dateKey<toKey(tb.startDate) || dateKey>toKey(tb.endDate)){ f.error='Pick a date within the summer hours period ('+fmtShort(tb.startDate)+'–'+fmtShort(tb.endDate)+').'; render(); return; }
+  const date=new Date(dateKey);
+  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+  if(!weekday){ f.error='The centre is only open Mon–Fri during the break.'; render(); return; }
+  if(isClosedDate(date)){ f.error='The centre is closed that day.'; render(); return; }
+  const student=findStudent(f.studentId);
+  const pick=termBreakPickBestPod(tb, weekday, dateKey, f.start, f.duration);
+  if(!pick){ f.error='That time just filled up — pick another.'; render(); return; }
+  const sess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:pick.podId, online:false, instructorId:pick.instructorId, instructorId2:null, handoff:null, date:date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'parent', creditId:null, recurring:false, termBreak:true};
+  sessions.push(sess);
+  dbWrite('booking a summer-hours session', function(){ return supabaseClient.from('sessions').insert({
+    id:sess.id, student_id:sess.studentId, pod_id:sess.podId, online:false, instructor_id:sess.instructorId,
+    instructor_id_2:null, handoff_min:null, the_date:toKey(sess.date), start_min:sess.start, duration:sess.duration,
+    status:sess.status, booked_by:sess.bookedBy, credit_id:null, is_recurring:false, term_break:true
+  }); });
+  toast('Booked '+fmtLong(date)+' at '+minToLabel(f.start)+' — see you then!');
+  state.termBreakBookingForm=null;
+  render();
+}
+// Cancelling a self-booked summer-hours session is a plain cancel, never a make-up credit — the
+// family picked this slot themselves rather than losing a regular one, so there's nothing "owed"
+// back to them the way there is for parentCancelSession's regular standing sessions.
+function parentCancelTermBreakSession(sessionId){
+  const sess=findSession(sessionId);
+  if(!sess || sess.status!=='scheduled' || !sess.termBreak) return;
+  const student=findStudent(sess.studentId);
+  if(!confirm('Cancel '+student.name+'\'s summer session on '+fmtLong(sess.date)+' at '+minToLabel(sess.start)+'?')) return;
+  sess.status='cancelled';
+  dbWrite('cancelling a summer-hours session (parent)', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
+  toast('Summer session cancelled.');
+  render();
+}
+
 // Parent-submitted "request a hold" / "request to cancel enrolment" (5.20) — parents propose,
 // front desk approves or declines. Approving a hold applies it exactly like a front-desk-placed
 // one (applyHold); approving a cancellation schedules a "stop attending" plan change from the
@@ -817,7 +1011,7 @@ var state={
   // one long page together — now each is the sole reason to click into its own tab, so they start
   // expanded (Sept 2026, tabs redesign). Pod seating/Settled credits/Staff timesheet stay collapsed
   // by default — secondary/historical sub-panels within a tab, not the tab's main attraction.
-  collapsedSections:{podSeating:true, creditsSettled:true, holdsPast:true},
+  collapsedSections:{podSeating:true, creditsSettled:true, holdsPast:true, termBreaks:true},
   // Timesheet tab filters (Sept 2026, per Allie: "I want the timesheet to allow me to look at any
   // day, but I need to select the day, or the staff, or both") — personKey is '' (everyone) or
   // 'staff:<id>'/'instructor:<id>'; date is '' (falls back to the default lookback window) or a
@@ -2140,6 +2334,7 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
       // starting a week late for a weekly recurring slot). toKey() on both sides avoids that entirely.
       if(student.startDate && toKey(date) < toKey(student.startDate)) return; // not enrolled yet — nothing to book before their first day (Sept 2026, per Allie: "its not always straight away")
       if(isClosedDate(date)) return; // centre's closed this day — never pre-book a regular session onto it
+      if(termBreakOn(date)) return; // running summer hours this day — no standing afternoon session; families self-book a morning slot instead
       const dateKey=toKey(date);
       if(isStudentOnHold(student.id, date)) return; // on hold — leave this occurrence unbooked
       const plan=studentPlanOn(student.id, date); // respects any scheduled stop/frequency change
@@ -3561,6 +3756,21 @@ function removeAssignment(podId, weekday, blockId, effectiveFromKey){
 // staffed at all in that window, so "0 seats, nobody's on" reads differently from "0 seats, fully
 // booked." (The `year` parameter is accepted but no longer filters — kept for callers that still
 // pass one.)
+// A session with no Pod on file (podId null, not online) still takes up a real seat in the room at
+// whatever time it's booked — usually because every Pod was already full when it was made and front
+// desk squeezed the student in anyway, or a Pod was cleared by hand afterward. It isn't tied to any
+// one specific Pod, so there's no single Pod's own count to charge it against — but openSeatsAt()
+// ignoring it entirely let the Availability lookup quote a seat that doesn't actually exist (Sept
+// 2026, per Allie: "unassigned kids must count towards availability"). This mirrors peakInWindow but
+// scoped to every unassigned session across the whole centre, for openSeatsAt() to subtract off the
+// aggregate total, wherever those seats really are.
+function unassignedPeakInWindow(dateKey, winStart, winEnd){
+  const list = sessions.filter(function(s){
+    return !s.podId && !s.online && toKey(s.date)===dateKey && s.status!=='cancelled'
+      && s.start<winEnd && winStart<s.start+s.duration;
+  }).map(function(s){ return {start:Math.max(s.start,winStart), end:Math.min(s.start+s.duration,winEnd)}; });
+  return peakConcurrencyOf(list);
+}
 function openSeatsAt(dateKey, weekday, blockStart, year, blockLen){
   let seats=0, staffed=0;
   const blockEnd=blockStart+blockLen;
@@ -3574,6 +3784,7 @@ function openSeatsAt(dateKey, weekday, blockStart, year, blockLen){
     const peak=peakInWindow(pod.id, dateKey, winStart, winEnd);
     seats += Math.max(0, podCapacity(pod.id)-peak);
   });
+  seats = Math.max(0, seats - unassignedPeakInWindow(dateKey, blockStart, blockEnd));
   return {seats, staffed};
 }
 // Combined (physical + online) peak headcount instructor X is minding, restricted to a window —
@@ -4530,15 +4741,29 @@ function holdMonthlyBreakdown(studentId, hold){
   }
   const findMonth=function(sortKey){ return months.find(function(x){ return x.sortKey===sortKey; }); };
   const seenDates={}; // dateKey -> true, so the pattern-based fallback below never double-counts a day that already has a real row
+  // Collapse every raw session row down to one verdict per calendar date first. Repeated schedule
+  // edits (saveRecurringForm) cancel old-pattern rows without ever deleting them, so the same date
+  // can accumulate several historical 'cancelled' rows over time — summing rows directly (as this
+  // used to) double- or triple-counts those ghosts. A cancelled-within-this-hold's-range row always
+  // wins for its date; a scheduled/attended row only counts if nothing on that date is cancelled.
+  const byDate={};
   sessions.forEach(function(s){
     if(s.studentId!==studentId) return;
     const dk=toKey(s.date);
+    if(s.status==='cancelled' && dk>=startKey && dk<=endKey){
+      byDate[dk]={cancelled:true};
+    } else if((s.status==='scheduled' || s.status==='attended') && !(byDate[dk] && byDate[dk].cancelled)){
+      byDate[dk]={cancelled:false};
+    }
+  });
+  Object.keys(byDate).forEach(function(dk){
     seenDates[dk]=true;
-    const d=new Date(s.date);
+    const parts=dk.split('-'); // local-safe parse (new Date(dk) parses as UTC midnight and can land on the wrong local day)
+    const d=new Date(Number(parts[0]), Number(parts[1])-1, Number(parts[2]));
     const entry=findMonth(d.getFullYear()*12+d.getMonth());
     if(!entry) return; // outside every month this hold touches — not relevant here
-    if(s.status==='cancelled' && dk>=startKey && dk<=endKey) entry.cancelled++;
-    else if(s.status==='scheduled' || s.status==='attended') entry.scheduled++;
+    if(byDate[dk].cancelled) entry.cancelled++;
+    else entry.scheduled++;
   });
   months.forEach(function(entry){
     const y2=Math.floor(entry.sortKey/12), m2=entry.sortKey%12;
@@ -5194,6 +5419,24 @@ function renderQuickCoverageModal(){
   return html;
 }
 
+// A Pod's day can naturally turn over into more than one distinct wave of students — mostly one
+// group arriving together, then leaving and being replaced by a different group later on (Sept 2026,
+// per Allie: "sometimes pods experience a second seating... on the first seating its 7 kids, and then
+// on the second its 6"). Grouped by each session's own start time rather than by staffing block,
+// since a real seating turnover is about when the KIDS actually arrive, not how coverage happens to
+// be split for the day — a Pod staffed by one instructor straight through can still turn over twice.
+// A Pod with everyone on a single start time (the ordinary case) has nothing worth calling out, so
+// this only returns something once there's a genuine second (or third...) wave.
+function podSeatingsBreakdown(roster){
+  const byStart={};
+  roster.forEach(function(s){ (byStart[s.start]=byStart[s.start]||[]).push(s); });
+  const starts=Object.keys(byStart).map(Number).sort(function(a,b){ return a-b; });
+  if(starts.length<2) return null;
+  const ORDINALS=['1st','2nd','3rd','4th','5th','6th','7th','8th'];
+  return starts.map(function(start, idx){
+    return {label:(ORDINALS[idx]||(idx+1)+'th')+' seating', time:minToLabel(start), count:byStart[start].length};
+  });
+}
 function renderPodSummaryStrip(dayKey, weekday){
   const now=simNow();
   const selectedDate=new Date(dayKey);
@@ -5210,11 +5453,13 @@ function renderPodSummaryStrip(dayKey, weekday){
     // filling up" view front desk watches through the day (5.28, per Allie).
     const occupancy=checkedIn.length;
     const roster=dayList.filter(function(s){ return s.podId===pod.id && !s.online; });
+    const seatings=podSeatingsBreakdown(roster);
     html+='<div class="card" style="margin:0"><div class="card-head" style="flex-wrap:wrap;row-gap:6px">'
       +'<h3 style="margin:0">'+pod.name+'</h3>'
       +'<span class="small muted">'+coverage+'</span>'
       +'<span class="badge '+(occupancy>=cap?'full':'available')+'">'+occupancy+'/'+cap+'</span>'
       +'<button class="btn sm ghost" style="margin-left:auto" onclick="openPodAssignForm(\''+pod.id+'\',\''+weekday+'\')">Assign</button>'
+      +(seatings? '<span class="small muted" style="width:100%">'+seatings.map(function(sg){ return sg.label+' ('+sg.time+'): <b>'+sg.count+'</b> kid'+(sg.count===1?'':'s'); }).join(' · ')+'</span>' : '')
     +'</div>'
     +(roster.length? rosterTableHtml(roster, weekday, dayKey, now) : '<div class="empty-note">Nobody assigned here yet.</div>')
     +'</div>';
@@ -5427,6 +5672,69 @@ function renderFrontTabsBar(activeTab){
   }).join('')+'</div>';
 }
 
+// Full-day (not just afternoon) time options for the summer-hours setup form below — CENTER_OPEN/
+// CENTER_CLOSE (used everywhere else) are the centre's own regular AFTERNOON hours, which is exactly
+// what a summer/term break replaces, so this can't reuse TIME_OPTIONS. Runs 6:00am-9:00pm on a
+// quarter-hour grid, comfortably covering any plausible seasonal window.
+function dayTimeOptionsHtml(selected){
+  let html='';
+  for(let t=360; t<=1260; t+=START_STEP){ html+='<option value="'+t+'"'+(t===selected?' selected':'')+'>'+minToLabel(t)+'</option>'; }
+  return html;
+}
+// Front-desk admin: set up (and staff) a summer/term-break hours period (Sept 2026, per Allie: "we
+// will be switching to our summer times... I need your help setting this up"). Collapsed by default,
+// same convention as Pod seating/Settled credits/Past holds — a once-a-year setup task, not a
+// day-to-day panel. Each existing period gets its own Pod x weekday coverage grid right underneath,
+// same idea as the regular Pod "Assign" flow but flattened to one instructor per cell since a break's
+// roster is short-lived and doesn't need dated assignment history.
+function renderTermBreaksPanel(){
+  let html=sectionOpen('termBreaks','Summer / term break hours',
+    '<button class="btn sm primary" onclick="openAddTermBreakForm()">+ Add summer hours</button>');
+  html+='<p>For a stretch where the centre swaps its usual afternoon hours for a different Mon–Fri window (school holidays, say). Every student\'s regular standing session is automatically skipped for these dates — nothing to do per student — and the normal schedule resumes on its own once the range ends. Assign an instructor to each Pod/weekday below to open it up for parents to self-book from their own login; a Pod/weekday left blank simply isn\'t offered.</p>';
+  if(termBreaks.length===0){ html+='<div class="empty-note">No summer/term break hours set up.</div>'; }
+  else{
+    termBreaks.slice().sort(function(a,b){ return toKey(a.startDate).localeCompare(toKey(b.startDate)); }).forEach(function(t){
+      html+='<div class="card" style="margin:0 0 12px"><div class="card-head" style="flex-wrap:wrap;row-gap:6px">'
+        +'<h3 style="margin:0">'+t.label+'</h3>'
+        +'<span class="small muted">'+fmtShort(t.startDate)+'–'+fmtShort(t.endDate)+' · '+minToLabel(t.morningStart)+'–'+minToLabel(t.morningEnd)+'</span>'
+        +'<button class="btn sm ghost" style="margin-left:auto" onclick="removeTermBreak(\''+t.id+'\')">Remove</button>'
+      +'</div>';
+      html+='<div style="overflow-x:auto"><table><tr><th>Pod</th>'+WEEKDAY_KEYS.map(function(wd){ return '<th>'+wd+'</th>'; }).join('')+'</tr>';
+      pods.forEach(function(pod){
+        html+='<tr><td><b>'+pod.name+'</b></td>'+WEEKDAY_KEYS.map(function(wd){
+          const current=termBreakCoverageFor(t, pod.id, wd)||'';
+          return '<td><select onchange="setTermBreakCoverage(\''+t.id+'\',\''+pod.id+'\',\''+wd+'\',this.value)"><option value=""'+(!current?' selected':'')+'>—</option>'
+            +instructors.filter(function(i){ return i.active!==false; }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(i){ return '<option value="'+i.id+'"'+(i.id===current?' selected':'')+'>'+i.name+'</option>'; }).join('')
+          +'</select></td>';
+        }).join('')+'</tr>';
+      });
+      html+='</table></div></div>';
+    });
+  }
+  html+='</div>';
+  html+=renderAddTermBreakModal();
+  return html;
+}
+function renderAddTermBreakModal(){
+  const f=state.termBreakForm;
+  if(!f) return '';
+  let html='<div class="overlay" onclick="if(event.target===this) closeAddTermBreakForm()"><div class="modal">';
+  html+='<h3>Add summer / term break hours</h3>';
+  html+='<p>Every student\'s regular afternoon session is automatically skipped for dates in this range — nothing to do per student. Assign instructors to Pods for the break afterward; parents can then self-book from their own login.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<label>Label</label><input type="text" value="'+f.label+'" oninput="setTermBreakField(\'label\',this.value)"/>';
+  html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.startDate+'" onchange="setTermBreakField(\'startDate\',this.value)"/></div>'
+    +'<div><label>End date</label><input type="date" value="'+f.endDate+'" onchange="setTermBreakField(\'endDate\',this.value)"/></div></div>';
+  html+='<div class="row2"><div><label>Opens at</label><select onchange="setTermBreakField(\'morningStart\',this.value)">'+dayTimeOptionsHtml(f.morningStart)+'</select></div>'
+    +'<div><label>Closes at</label><select onchange="setTermBreakField(\'morningEnd\',this.value)">'+dayTimeOptionsHtml(f.morningEnd)+'</select></div></div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeAddTermBreakForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveTermBreakForm()">Add</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+
 function renderStaff(){
   const now=simNow();
   const monday=addDays(getMonday(now), state.weekOffset*7);
@@ -5493,6 +5801,7 @@ function renderStaff(){
       +'<p class="small muted">Move a student here and it sticks — every '+weekday+' from '+fmtShort(selectedDate)+' onward, not just '+fmtShort(selectedDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead.</p>'
       +renderPodSummaryStrip(dayKey, weekday)
       +'</div>';
+    html+=renderTermBreaksPanel();
   } else if(tab==='students'){
     html+=renderStudentsPanel();
   } else if(tab==='parents'){
@@ -5873,7 +6182,7 @@ function renderWaitlistModal(){
   +'</div>';
   if(f.mode==='existing'){
     html+='<label>Student</label><select onchange="setWaitlistField(\'studentId\',this.value)"><option value="">Choose…</option>'
-      +students.map(function(s){ return '<option value="'+s.id+'"'+(s.id===f.studentId?' selected':'')+'>'+s.name+' ('+yearLabel(s.year)+')</option>'; }).join('')
+      +students.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(s){ return '<option value="'+s.id+'"'+(s.id===f.studentId?' selected':'')+'>'+s.name+' ('+yearLabel(s.year)+')</option>'; }).join('')
       +'</select>';
     // Which of THEIR current sessions this join would swap out — required whenever they have one
     // (Sept 2026, per Allie: "swap (current day) for (desired day)... we need to be aware of which").
@@ -7679,6 +7988,12 @@ function renderParent(){
     +'<p>Please make all cancellations, schedule-change requests and make-up bookings here rather than by phone, email or text. Cancellations and make-up bookings update instantly; a permanent day/time change is reviewed by front desk first, same as a hold or cancelling enrolment.</p>'
     +'<p>Quick, easy, all in one place.</p></div>';
 
+  // Currently-running summer/term break hours, or the soonest upcoming one — the same one
+  // openTermBreakBookingForm() itself lands on — used just to decide whether to even offer the "Book
+  // a summer session" link at all (Sept 2026, per Allie: "when I give parents access to their
+  // accounts, they can schedule themselves over the holiday period").
+  const activeOrUpcomingTermBreak=termBreakOn(simNow()) || termBreaks.find(function(t){ return toKey(t.startDate)>=toKey(simNow()); }) || null;
+
   parent.studentIds.forEach(function(sid){
     const student=findStudent(sid);
     const studentCredits=credits.filter(function(c){ return c.studentId===sid; })
@@ -7710,6 +8025,7 @@ function renderParent(){
         +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Change regular day/time</a>')
         +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>')
         +'<a href="#" class="small" onclick="openParentWaitlistForm(\''+sid+'\');return false;">Join the waitlist for another day/time</a>'
+        +(activeOrUpcomingTermBreak? '<a href="#" class="small" onclick="openTermBreakBookingForm(\''+sid+'\');return false;">Book a '+activeOrUpcomingTermBreak.label.toLowerCase()+' session</a>' : '')
       +'</div></div>';
 
     // -- This child's own waitlist entries (5.17, parent self-service Sept 2026) — a parent can see
@@ -7749,19 +8065,22 @@ function renderParent(){
         const pod=findPod(s.podId);
         const instr=s.instructorId? findInstructor(s.instructorId) : null;
         const isMakeUp=credits.some(function(c){ return c.redeemedSessionId===s.id; });
-        const typeBadge=s.recurring? '<span class="badge booked">Regular</span>' : (isMakeUp? '<span class="badge available">Make-Up</span>' : '<span class="badge soon">One-off</span>');
+        // Sept 2026: a session the family self-booked during summer/term break hours gets its own
+        // badge and its own cancel path (parentCancelTermBreakSession — a plain cancel, never a
+        // make-up credit, since nothing regular was actually missed to earn one).
+        const typeBadge=s.termBreak? '<span class="badge soon">Summer</span>' : (s.recurring? '<span class="badge booked">Regular</span>' : (isMakeUp? '<span class="badge available">Make-Up</span>' : '<span class="badge soon">One-off</span>'));
         // Cancelling is always allowed, even same-day past the 10am cutoff — it just won't come
         // with a make-up credit past that point (5.26, per Allie: previously refused outright,
         // which just pushed the family to phone in instead). Flag it here too, not only in the
         // confirm dialog, so it's not a surprise after they've already clicked Cancel.
-        const noMakeUpToday = toKey(s.date)===toKey(simNow()) && sameDayMakeUpCutoffPassed();
+        const noMakeUpToday = !s.termBreak && toKey(s.date)===toKey(simNow()) && sameDayMakeUpCutoffPassed();
         return '<div class="session-row">'
           +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
           +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(s.online?'Online':(pod?pod.name:'—'))+' · '+(instr?instr.name:'Unassigned')+'</div>'
             +(noMakeUpToday? '<div class="small" style="color:var(--danger)">Past 10am — cancelling now won\'t include a make-up credit</div>' : '')
           +'</div>'
           +typeBadge
-          +'<button class="btn sm ghost" onclick="parentCancelSession(\''+s.id+'\')">Cancel</button>'
+          +'<button class="btn sm ghost" onclick="'+(s.termBreak? 'parentCancelTermBreakSession' : 'parentCancelSession')+'(\''+s.id+'\')">Cancel</button>'
         +'</div>';
       }).join('')+'</div>';
     }
@@ -7804,6 +8123,7 @@ function renderParent(){
   html+=renderHoldRequestModal();
   html+=renderTimeChangeRequestModal();
   html+=renderCancelRequestModal();
+  html+=renderTermBreakBookingModal();
   html+=renderParentWaitlistModal();
   return html;
 }
@@ -7883,6 +8203,52 @@ function renderCancelRequestModal(){
     +'<button class="btn ghost" onclick="closeCancelRequestForm()">Back</button>'
     +'<button class="btn danger" onclick="submitCancelRequest()">Send request</button>'
   +'</div></div></div>';
+  return html;
+}
+
+// Parent-facing summer/term-break self-booking (Sept 2026, per Allie: "when I give parents access
+// to their accounts, they can schedule themselves over the holiday period, and also can schedule
+// themselves upon returning to class" — the return-to-class side needs nothing extra here, since a
+// student's normal recurring plan simply picks back up on its own once dates move past the break's
+// own endDate; see generateRecurringSessions' termBreakOn() check). Picks a date first (any weekday
+// inside the break's own range, not closed), then only shows times that are genuinely open right
+// now, using the exact same termBreakOpenSeatsAt()/termBreakPickBestPod() math the confirm step
+// itself relies on — so nothing offered here can ever fail to book once picked.
+function renderTermBreakBookingModal(){
+  const f=state.termBreakBookingForm;
+  if(!f) return '';
+  const tb=termBreaks.find(function(t){ return t.id===f.termBreakId; });
+  if(!tb) return '';
+  const student=findStudent(f.studentId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeTermBreakBookingForm()"><div class="modal">';
+  html+='<h3>Book a '+tb.label.toLowerCase()+' session for '+student.name+'</h3>';
+  html+='<p>Pick any weekday between '+fmtShort(tb.startDate)+' and '+fmtShort(tb.endDate)+' — the centre runs '+minToLabel(tb.morningStart)+'–'+minToLabel(tb.morningEnd)+' during this period, in place of the usual regular schedule.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<label>Date</label><input type="date" value="'+f.date+'" min="'+toKey(tb.startDate)+'" max="'+toKey(tb.endDate)+'" onchange="setTermBreakBookingField(\'date\',this.value)"/>';
+  if(f.date){
+    const date=new Date(f.date);
+    const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+    if(!weekday){
+      html+='<p class="small" style="color:var(--danger)">The centre is only open Monday–Friday during this period — pick a weekday.</p>';
+    } else if(isClosedDate(date)){
+      html+='<p class="small" style="color:var(--danger)">The centre is closed that day.</p>';
+    } else {
+      const starts=termBreakPossibleStarts(tb, f.duration);
+      const openStarts=starts.filter(function(st){ return termBreakOpenSeatsAt(tb, weekday, f.date, st, f.duration).seats>0; });
+      if(openStarts.length===0){
+        html+='<p class="small muted">No open times that day for a '+f.duration+'-minute session — try another date.</p>';
+      } else {
+        html+='<label>Time</label><select onchange="setTermBreakBookingField(\'start\',this.value)"><option value="">Choose…</option>'
+          +openStarts.map(function(st){ return '<option value="'+st+'"'+(st===f.start?' selected':'')+'>'+minToLabel(st)+'</option>'; }).join('')
+        +'</select>';
+      }
+    }
+  }
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeTermBreakBookingForm()">Cancel</button>'
+    +'<button class="btn primary" '+(f.start==null?'disabled':'')+' onclick="confirmTermBreakBooking()">Book</button>'
+  +'</div>';
+  html+='</div></div>';
   return html;
 }
 
@@ -8102,7 +8468,7 @@ var LIVE_SYNC_TABLES=['instructors','instructor_avail_rules','instructor_one_off
   'student_pod_assignments','student_plan_changes','student_plan_change_recurring','parents','sessions',
   'credits','coverage_requests','coverage_request_notified_instructors','waitlist_entries','closed_days',
   'enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring','staff_members',
-  'staff_rostered_shifts','staff_attendance'];
+  'staff_rostered_shifts','staff_attendance','term_breaks','term_break_coverage'];
 function subscribeToLiveUpdates(){
   let channel=supabaseClient.channel('live-updates');
   LIVE_SYNC_TABLES.forEach(function(t){
@@ -8211,7 +8577,7 @@ function loadAllData(){
     T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
     T('parents','id,name,email,auth_user_id'),
-    T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online'),
+    T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break'),
     T('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note'),
     T('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
     T('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
@@ -8223,8 +8589,10 @@ function loadAllData(){
     T('staff_members','id,name,email,auth_user_id'),
     T('staff_rostered_shifts','id,staff_id,weekday,start_min,end_min'),
     T('staff_attendance','id,staff_id,instructor_id,the_date,check_in_min,check_out_min'),
+    T('term_breaks','id,label,start_date,end_date,morning_start,morning_end'),
+    T('term_break_coverage','term_break_id,pod_id,weekday,instructor_id'),
   ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows,staffShiftRows,staffAttendanceRows]=t;
+    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows,staffShiftRows,staffAttendanceRows,termBreakRows,termBreakCoverRows]=t;
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
@@ -8275,7 +8643,7 @@ function loadAllData(){
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
       actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false,
-      bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false,
+      bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false, termBreak:r.term_break||false,
     }; });
 
     credits=creditRows.map(function(r){ return {
@@ -8298,6 +8666,15 @@ function loadAllData(){
     closedDays=closedDayRows.map(function(r){ return {
       id:r.id, date:new Date(r.the_date), label:r.label, recurring:r.recurring,
     }; });
+
+    termBreaks=termBreakRows.map(function(r){
+      const coverage={};
+      termBreakCoverRows.filter(function(c){ return c.term_break_id===r.id; }).forEach(function(c){
+        coverage[c.pod_id]=coverage[c.pod_id]||{};
+        coverage[c.pod_id][c.weekday]=c.instructor_id;
+      });
+      return {id:r.id, label:r.label, startDate:new Date(r.start_date), endDate:new Date(r.end_date), morningStart:r.morning_start, morningEnd:r.morning_end, coverage:coverage};
+    });
 
     enrollmentRequests=enrollRequestRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, type:r.type,
