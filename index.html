@@ -817,7 +817,7 @@ var state={
   // one long page together — now each is the sole reason to click into its own tab, so they start
   // expanded (Sept 2026, tabs redesign). Pod seating/Settled credits/Staff timesheet stay collapsed
   // by default — secondary/historical sub-panels within a tab, not the tab's main attraction.
-  collapsedSections:{podSeating:true, creditsSettled:true},
+  collapsedSections:{podSeating:true, creditsSettled:true, holdsPast:true},
   // Timesheet tab filters (Sept 2026, per Allie: "I want the timesheet to allow me to look at any
   // day, but I need to select the day, or the staff, or both") — personKey is '' (everyone) or
   // 'staff:<id>'/'instructor:<id>'; date is '' (falls back to the default lookback window) or a
@@ -4362,10 +4362,11 @@ function closeHoldForm(){ state.holdForm=null; render(); }
 function setHoldField(field, value){
   state.holdForm[field]=value;
   state.holdForm.error='';
-  // The start/end range decides which sessions (if any) fall inside the 7-day billing-notice
-  // window, so any previous answer to "how should those be handled" no longer necessarily applies —
-  // clear it and make them confirm again against the new range.
-  if(field==='start' || field==='end'){ state.holdForm.grantMakeupCredits=null; }
+  // The start/end range (or which student it even applies to, now that "+ Hold" on the Holds tab
+  // can open this with no student picked yet) decides which sessions (if any) fall inside the 7-day
+  // billing-notice window, so any previous answer to "how should those be handled" no longer
+  // necessarily applies — clear it and make them confirm again against the new range.
+  if(field==='start' || field==='end' || field==='studentId'){ state.holdForm.grantMakeupCredits=null; }
   render();
 }
 function setHoldMakeupChoice(v){ state.holdForm.grantMakeupCredits=v; state.holdForm.error=''; render(); }
@@ -4454,6 +4455,7 @@ function applyHold(student, start, end, note, grantMakeupCredits){
 }
 function saveHold(){
   const f=state.holdForm;
+  if(!f.studentId){ f.error='Choose a student.'; render(); return; }
   const student=findStudent(f.studentId);
   if(!f.start || !f.end){ f.error='Choose a start and end date.'; render(); return; }
   if(f.end<f.start){ f.error='End date must be on or after the start date.'; render(); return; }
@@ -4502,65 +4504,114 @@ function allHoldsFlat(){
   });
   return out.sort(function(a,b){ return toKey(b.hold.start).localeCompare(toKey(a.hold.start)); });
 }
-// Splits a hold's effect on billing by calendar month — computed fresh from the student's actual
-// session records every time this renders, rather than frozen at whatever was known the moment the
-// hold was placed. That matters because a hold placed further out than the pre-booking horizon
-// (HORIZON_WEEKS) doesn't have every affected session's row created yet at that moment — this way,
-// as time passes and those occurrences are reached and cancelled for real, they show up here
-// automatically (Sept 2026, per Allie: "for the cancelled sessions they need to be split into
-// months and say x sessions cancelled in october, 3 scheduled to attend remaining").
+// Splits a hold's effect on billing by calendar month. For any day that already has a real session
+// row, uses its actual status (ground truth — respects excused absences, other holds, anything else
+// that genuinely happened). For a day that doesn't have a row yet — typically because it's further
+// out than HORIZON_WEEKS, the pre-booking horizon — falls back to asking studentPlanOn() (the same
+// resolver every other schedule feature uses, so a dated plan change mid-hold is honoured exactly
+// like everywhere else) whether that day would normally be one of the student's regular sessions at
+// all, and whether it falls inside this hold or not.
+//
+// The fallback is what makes this correct arbitrarily far into the future rather than silently
+// under-counting "scheduled" for months beyond the horizon — real occurrences the family is
+// genuinely on track for, just not pre-booked into a row yet (Sept 2026, per Allie, after checking
+// her own math against a longer hold: "how far into the future does this look? because ... there
+// should be more in the scheduled count"). It respects the student's own enrolment start date too,
+// so a month that started before they'd even enrolled never counts days from before then.
 function holdMonthlyBreakdown(studentId, hold){
-  const startD=new Date(toKey(hold.start)), endD=new Date(toKey(hold.end));
-  const months=[], byKey={};
+  const student=findStudent(studentId);
+  const startKey=toKey(hold.start), endKey=toKey(hold.end);
+  const startD=new Date(startKey), endD=new Date(endKey);
+  const months=[];
   let y=startD.getFullYear(), m=startD.getMonth();
   while(y<endD.getFullYear() || (y===endD.getFullYear() && m<=endD.getMonth())){
-    const key=y+'-'+m;
-    const entry={key:key, sortKey:y*12+m, label:new Date(y,m,1).toLocaleDateString('en-AU',{month:'long',year:'numeric'}), cancelled:0, scheduled:0};
-    months.push(entry); byKey[key]=entry;
+    months.push({sortKey:y*12+m, label:new Date(y,m,1).toLocaleDateString('en-AU',{month:'long',year:'numeric'}), cancelled:0, scheduled:0});
     m++; if(m>11){ m=0; y++; }
   }
+  const findMonth=function(sortKey){ return months.find(function(x){ return x.sortKey===sortKey; }); };
+  const seenDates={}; // dateKey -> true, so the pattern-based fallback below never double-counts a day that already has a real row
   sessions.forEach(function(s){
     if(s.studentId!==studentId) return;
-    const d=new Date(s.date);
-    const mk=d.getFullYear()+'-'+d.getMonth();
-    const entry=byKey[mk];
-    if(!entry) return; // outside every month this hold touches — not relevant here
     const dk=toKey(s.date);
-    if(s.status==='cancelled' && dk>=toKey(hold.start) && dk<=toKey(hold.end)){
-      entry.cancelled++;
-    } else if(s.status==='scheduled' || s.status==='attended'){
-      // "Remaining" for that same month — whichever of the student's sessions that month AREN'T
-      // cancelled, whether they fall before/after the hold window within it or the hold only covers
-      // part of the month — so billing can see "still on track for N sessions in October" alongside
-      // however many were lost to the hold.
-      entry.scheduled++;
+    seenDates[dk]=true;
+    const d=new Date(s.date);
+    const entry=findMonth(d.getFullYear()*12+d.getMonth());
+    if(!entry) return; // outside every month this hold touches — not relevant here
+    if(s.status==='cancelled' && dk>=startKey && dk<=endKey) entry.cancelled++;
+    else if(s.status==='scheduled' || s.status==='attended') entry.scheduled++;
+  });
+  months.forEach(function(entry){
+    const y2=Math.floor(entry.sortKey/12), m2=entry.sortKey%12;
+    const lastDay=new Date(y2, m2+1, 0).getDate();
+    for(let day=1; day<=lastDay; day++){
+      const date=new Date(y2, m2, day);
+      const dk=toKey(date);
+      if(seenDates[dk]) continue; // already counted for real above
+      if(student.startDate && dk<toKey(student.startDate)) continue; // not enrolled yet
+      if(isClosedDate(date)) continue; // centre closed — never a session either way
+      const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7]; // undefined on a Sat/Sun — never matches a recurring slot below
+      const plan=studentPlanOn(studentId, date); // resolves whichever plan (incl. any dated change) actually governs this date
+      if(!(plan.recurring||[]).some(function(r){ return r.weekday===weekday; })) continue; // not one of their regular days
+      if(dk>=startKey && dk<=endKey){
+        entry.cancelled++; // falls inside THIS hold — would have happened but for it
+      } else if(!isStudentOnHold(studentId, date)){
+        // Still on track for that same month — not cancelled by this hold (or any other one).
+        entry.scheduled++;
+      }
     }
   });
   return months;
 }
-function renderHoldsPanel(){
-  const rows=allHoldsFlat();
-  let html=sectionOpen('holds','Holds',
-    '<span class="small muted">'+rows.length+'</span>');
-  html+='<p>Every hold on file — front desk placed (Students list, "Hold") or from an approved parent request — for keeping billing in sync: who\'s currently or about to be on hold, any make-up credits issued for late notice, and month by month how many sessions were cancelled versus how many they\'re still on track to attend.</p>';
-  if(rows.length===0){ html+='<div class="empty-note">No holds on file.</div>'; }
+// Shared row-builder for both the current and the past holds tables below (Sept 2026, per Allie:
+// "once the hold period has passed, can you place them into a different box and make that always
+// collapsed" — mirrors the exact split the Credits tab already uses for booked vs. completed/expired).
+function holdReportRowHtml(r){
+  const st=holdStatus(r.hold);
+  const statusBadge = st==='active'? '<span class="badge hold">Active</span>' : st==='upcoming'? '<span class="badge soon">Upcoming</span>' : '<span class="badge completed">Ended</span>';
+  const breakdown=holdMonthlyBreakdown(r.student.id, r.hold);
+  const monthsCell = breakdown.length
+    ? breakdown.map(function(m){ return '<div>'+m.label+': <b>'+m.cancelled+'</b> cancelled, <b>'+m.scheduled+'</b> scheduled</div>'; }).join('')
+    : '<span class="small muted">—</span>';
+  return '<tr><td>'+r.student.name+'</td>'
+    +'<td>'+fmtShort(r.hold.start)+'–'+fmtShort(r.hold.end)+'</td>'
+    +'<td>'+statusBadge+'</td>'
+    +'<td class="small">'+(r.hold.note||'—')+'</td>'
+    +'<td>'+(r.hold.creditsIssued||0)+'</td>'
+    +'<td class="small">'+monthsCell+'</td>'
+    +'<td><button class="btn sm ghost" onclick="removeHold(\''+r.student.id+'\',\''+r.hold.id+'\')">Remove</button></td></tr>';
+}
+function currentHolds(){
+  return allHoldsFlat().filter(function(r){ return holdStatus(r.hold)!=='ended'; });
+}
+function pastHolds(){
+  return allHoldsFlat().filter(function(r){ return holdStatus(r.hold)==='ended'; });
+}
+function renderCurrentHoldsPanel(){
+  const rows=currentHolds();
+  let html=sectionOpen('holdsCurrent','Current & upcoming holds ('+rows.length+')',
+    '<button class="btn sm primary" onclick="openHoldForm(\'\')">+ Hold</button>');
+  html+='<p>Every active or scheduled hold — placed here or from an approved parent request — for keeping billing in sync: any make-up credits issued for late notice, and month by month how many sessions were cancelled versus how many they\'re still on track to attend.</p>';
+  if(rows.length===0){ html+='<div class="empty-note">No current or upcoming holds.</div>'; }
   else{
     html+='<table><tr><th>Student</th><th>Dates</th><th>Status</th><th>Note</th><th>Make-up credits</th><th>Sessions by month</th><th></th></tr>';
-    rows.forEach(function(r){
-      const st=holdStatus(r.hold);
-      const statusBadge = st==='active'? '<span class="badge hold">Active</span>' : st==='upcoming'? '<span class="badge soon">Upcoming</span>' : '<span class="badge completed">Ended</span>';
-      const breakdown=holdMonthlyBreakdown(r.student.id, r.hold);
-      const monthsCell = breakdown.length
-        ? breakdown.map(function(m){ return '<div>'+m.label+': <b>'+m.cancelled+'</b> cancelled, <b>'+m.scheduled+'</b> scheduled</div>'; }).join('')
-        : '<span class="small muted">—</span>';
-      html+='<tr><td>'+r.student.name+'</td>'
-        +'<td>'+fmtShort(r.hold.start)+'–'+fmtShort(r.hold.end)+'</td>'
-        +'<td>'+statusBadge+'</td>'
-        +'<td class="small">'+(r.hold.note||'—')+'</td>'
-        +'<td>'+(r.hold.creditsIssued||0)+'</td>'
-        +'<td class="small">'+monthsCell+'</td>'
-        +'<td><button class="btn sm ghost" onclick="removeHold(\''+r.student.id+'\',\''+r.hold.id+'\')">Remove</button></td></tr>';
-    });
+    rows.forEach(function(r){ html+=holdReportRowHtml(r); });
+    html+='</table>';
+  }
+  html+='</div>';
+  html+=renderHoldModal();
+  return html;
+}
+// Past (ended) holds — kept around as a permanent billing record, but tucked into its own
+// collapsed-by-default section once the hold period has passed, same convention as Settled credits
+// and Inactive Students/Parents, so old holds don't bury the ones still worth acting on.
+function renderPastHoldsPanel(){
+  const rows=pastHolds();
+  let html=sectionOpen('holdsPast','Past holds ('+rows.length+')','');
+  html+='<p>Holds whose end date has already passed — kept here as a record for billing, no action needed.</p>';
+  if(rows.length===0){ html+='<div class="empty-note">No past holds yet.</div>'; }
+  else{
+    html+='<table><tr><th>Student</th><th>Dates</th><th>Status</th><th>Note</th><th>Make-up credits</th><th>Sessions by month</th><th></th></tr>';
+    rows.forEach(function(r){ html+=holdReportRowHtml(r); });
     html+='</table>';
   }
   html+='</div>';
@@ -5457,7 +5508,8 @@ function renderStaff(){
     html+=renderBookedCreditsPanel();
     html+=renderSettledCreditsPanel();
   } else if(tab==='holds'){
-    html+=renderHoldsPanel();
+    html+=renderCurrentHoldsPanel();
+    html+=renderPastHoldsPanel();
   }
 
   // Modals always render regardless of which tab is active — every one of these is only ever
@@ -6135,7 +6187,7 @@ function renderBookingModal(){
 function renderStudentsPanel(){
   let html=sectionOpen('students','Students',
     '<button class="btn sm primary" onclick="openNewStudentForm()">+ Add student</button>');
-  html+='<p>Set once at enrollment: school year, sessions per week (1 or 2), usual length, and a regular day/time for each. The system pre-books actual sessions from that automatically, up to '+HORIZON_WEEKS+' weeks ahead — staff can still move, cancel, or add one-off sessions by hand any time. “Hold” is front-desk only — it pauses a student for a date range without losing their regular spot, and frees those sessions up for one-off bookings while they’re away.</p>';
+  html+='<p>Set once at enrollment: school year, sessions per week (1 or 2), usual length, and a regular day/time for each. The system pre-books actual sessions from that automatically, up to '+HORIZON_WEEKS+' weeks ahead — staff can still move, cancel, or add one-off sessions by hand any time. To pause a student for a date range without losing their regular spot, use “+ Hold” on the Holds tab.</p>';
   html+='<table><tr><th>Student</th><th>Year</th><th>Plan</th><th>Regular schedule</th><th>Booked this week</th><th>Parent</th><th></th></tr>';
   students.filter(function(s){ return !isStudentInactive(s); }).sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
     const parent=parents.find(function(p){ return p.id===s.parentId; });
@@ -6158,13 +6210,12 @@ function renderStudentsPanel(){
       +'<td class="small">'+recurringSummary(s)+'</td>'
       +'<td>'+(short? '<span class="badge soon">'+booked+' / '+s.sessionsPerWeek+'</span>' : '<span class="badge available">'+booked+' / '+s.sessionsPerWeek+'</span>')+'</td>'
       +'<td class="small">'+(parent? parent.name : '—')+'</td>'
-      +'<td><button class="btn sm ghost" onclick="openEditStudentForm(\''+s.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openRecurringForm(\''+s.id+'\')">Edit schedule</button> <button class="btn sm ghost" onclick="openHoldForm(\''+s.id+'\')">Hold</button> <button class="btn sm ghost" onclick="openAttendanceLog(\''+s.id+'\')">History</button> <button class="btn sm ghost" onclick="openStudentPodForm(\''+s.id+'\')">Change Pod</button> <button class="btn sm ghost" onclick="openPlanChangeForm(\''+s.id+'\')">Stop / change plan</button></td></tr>';
+      +'<td><button class="btn sm ghost" onclick="openEditStudentForm(\''+s.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openRecurringForm(\''+s.id+'\')">Edit schedule</button> <button class="btn sm ghost" onclick="openAttendanceLog(\''+s.id+'\')">History</button> <button class="btn sm ghost" onclick="openStudentPodForm(\''+s.id+'\')">Change Pod</button> <button class="btn sm ghost" onclick="openPlanChangeForm(\''+s.id+'\')">Stop / change plan</button></td></tr>';
   });
   html+='</table></div>';
   html+=renderNewStudentModal();
   html+=renderEditStudentModal();
   html+=renderRecurringModal();
-  html+=renderHoldModal();
   html+=renderAttendanceLogModal();
   html+=renderStudentPodModal();
   html+=renderPlanChangeModal();
@@ -6693,11 +6744,14 @@ function renderNewInstructorModal(){
 function renderHoldModal(){
   const f=state.holdForm;
   if(!f) return '';
-  const student=findStudent(f.studentId);
+  const student=f.studentId? findStudent(f.studentId) : null;
   let html='<div class="overlay" onclick="if(event.target===this) closeHoldForm()"><div class="modal">';
-  html+='<h3>Place '+student.name+' on hold</h3>';
-  html+='<p>Front-desk only. Their regular spot isn\'t touched — it\'ll resume automatically after the hold ends. Any of their sessions inside this date range (regular or one-off) are freed up so someone else can book that Pod slot in the meantime.</p>';
+  html+='<h3>'+(student? 'Place '+student.name+' on hold' : 'Place a student on hold')+'</h3>';
+  html+='<p>Their regular spot isn\'t touched — it\'ll resume automatically after the hold ends. Any of their sessions inside this date range (regular or one-off) are freed up so someone else can book that Pod slot in the meantime.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<label>Student</label><select onchange="setHoldField(\'studentId\',this.value)"><option value="">Choose a student…</option>'
+    +students.filter(function(s){ return !isStudentInactive(s); }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(s){ return '<option value="'+s.id+'"'+(s.id===f.studentId?' selected':'')+'>'+s.name+'</option>'; }).join('')
+    +'</select>';
   html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.start+'" onchange="setHoldField(\'start\',this.value)"/></div>'
     +'<div><label>End date</label><input type="date" value="'+f.end+'" onchange="setHoldField(\'end\',this.value)"/></div></div>';
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. family vacation" value="'+f.note+'" oninput="setHoldField(\'note\',this.value)"/>';
@@ -6712,13 +6766,13 @@ function renderHoldModal(){
     html+='<label style="display:flex;gap:8px;align-items:flex-start;font-weight:normal;margin-bottom:6px"><input type="radio" name="holdNoticeChoice" '+(f.grantMakeupCredits===false?'checked':'')+' onchange="setHoldMakeupChoice(false)" style="margin-top:3px"/> <span>Retrospective — enough notice was actually given (payments are being adjusted); no make-ups needed, just cancel as normal.</span></label>';
     html+='<label style="display:flex;gap:8px;align-items:flex-start;font-weight:normal;margin-bottom:6px"><input type="radio" name="holdNoticeChoice" '+(f.grantMakeupCredits===true?'checked':'')+' onchange="setHoldMakeupChoice(true)" style="margin-top:3px"/> <span>Not enough notice — issue a make-up credit for each affected session.</span></label>';
   }
-  const holdConfirmDisabled = lateSessions.length>0 && f.grantMakeupCredits===null;
+  const holdConfirmDisabled = !student || (lateSessions.length>0 && f.grantMakeupCredits===null);
   html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeHoldForm()">Cancel</button>'
     +'<button class="btn primary" '+(holdConfirmDisabled?'disabled':'')+' onclick="saveHold()">Place on hold</button>'
   +'</div>';
 
-  const holds=(student.holds||[]).slice().sort(function(a,b){ return toKey(b.start).localeCompare(toKey(a.start)); });
+  const holds=student? (student.holds||[]).slice().sort(function(a,b){ return toKey(b.start).localeCompare(toKey(a.start)); }) : [];
   if(holds.length>0){
     html+='<h3 style="margin-top:18px">Holds on file</h3><table><tr><th>Dates</th><th>Note</th><th></th></tr>'
       +holds.map(function(h){
