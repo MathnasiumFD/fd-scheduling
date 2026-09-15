@@ -809,6 +809,11 @@ var state={
   // expanded (Sept 2026, tabs redesign). Pod seating/Settled credits/Staff timesheet stay collapsed
   // by default — secondary/historical sub-panels within a tab, not the tab's main attraction.
   collapsedSections:{podSeating:true, creditsSettled:true},
+  // Timesheet tab filters (Sept 2026, per Allie: "I want the timesheet to allow me to look at any
+  // day, but I need to select the day, or the staff, or both") — personKey is '' (everyone) or
+  // 'staff:<id>'/'instructor:<id>'; date is '' (falls back to the default lookback window) or a
+  // specific yyyy-mm-dd to jump straight to that one day, however long ago.
+  timesheetFilter:{personKey:'', date:''},
   // Quick check-in/out student search (Sept 2026, per Allie: a search bar that suggests the closest
   // matched student name so front desk doesn't have to hunt through the Schedule list) — just the
   // live query text; matching happens fresh on every render from `sessions`/`students`, nothing else
@@ -5008,11 +5013,13 @@ function sectionOpen(id, title, extraHeaderHtml){
 // timesheet, Settled credits) keep their existing default-collapsed behavior WITHIN their tab —
 // only the primary panel per tab (Students, Instructors, Parents, Front Desk Staff, Credits report)
 // now starts expanded, since navigating to the tab is itself the "reveal" action.
+// Instructors folded into the Staff tab rather than kept as their own top-level tab (Sept 2026, per
+// Allie: "I want instructors to come under Staff") — both rosters render one after another on the
+// same tab now; see the tab==='staff' branch below.
 var FRONT_TABS=[
   {id:'today', label:'Today'},
   {id:'schedule', label:'Schedule'},
   {id:'students', label:'Students'},
-  {id:'instructors', label:'Instructors'},
   {id:'parents', label:'Parents'},
   {id:'staff', label:'Staff'},
   {id:'timesheet', label:'Timesheet'},
@@ -5087,12 +5094,11 @@ function renderStaff(){
       +'</div>';
   } else if(tab==='students'){
     html+=renderStudentsPanel();
-  } else if(tab==='instructors'){
-    html+=renderInstructorsPanel();
   } else if(tab==='parents'){
     html+=renderParentsPanel();
   } else if(tab==='staff'){
     html+=renderFrontStaffPanel();
+    html+=renderInstructorsPanel();
   } else if(tab==='timesheet'){
     html+=renderStaffCheckInPanel();
     html+=renderStaffTimesheetPanel();
@@ -6169,16 +6175,62 @@ var STAFF_TIMESHEET_LOOKBACK_DAYS=14;
 // staffNoShowsSince()/instructorNoShowsSince() are left in place (still exercised directly by the
 // test suite) in case a no-show view is wanted again elsewhere later, they're just not surfaced
 // here any more. Late arrivals still show, via the "Vs roster" column below.
+// Person options for the Timesheet filter dropdown — front desk staff first, then instructors,
+// each alphabetised within their own group, each tagged with a 'staff:'/'instructor:' prefix so
+// the value alone says which table to filter against.
+function timesheetPersonOptions(){
+  return staffMembers.slice().sort(function(a,b){ return a.name.localeCompare(b.name); })
+    .map(function(s){ return {value:'staff:'+s.id, label:s.name}; })
+    .concat(instructors.slice().sort(function(a,b){ return a.name.localeCompare(b.name); })
+      .map(function(i){ return {value:'instructor:'+i.id, label:i.name+' (Instructor)'}; }));
+}
+function setTimesheetFilterPerson(value){ state.timesheetFilter.personKey=value; render(); }
+function setTimesheetFilterDate(value){ state.timesheetFilter.date=value; render(); }
+function clearTimesheetFilters(){ state.timesheetFilter={personKey:'', date:''}; render(); }
+// Timesheet history (Sept 2026, per Allie: "I want the timesheet to allow me to look at any day,
+// but I need to select the day, or the staff, or both") — a specific date jumps straight to that
+// one day regardless of how long ago it was, overriding the default lookback window entirely; a
+// person narrows to just their own records within whichever date scope is active; the two combine
+// freely, and either (or neither) can be set on its own.
 function renderStaffTimesheetPanel(){
   const days=STAFF_TIMESHEET_LOOKBACK_DAYS;
   let html=sectionOpen('staffTimesheet','Timesheet');
-  html+='<p class="small muted">Every check-in/check-out over the last '+days+' days for front desk staff and instructors.</p>';
-  const cutoffKey=toKey(addDays(simNow(), -days));
-  const recent=staffAttendance.filter(function(a){ return toKey(a.date)>=cutoffKey; })
-    .slice().sort(function(a,b){ return new Date(b.date)-new Date(a.date) || b.checkIn-a.checkIn; });
+  const filter=state.timesheetFilter;
+  const peopleOptions=timesheetPersonOptions();
+  const hasFilters = !!filter.personKey || !!filter.date;
+  html+='<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px">'
+    +'<div><label>Person</label><select onchange="setTimesheetFilterPerson(this.value)">'
+      +'<option value=""'+(filter.personKey?'':' selected')+'>Everyone</option>'
+      +peopleOptions.map(function(o){ return '<option value="'+o.value+'"'+(filter.personKey===o.value?' selected':'')+'>'+o.label+'</option>'; }).join('')
+    +'</select></div>'
+    +'<div><label>Day</label><input type="date" value="'+filter.date+'" max="'+toKey(simNow())+'" onchange="setTimesheetFilterDate(this.value)"/></div>'
+    +(hasFilters? '<button class="btn sm ghost" onclick="clearTimesheetFilters()">Clear filters</button>' : '')
+  +'</div>';
+
+  let pool=staffAttendance;
+  if(filter.date){
+    pool=pool.filter(function(a){ return toKey(a.date)===filter.date; });
+  } else {
+    const cutoffKey=toKey(addDays(simNow(), -days));
+    pool=pool.filter(function(a){ return toKey(a.date)>=cutoffKey; });
+  }
+  let filteredPersonLabel='';
+  if(filter.personKey){
+    const sep=filter.personKey.indexOf(':');
+    const kind=filter.personKey.slice(0,sep), id=filter.personKey.slice(sep+1);
+    pool=pool.filter(function(a){ return kind==='instructor'? a.instructorId===id : a.staffId===id; });
+    const match=peopleOptions.find(function(o){ return o.value===filter.personKey; });
+    filteredPersonLabel = match? match.label : '';
+  }
+  const recent=pool.slice().sort(function(a,b){ return new Date(b.date)-new Date(a.date) || b.checkIn-a.checkIn; });
+
+  const scopeLabel = filter.date? ('on '+fmtShort(new Date(filter.date))) : ('over the last '+days+' days');
+  const whoLabel = filteredPersonLabel? ('for '+filteredPersonLabel) : 'for front desk staff and instructors';
+  html+='<p class="small muted">Every check-in/check-out '+scopeLabel+' '+whoLabel+'.</p>';
+
   if(recent.length===0){
-    html+='<div class="empty-note">No attendance recorded yet.</div>';
-  } else if(recent.length){
+    html+='<div class="empty-note">No attendance recorded'+(hasFilters? ' matching these filters.' : ' yet.')+'</div>';
+  } else {
     html+='<table><tr><th>Date</th><th>Name</th><th>Check-in</th><th>Check-out</th><th>Hours</th><th>Vs roster</th></tr>'
       +recent.map(function(r){
         const isInstr=r.instructorId!=null;
