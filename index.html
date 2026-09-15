@@ -780,7 +780,7 @@ var state={
   // Checked-in-today starts UNCOLLAPSED (Sept 2026, per Allie: "checked in today uncollapsed by
   // default") — it now also carries the "Who's here right now" board at its top, so front desk
   // wants it open on page load rather than needing an extra click to see who's actually present.
-  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, podSeating:true},
+  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, podSeating:true, creditsSettled:true},
   // Quick check-in/out student search (Sept 2026, per Allie: a search bar that suggests the closest
   // matched student name so front desk doesn't have to hunt through the Schedule list) — just the
   // live query text; matching happens fresh on every render from `sessions`/`students`, nothing else
@@ -1656,9 +1656,14 @@ function applyStopEnrollment(student, effectiveFrom, note){
 }
 
 // Same underlying mechanism as savePlanChange()'s "change frequency/day/time" mode (frequency
-// stays whatever it already was — a time-change request only ever touches which day(s)/time(s)),
-// just invoked from approving a parent's own request rather than front desk typing it in directly.
-function applyTimeChange(student, effectiveFrom, recurring, note){
+// stays whatever it already was — a time-change request only ever touches which day(s)/time(s)).
+// Two callers: front desk approving an old (pre-Sept-2026) pending request via
+// approveEnrollmentRequest(), and — since Sept 2026, per Allie: "as a parent, they should be able to
+// change days and times permanently... without front desk permission" — a parent's own
+// submitTimeChangeRequest() applying it directly and immediately, no approval step at all. `selfService`
+// only changes the toast wording (a parent shouldn't see their own note quoted back at them
+// third-person, the way front desk does when reviewing someone else's).
+function applyTimeChange(student, effectiveFrom, recurring, note, selfService){
   const effKey=toKey(effectiveFrom);
   const change={id:newId()||('pc'+(nextPlanChangeId++)), effectiveFrom:effectiveFrom, stopped:false, sessionsPerWeek:recurring.length, recurring:recurring};
   student.planChanges=(student.planChanges||[]).filter(function(pc){ return toKey(pc.effectiveFrom)!==effKey; });
@@ -1689,7 +1694,12 @@ function applyTimeChange(student, effectiveFrom, recurring, note){
     });
   });
   regenerateAllRecurring();
-  toast(student.name+'\'s schedule changing to '+recurringSummary({recurring:recurring})+' from '+fmtShort(effectiveFrom)+(movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match.' : '.')+(note? ' Parent\'s note: '+note : ''));
+  const movedNote = movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match.' : '.';
+  if(selfService){
+    toast(student.name+'\'s new schedule is '+recurringSummary({recurring:recurring})+' from '+fmtShort(effectiveFrom)+movedNote);
+  } else {
+    toast(student.name+'\'s schedule changing to '+recurringSummary({recurring:recurring})+' from '+fmtShort(effectiveFrom)+movedNote+(note? ' Parent\'s note: '+note : ''));
+  }
   return change;
 }
 
@@ -1697,7 +1707,14 @@ function approveEnrollmentRequest(id){
   const req=enrollmentRequests.find(function(r){ return r.id===id; });
   if(!req) return;
   const student=findStudent(req.studentId);
-  if(req.type==='hold'){ applyHold(student, req.start, req.end, req.note, !monthNoticeOk(req.start)); }
+  // grantMakeupCredits is just "this came through the parent-request pipeline, so late-notice
+  // credit logic applies where relevant" — applyHold() itself now checks each session's OWN
+  // billing month for sufficient notice rather than one blanket check against the hold's start
+  // date, so a hold spanning into a month that by now has plenty of notice correctly gets a plain
+  // cancellation (no credit) for those later sessions even though the hold as a whole started late
+  // (Sept 2026, per Allie: "any sessions that fall in the period of sufficient notice should just
+  // be automatically cancelled").
+  if(req.type==='hold'){ applyHold(student, req.start, req.end, req.note, true); }
   else if(req.type==='time_change'){ applyTimeChange(student, req.effectiveFrom, req.requestedRecurring||[], req.note); }
   else { applyStopEnrollment(student, req.effectiveFrom, req.note); }
   req.status='approved';
@@ -1824,6 +1841,14 @@ function joinWaitlistFromTimeChangeRequest(idx){
   state.timeChangeRequestForm=null;
   openParentWaitlistForm(studentId, slot.weekday, slot.start, currentSlot);
 }
+// Applies immediately — no front-desk approval step (Sept 2026, per Allie: "as a parent, they
+// should be able to change days and times permanently or one off without front desk permission").
+// Before this, submitting here only created a pending enrollment_requests row that front desk had
+// to separately open and click Approve on before anything actually changed; now it calls
+// applyTimeChange() directly, the exact same function front desk's own approval used to call, so the
+// underlying schedule-change mechanics (cancelling upcoming standing sessions, restoring any make-up
+// credit tied to one, writing the new student_plan_changes/_recurring rows, regenerating sessions)
+// are unchanged — only the "someone has to click Approve first" gate is gone.
 function submitTimeChangeRequest(){
   const f=state.timeChangeRequestForm;
   if(!f.effectiveFrom){ f.error='Choose the date this should take effect from.'; render(); return; }
@@ -1837,39 +1862,18 @@ function submitTimeChangeRequest(){
   const recurring=f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; });
   // Every row came from a dropdown already filtered to open times (see
   // renderTimeChangeRecurringPickers), so this is almost always true by construction — it's only
-  // false if a picked time went full in the moments between opening the form and hitting Send, or
-  // it was force-kept because it was the family's existing time. Front desk still has to be the one
-  // to click Approve (only staff can write the actual schedule change — see
-  // renderEnrollmentRequestsPanel's "Ready to approve" flag), but when every slot is open there's
-  // nothing for them to check first, so approval is just a formality rather than research.
-  const allAvailable=recurring.every(function(r){ return standingSlotHasAvailability(r.weekday, r.start, student.duration, student.year); });
-  // previousRecurring is f.currentRecurring — the frozen snapshot taken when the form opened —
-  // carried onto the request itself so front desk's approval view can show the swap pairing
-  // (Sept 2026, per Allie: "we need to be aware of which" day is being given up) without relying on
-  // the student's live record, which could in principle have moved on by the time someone reviews it.
-  const previousRecurring=f.currentRecurring.map(function(r){ return {weekday:r.weekday, start:r.start}; });
-  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'time_change', start:null, end:null, effectiveFrom:effectiveFrom, previousRecurring:previousRecurring, requestedRecurring:recurring, note:f.note.trim(), status:'open', createdAt:simNow()};
-  enrollmentRequests.push(req);
-  dbWrite('submitting a schedule-change request', function(){
-    return supabaseClient.from('enrollment_requests').insert({
-      id:req.id, student_id:req.studentId, type:req.type, start_date:null, end_date:null, effective_from:toKey(req.effectiveFrom), note:req.note, status:req.status, created_at:req.createdAt.toISOString()
-    }).then(function(r){
-      if(r.error) return r;
-      return supabaseClient.from('enrollment_request_recurring').insert(recurring.map(function(rec){
-        return {request_id:req.id, weekday:rec.weekday, start_min:rec.start};
-      }));
-    }).then(function(r){
-      if(r.error || !previousRecurring.length) return r;
-      return supabaseClient.from('enrollment_request_previous_recurring').insert(previousRecurring.map(function(rec){
-        return {request_id:req.id, weekday:rec.weekday, start_min:rec.start};
-      }));
-    });
-  });
+  // false if a picked time went full in the moments between opening the form and hitting Confirm.
+  // That used to be fine to let through anyway, since front desk would double-check before actually
+  // writing the change (see the "Ready to approve" flag this used to feed). With that safety net
+  // gone now that this applies immediately, re-check right here instead and block on it — each full
+  // row already shows its own "Join waitlist" escape hatch above, so this should be rare.
+  const stillFull=recurring.filter(function(r){ return !standingSlotHasAvailability(r.weekday, r.start, student.duration, student.year); });
+  if(stillFull.length){
+    f.error='One of your picked times just filled up ('+stillFull.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ')+') — pick a different time for that row, or use "Join waitlist" instead.';
+    render(); return;
+  }
   state.timeChangeRequestForm=null;
-  notifyFrontDeskOfEnrollmentRequest(req.id);
-  toast(allAvailable
-    ? 'Request sent — every time you picked is open right now, so this should be confirmed shortly.'
-    : 'Schedule change request sent to front desk — you\'ll see it reflected here once it\'s reviewed.');
+  applyTimeChange(student, effectiveFrom, recurring, f.note.trim(), true);
 }
 
 // Everything a parent should be told is changing about a child's schedule (5.20) — any front-desk-
@@ -4072,10 +4076,16 @@ function closeHoldForm(){ state.holdForm=null; render(); }
 function setHoldField(field, value){ state.holdForm[field]=value; state.holdForm.error=''; render(); }
 // Shared by front desk placing a hold directly (saveHold) and front desk approving a parent's
 // hold request (approveEnrollmentRequest) — same effect either way, just a different entry point.
-// grantMakeupCredits is true only for a hold requested inside the 7-day billing-notice window —
-// billing can't be pulled back in time for this cycle, so instead of just freeing the slot, each
-// affected standing session gets a make-up credit issued (same mechanism as an excused absence),
-// so the family still gets the sessions they're paying for (Sept 2026, per Allie).
+// grantMakeupCredits gates whether late-notice credit logic applies at ALL (true only via a parent's
+// own request; a front-desk-entered hold never auto-issues these, per desk discretion). When it's
+// on, the actual "was there enough notice" check is per SESSION, not once for the whole hold — each
+// session is tested against its own billing month's 1st, not just the hold's start date (Sept 2026,
+// per Allie: "when approving a hold request that hasn't received enough notice... the missed
+// sessions need to be automatically credited as make-up credits. Any sessions that fall in the
+// period of sufficient notice, should just be automatically cancelled"). A hold spanning, say, late
+// September into November can straddle both: September sessions (this cycle's billing already
+// locked in) get a make-up credit, while November sessions (plenty of notice by now) just get a
+// plain cancellation — exactly like an ordinary, well-notified hold.
 function applyHold(student, start, end, note, grantMakeupCredits){
   const hold={id:newId()||('hold'+(nextSessionId++)), start:start, end:end, note:(note||'').trim()};
   student.holds=student.holds||[];
@@ -4101,9 +4111,12 @@ function applyHold(student, start, end, note, grantMakeupCredits){
         credit.status='available'; credit.redeemedSessionId=null;
         dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', credit.id); });
       }
-    } else if(grantMakeupCredits){
+    } else if(grantMakeupCredits && !monthNoticeOk(s.date)){
+      // Named to this specific missed session's own date, not the hold's overall start–end range —
+      // a hold that straddles a late-notice month and a well-notified one only issues credits for
+      // sessions in the former, so the note should point at the actual session, not the whole hold.
       const issued=simNow(), expiry=addMonths(issued,3);
-      const c={id:newId()||('c'+(nextCreditId++)), studentId:student.id, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:'Missed during a late-notice hold ('+fmtShort(hold.start)+'–'+fmtShort(hold.end)+')'};
+      const c={id:newId()||('c'+(nextCreditId++)), studentId:student.id, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:'Missed during a late-notice hold — session on '+fmtShort(s.date)};
       credits.push(c);
       madeUpCount++;
       dbWrite('issuing a make-up credit (hold)', function(){ return supabaseClient.from('credits').insert({
@@ -4953,6 +4966,7 @@ function renderStaff(){
   html+=renderParentsPanel();
   html+=renderFrontStaffPanel();
   html+=renderCreditsReport();
+  html+=renderSettledCreditsPanel();
   html+=renderInactiveStudentsPanel();
   html+=renderInactiveParentsPanel();
 
@@ -5510,7 +5524,11 @@ function renderBookingModal(){
   } else {
     html+='<label>Student</label><select onchange="setBookingStudent(this.value)">'
         +'<option value="">Choose a student…</option>'
-        +students.map(function(s){ return '<option value="'+s.id+'"'+(s.id===f.studentId?' selected':'')+'>'+s.name+' ('+yearLabel(s.year)+')</option>'; }).join('')
+        // Alphabetised (Sept 2026, per Allie: "the kids in the drop down need to be alphabetised") —
+        // this was previously in whatever order `students` happened to load in from the database,
+        // which made a specific name a scroll-and-hunt exercise on a roster of any real size.
+        +students.slice().sort(function(a,b){ return a.name.localeCompare(b.name, undefined, {sensitivity:'base'}); })
+          .map(function(s){ return '<option value="'+s.id+'"'+(s.id===f.studentId?' selected':'')+'>'+s.name+' ('+yearLabel(s.year)+')</option>'; }).join('')
         +'</select>';
   }
   html+='<div class="row2"><div><label>Length</label><select onchange="setBookingDuration(this.value)">'
@@ -6151,35 +6169,72 @@ function renderInactiveParentsPanel(){
   return html;
 }
 
+// Shared row-builder for both the active and the settled make-up-credits tables below — identical
+// column layout either way, only which credits get fed in differs (Sept 2026, per Allie: "can we
+// split makeup credits into two sections, so that when they are booked or expired, they go to a
+// different section" — booked/completed/expired credits pile up over time and were drowning out the
+// still-actionable ones in a single flat table sorted only by expiry date).
+function creditReportRowHtml(c){
+  const st=creditDisplayStatus(c);
+  const student=findStudent(c.studentId);
+  const badge={available:'<span class="badge available">Available</span>',soon:'<span class="badge soon">Expiring soon</span>',expired:'<span class="badge expired">Expired</span>',booked:'<span class="badge booked">Booked</span>',completed:'<span class="badge completed">Completed</span>'}[st] || st;
+  let detail='—';
+  if(c.redeemedSessionId){
+    const sess=findSession(c.redeemedSessionId);
+    if(sess) detail=fmtShort(sess.date)+' '+rangeLabel(sess.start,sess.duration)+' · '+(findPod(sess.podId)?findPod(sess.podId).name+' · ':'')+(sess.instructorId? findInstructor(sess.instructorId).name : '—');
+  }
+  const sourceLabel = c.source==='manual'? 'Manual'+(c.note? ' <span class="small muted">— '+c.note+'</span>' : '')
+    : c.source==='excused-absence'? 'Excused absence'
+    : c.source==='parent-cancel'? 'Parent cancel'
+    : c.source==='closure'? 'Centre closure'
+    : 'No-show';
+  const removable = c.source==='manual' && c.status==='available';
+  // Manually assigning a make-up (Sept 2026, per Allie: "I need a button to manually assign
+  // make-up sessions") — offered for any available credit, not just manually-added ones, since a
+  // parent might call in about ANY kind of make-up (a no-show credit, an excused absence, etc.)
+  // and ask front desk to just book it for them rather than doing it themselves online.
+  const bookable = c.status==='available';
+  return '<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
+    +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
+}
+// Still actionable — available now, or expiring soon (both cases front desk might need to chase a
+// family to actually use before it lapses). Everything else (already booked into a make-up session,
+// that make-up completed, or lapsed unused) has nothing left to DO, so it moves to the settled
+// section below instead of cluttering this one.
+function activeCredits(){
+  return credits.filter(function(c){ const st=creditDisplayStatus(c); return st==='available' || st==='soon'; });
+}
+function settledCredits(){
+  return credits.filter(function(c){ const st=creditDisplayStatus(c); return st!=='available' && st!=='soon'; });
+}
 function renderCreditsReport(){
-  let html=sectionOpen('credits','Make-up credits','<button class="btn sm primary" onclick="openAddCreditForm(\'\')">+ Add credit</button>');
-  html+='<p>Issued automatically for an excused absence (notified in advance), a parent self-cancel, or a centre closure — never for a plain no-show, which gets no credit — or added by hand for a make-up owed from before this system (e.g. carried over from the old manual log), or any other credit front desk needs to grant directly. All expire automatically 3 months after the date entered — no manual cleanup.</p>';
-  html+='<table><tr><th>Student</th><th>Issued (missed session)</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
-  credits.slice().sort(function(a,b){ return a.expiryDate-b.expiryDate; }).forEach(function(c){
-    const st=creditDisplayStatus(c);
-    const student=findStudent(c.studentId);
-    const badge={available:'<span class="badge available">Available</span>',soon:'<span class="badge soon">Expiring soon</span>',expired:'<span class="badge expired">Expired</span>',booked:'<span class="badge booked">Booked</span>',completed:'<span class="badge completed">Completed</span>'}[st] || st;
-    let detail='—';
-    if(c.redeemedSessionId){
-      const sess=findSession(c.redeemedSessionId);
-      if(sess) detail=fmtShort(sess.date)+' '+rangeLabel(sess.start,sess.duration)+' · '+(findPod(sess.podId)?findPod(sess.podId).name+' · ':'')+(sess.instructorId? findInstructor(sess.instructorId).name : '—');
-    }
-    const sourceLabel = c.source==='manual'? 'Manual'+(c.note? ' <span class="small muted">— '+c.note+'</span>' : '')
-      : c.source==='excused-absence'? 'Excused absence'
-      : c.source==='parent-cancel'? 'Parent cancel'
-      : c.source==='closure'? 'Centre closure'
-      : 'No-show';
-    const removable = c.source==='manual' && c.status==='available';
-    // Manually assigning a make-up (Sept 2026, per Allie: "I need a button to manually assign
-    // make-up sessions") — offered for any available credit, not just manually-added ones, since a
-    // parent might call in about ANY kind of make-up (a no-show credit, an excused absence, etc.)
-    // and ask front desk to just book it for them rather than doing it themselves online.
-    const bookable = c.status==='available';
-    html+='<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
-      +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
-  });
-  html+='</table></div>';
+  const list=activeCredits().sort(function(a,b){ return a.expiryDate-b.expiryDate; });
+  let html=sectionOpen('credits','Make-up credits ('+list.length+')','<button class="btn sm primary" onclick="openAddCreditForm(\'\')">+ Add credit</button>');
+  html+='<p>Issued automatically for an excused absence (notified in advance), a parent self-cancel, or a centre closure — never for a plain no-show, which gets no credit — or added by hand for a make-up owed from before this system (e.g. carried over from the old manual log), or any other credit front desk needs to grant directly. All expire automatically 3 months after the date entered — no manual cleanup. Once a credit is booked into a make-up, completed, or expires, it moves to the "Booked & expired credits" section below.</p>';
+  if(list.length===0){ html+='<div class="empty-note">No make-up credits currently need action.</div>'; }
+  else{
+    html+='<table><tr><th>Student</th><th>Issued (missed session)</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
+    list.forEach(function(c){ html+=creditReportRowHtml(c); });
+    html+='</table>';
+  }
+  html+='</div>';
   html+=renderAddCreditModal();
+  return html;
+}
+// Settled credits — booked, completed, or expired. Kept around (never deleted) as a record, but
+// tucked into its own collapsed-by-default section, same convention as Inactive Students/Parents
+// below, so it doesn't bury the still-actionable credits above it.
+function renderSettledCreditsPanel(){
+  const list=settledCredits().sort(function(a,b){ return b.expiryDate-a.expiryDate; });
+  let html=sectionOpen('creditsSettled','Booked & expired credits ('+list.length+')','');
+  html+='<p>Credits already booked into a make-up session, completed, or expired unused — no action needed, kept here as a record.</p>';
+  if(list.length===0){ html+='<div class="empty-note">No booked, completed, or expired credits yet.</div>'; }
+  else{
+    html+='<table><tr><th>Student</th><th>Issued (missed session)</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
+    list.forEach(function(c){ html+=creditReportRowHtml(c); });
+    html+='</table>';
+  }
+  html+='</div>';
   return html;
 }
 
@@ -6833,6 +6888,11 @@ function renderParent(){
     // requests are still one-at-a-time, since a second one before the first is resolved would just
     // be ambiguous about which the parent actually wants.
     const openHoldCount=enrollmentRequests.filter(function(r){ return r.studentId===sid && r.type==='hold' && r.status==='open'; }).length;
+    // A permanent day/time change no longer creates a pending request at all (Sept 2026, per Allie —
+    // see submitTimeChangeRequest()), so this can only ever be true for a stray pre-existing
+    // 'time_change' row from before that change shipped. Left in place purely so a parent can't open
+    // a second, conflicting change on top of one of those old leftover rows before front desk gets
+    // to it the old way; it'll simply never trigger for anything submitted going forward.
     const pendingTimeChange=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='time_change' && r.status==='open'; });
     const pendingCancel=enrollmentRequests.some(function(r){ return r.studentId===sid && r.type==='cancel' && r.status==='open'; });
     html+='<div class="parent-header"><div class="avatar-circle">'+initials+'</div>'
@@ -6841,7 +6901,7 @@ function renderParent(){
       +'<div style="margin-left:auto;display:flex;flex-direction:column;gap:4px;align-items:flex-end">'
         +'<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>'
         +(openHoldCount>0? '<span class="small muted">'+openHoldCount+' hold request'+(openHoldCount===1?'':'s')+' pending</span>' : '')
-        +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Request a permanent day/time change</a>')
+        +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Change regular day/time</a>')
         +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>')
         +'<a href="#" class="small" onclick="openParentWaitlistForm(\''+sid+'\');return false;">Join the waitlist for another day/time</a>'
       +'</div></div>';
@@ -6968,7 +7028,7 @@ function renderTimeChangeRequestModal(){
   const student=findStudent(f.studentId);
   const starts=possibleStarts(student.duration);
   let html='<div class="overlay" onclick="if(event.target===this) closeTimeChangeRequestForm()"><div class="modal">';
-  html+='<h3>Request a permanent day/time change for '+student.name+'</h3>';
+  html+='<h3>Change '+student.name+'\'s regular day/time</h3>';
   // Sept 2026, per Allie's own wording for this box.
   html+='<p>Select the new regular day(s) and time(s) you would like. Only available session times will be shown.</p>'
     +'<p>Once confirmed, your new schedule will be updated automatically.</p>';
@@ -6996,7 +7056,7 @@ function renderTimeChangeRequestModal(){
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. school sport moved to Tuesdays" value="'+f.note+'" oninput="setTimeChangeRequestField(\'note\',this.value)"/>';
   html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeTimeChangeRequestForm()">Cancel</button>'
-    +'<button class="btn primary" onclick="submitTimeChangeRequest()">Send request</button>'
+    +'<button class="btn primary" onclick="submitTimeChangeRequest()">Confirm change</button>'
   +'</div></div></div>';
   return html;
 }
