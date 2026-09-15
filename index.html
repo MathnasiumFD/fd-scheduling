@@ -70,6 +70,15 @@
   .tab{ border:none; background:transparent; padding:7px 16px; border-radius:999px; font-size:.85rem; font-weight:700; font-family:var(--font-display); color:var(--text-muted); cursor:pointer; }
   .tab.active{ background:var(--primary); color:var(--primary-text); }
 
+  /* Front desk's own internal section tabs (Sept 2026, per Allie: "front centre view to have each
+     section as a separate tab maybe instead of collapsible sections") — deliberately a squarer,
+     slightly less prominent pill than .tabs/.tab above (which switches between Front Desk/
+     Instructor/Parent) so the two navigation levels stay visually distinct when stacked. Wraps
+     onto a second line on narrow screens rather than overflowing. */
+  .subtabs{ display:flex; gap:6px; flex-wrap:wrap; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:4px; margin-bottom:16px; }
+  .subtab{ border:none; background:transparent; padding:7px 14px; border-radius:7px; font-size:.82rem; font-weight:600; font-family:var(--font-display); color:var(--text-muted); cursor:pointer; }
+  .subtab.active{ background:var(--primary); color:var(--primary-text); }
+
   .card{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); padding:16px 18px; margin-bottom:16px; }
   .card-head{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
   /* Collapsible front-desk sections: clicking a section's own title toggles it — everything in the
@@ -749,6 +758,11 @@ sessions.push({id:'sessA', studentId:'s3', podId:'pod2', instructorId:'i2', date
 /* ---------- state ---------- */
 var state={
   role:'staff',
+  // Which of the front desk's own internal section tabs is showing (Sept 2026, per Allie: "front
+  // centre view to have each section as a separate tab maybe instead of collapsible sections") —
+  // see FRONT_TABS/renderFrontTabsBar()/renderStaff(). Separate from `role` above, which switches
+  // between the Front Desk/Instructor/Parent views entirely.
+  frontTab:'today',
   offsetDays:0,
   weekOffset:0,
   selectedDayKey:null,
@@ -765,7 +779,6 @@ var state={
   newStudentForm:null,
   newInstructorForm:null,
   recurringForm:null,
-  reactivateForm:null,
   holdForm:null,
   checkIn:null,
   availWeekOffset:0,
@@ -791,7 +804,11 @@ var state={
   // Checked-in-today starts UNCOLLAPSED (Sept 2026, per Allie: "checked in today uncollapsed by
   // default") — it now also carries the "Who's here right now" board at its top, so front desk
   // wants it open on page load rather than needing an extra click to see who's actually present.
-  collapsedSections:{students:true, instructors:true, parents:true, frontStaff:true, inactiveStudents:true, inactiveParents:true, podSeating:true, creditsSettled:true, staffTimesheet:true},
+  // Students/Instructors/Parents/Front Desk Staff used to default collapsed since they all sat on
+  // one long page together — now each is the sole reason to click into its own tab, so they start
+  // expanded (Sept 2026, tabs redesign). Pod seating/Settled credits/Staff timesheet stay collapsed
+  // by default — secondary/historical sub-panels within a tab, not the tab's main attraction.
+  collapsedSections:{podSeating:true, creditsSettled:true, staffTimesheet:true},
   // Quick check-in/out student search (Sept 2026, per Allie: a search bar that suggests the closest
   // matched student name so front desk doesn't have to hunt through the Schedule list) — just the
   // live query text; matching happens fresh on every render from `sessions`/`students`, nothing else
@@ -1439,32 +1456,20 @@ function currentOrUpcomingHold(studentId){
     .sort(function(a,b){ return toKey(a.start).localeCompare(toKey(b.start)); })[0] || null;
 }
 
-/* ---------- Inactive students/parents (5.26) ---------- */
+/* ---------- Inactive students/parents ---------- */
 // A student is "inactive" once their enrolment has actually stopped (stoppedFrom set by
 // applyPlanChanges() promoting a "stop" plan change) — separate from a hold, which is temporary
 // and keeps the standing plan intact. A parent has no separate active/inactive flag of its own —
-// it's simply inactive when every one of its children is: reactivating is always a per-student
-// action (see openReactivateStudentForm), and a parent falls back out of "inactive" automatically
-// the moment any one child is reactivated.
+// it's simply inactive when every one of its children is. Deliberately a dead end from the app's
+// own UI (Sept 2026, per Allie: "when deactivating a student/parent, delete them entirely") — once
+// stopped, they drop off every list (there's no "Inactive Students/Parents" panel to browse and no
+// duplicate-detection/reactivate flow when re-enrolling someone with the same name or email), but
+// their historical sessions, credits, and attendance are untouched in the database. Re-enrolling
+// the same real person later just creates a fresh, independent record.
 function isStudentInactive(student){ return !!(student && student.stoppedFrom); }
 function isParentInactive(parent){
   const kids=(parent.studentIds||[]).map(findStudent).filter(Boolean);
   return kids.length>0 && kids.every(isStudentInactive);
-}
-function inactiveChildrenOf(parent){
-  return (parent.studentIds||[]).map(findStudent).filter(Boolean).filter(isStudentInactive);
-}
-// Exact-name match against inactive students only — used to warn front desk before they enroll
-// what might just be the same kid coming back under a fresh record, per Allie (Sept 2026).
-function findInactiveStudentByName(name){
-  const norm=(name||'').trim().toLowerCase();
-  if(!norm) return null;
-  return students.find(function(s){ return isStudentInactive(s) && s.name.trim().toLowerCase()===norm; }) || null;
-}
-function findInactiveParentByEmail(email){
-  const norm=(email||'').trim().toLowerCase();
-  if(!norm) return null;
-  return parents.find(function(p){ return isParentInactive(p) && p.email.toLowerCase()===norm; }) || null;
 }
 
 // A student's enrollment plan (sessions/week + standing days) is normally just the current
@@ -3719,21 +3724,13 @@ function defaultRecurring(count, duration){
 
 function openNewStudentForm(){
   const dur=90, spw=2;
-  state.newStudentForm={ parentMode:'existing', parentId: parents[0]? parents[0].id : '', parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), matchedInactiveId:null, confirmNewAnyway:false, error:'' };
+  state.newStudentForm={ parentMode:'existing', parentId: parents[0]? parents[0].id : '', parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), error:'' };
   render();
 }
 function closeNewStudentForm(){ state.newStudentForm=null; render(); }
 function setNSF(field, value){
   state.newStudentForm[field]=value;
   state.newStudentForm.error='';
-  // Catch front desk re-enrolling a student who was previously marked inactive (stopped) under the
-  // same name, before they get all the way to Save — cheaper to redirect them to "Reactivate" here
-  // than to let them create a second, disconnected record for the same real student.
-  if(field==='studentName'){
-    const match=findInactiveStudentByName(value);
-    state.newStudentForm.matchedInactiveId = match? match.id : null;
-    state.newStudentForm.confirmNewAnyway=false;
-  }
   render();
 }
 function setNSFParentMode(mode){ state.newStudentForm.parentMode=mode; state.newStudentForm.error=''; render(); }
@@ -3764,10 +3761,6 @@ function setNSFRecurring(idx, field, value){
 function saveNewStudent(){
   const f=state.newStudentForm;
   if(!f.studentName.trim()){ f.error='Enter the student\'s name.'; render(); return; }
-  if(f.matchedInactiveId && !f.confirmNewAnyway){
-    f.error='An inactive student named "'+f.studentName.trim()+'" already exists — reactivate them above, or tick "enroll as a new, separate student anyway" if this is a different person.';
-    render(); return;
-  }
   if(!f.year){ f.error='Choose a school year.'; render(); return; }
   let parentId=null;
   // Set only when creating a brand-new parent alongside this student — its actual remote insert is
@@ -3784,13 +3777,7 @@ function saveNewStudent(){
     if(!f.parentName.trim() || !f.parentEmail.trim()){ f.error='Enter the parent\'s name and email.'; render(); return; }
     const existingParent=parents.find(function(p){ return p.email.toLowerCase()===f.parentEmail.trim().toLowerCase(); });
     if(existingParent){
-      if(isParentInactive(existingParent)){
-        const kids=inactiveChildrenOf(existingParent);
-        f.error='A parent with that email already exists but is inactive (all their children have stopped). Reactivate one instead of creating a duplicate: '
-          +kids.map(function(k){ return '<button class="btn sm" style="margin:2px 4px 0 0" onclick="closeNewStudentForm();openReactivateStudentForm(\''+k.id+'\')">Reactivate '+k.name+'</button>'; }).join('');
-      } else {
-        f.error='A parent with that email already exists — pick “Existing parent” instead.';
-      }
+      f.error='A parent with that email already exists — pick “Existing parent” instead.';
       render(); return;
     }
     const newParent={id:newId()||('p'+(nextParentId++)), name:f.parentName.trim(), email:f.parentEmail.trim(), studentIds:[]};
@@ -4109,85 +4096,6 @@ function saveRecurringForm(){
     toast(student.name+'’s regular schedule saved — '+made+' upcoming session(s) pre-booked.'+(clearedCount? ' '+clearedCount+' old-schedule session(s) cleared.' : ''));
   }
   state.recurringForm=null;
-  render();
-}
-
-/* ---------- reactivating an inactive (stopped) student (5.26) ---------- */
-// Deletes every already-applied "stop" plan-change row for a student, locally and in Supabase.
-// Necessary (not just cosmetic) because stoppedFrom is re-derived from this history on every page
-// load via applyPlanChanges() — merely clearing student.stoppedFrom in memory wouldn't survive a
-// reload; the underlying stop record would just get re-promoted and stop them right back out.
-function clearStoppedPlanChanges(student){
-  const hadStopLocally=(student.planChanges||[]).some(function(pc){ return pc.stopped; });
-  student.planChanges=(student.planChanges||[]).filter(function(pc){ return !pc.stopped; });
-  // Always issue the delete, not just when a stopped entry is still visible locally:
-  // applyPlanChanges() only filters a promoted stop out of the in-memory planChanges array once its
-  // effective date arrives — it never deletes the underlying student_plan_changes row in Supabase.
-  // Since stoppedFrom (what makes a student "inactive" at all) is set precisely by that promotion,
-  // by the time someone reactivates, the stopped row has almost always already dropped out of
-  // student.planChanges — this unconditional delete is what actually clears it, or the student
-  // would revert to stopped again on the very next page load.
-  dbWrite('clearing a stopped-enrolment record', function(){ return supabaseClient.from('student_plan_changes').delete().eq('student_id', student.id).eq('stopped', true); });
-  return hadStopLocally;
-}
-// prefill (optional) carries over whatever plan details front desk already typed into the "Add
-// student" form before realizing this was actually an inactive student coming back — see
-// reactivateFromNewStudentForm() — so they don't have to re-enter the same day/time/duration twice.
-function openReactivateStudentForm(studentId, prefill){
-  const student=findStudent(studentId);
-  const dur=(prefill&&prefill.duration) || student.duration || 90;
-  const spw=(prefill&&prefill.sessionsPerWeek) || 2;
-  const starts=possibleStarts(dur);
-  const recurring=(prefill&&prefill.recurring&&prefill.recurring.length)
-    ? prefill.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; })
-    : defaultRecurring(spw,dur);
-  state.reactivateForm={ studentId, duration:dur, sessionsPerWeek:spw, recurring, error:'' };
-  render();
-}
-function closeReactivateStudentForm(){ state.reactivateForm=null; render(); }
-function setReactivateSessionsPerWeek(v){
-  const f=state.reactivateForm;
-  f.sessionsPerWeek=Number(v);
-  const starts=possibleStarts(f.duration);
-  while(f.recurring.length<f.sessionsPerWeek) f.recurring.push({weekday:'Mon', start:starts[0]});
-  f.recurring=f.recurring.slice(0,f.sessionsPerWeek);
-  f.error='';
-  render();
-}
-function setReactivateDuration(v){
-  const f=state.reactivateForm;
-  f.duration=Number(v);
-  const starts=possibleStarts(f.duration);
-  f.recurring.forEach(function(r){ if(!starts.includes(r.start)) r.start=starts[0]; });
-  f.error='';
-  render();
-}
-function setReactivateRecurring(idx, field, value){
-  state.reactivateForm.recurring[idx][field] = field==='start'? Number(value) : value;
-  render();
-}
-function confirmReactivateStudent(){
-  const f=state.reactivateForm;
-  const student=findStudent(f.studentId);
-  if(f.recurring.length===0){ f.error='Add at least one standing day/time.'; render(); return; }
-  clearStoppedPlanChanges(student);
-  student.stoppedFrom=null;
-  student.duration=Number(f.duration);
-  student.sessionsPerWeek=Number(f.sessionsPerWeek);
-  student.recurring=f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; });
-  dbWrite('reactivating a student', function(){
-    return supabaseClient.from('students').update({duration:student.duration, sessions_per_week:student.sessionsPerWeek}).eq('id', student.id).then(function(){
-      return supabaseClient.from('student_recurring_slots').delete().eq('student_id', student.id);
-    }).then(function(){
-      if(!student.recurring.length) return;
-      return supabaseClient.from('student_recurring_slots').insert(student.recurring.map(function(rec){
-        return {student_id:student.id, weekday:rec.weekday, start_min:rec.start};
-      }));
-    });
-  });
-  const made=generateRecurringSessions(student, HORIZON_WEEKS);
-  toast(student.name+' reactivated — '+f.sessionsPerWeek+'x/week, '+f.duration+' min. '+made+' standing session(s) pre-booked.');
-  state.reactivateForm=null;
   render();
 }
 
@@ -5022,6 +4930,31 @@ function sectionOpen(id, title, extraHeaderHtml){
     +(extraHeaderHtml||'')+'</div>';
 }
 
+// Front desk's own internal section tabs (Sept 2026, per Allie: "front centre view to have each
+// section as a separate tab maybe instead of collapsible sections" — confirmed via clarifying
+// question: grouped tabs matching how these sections are already used day-to-day vs. occasionally,
+// not one tab per existing card). "Today" bundles every panel front desk works out of constantly
+// through the day; the rest are the roster/reference sections that used to sit collapsed further
+// down the same long page. Each tab's own secondary/historical sub-panels (Pod seating, Staff
+// timesheet, Settled credits) keep their existing default-collapsed behavior WITHIN their tab —
+// only the primary panel per tab (Students, Instructors, Parents, Front Desk Staff, Credits report)
+// now starts expanded, since navigating to the tab is itself the "reveal" action.
+var FRONT_TABS=[
+  {id:'today', label:'Today'},
+  {id:'schedule', label:'Schedule'},
+  {id:'students', label:'Students'},
+  {id:'instructors', label:'Instructors'},
+  {id:'parents', label:'Parents'},
+  {id:'staff', label:'Staff'},
+  {id:'credits', label:'Credits'},
+];
+function setFrontTab(id){ state.frontTab=id; render(); }
+function renderFrontTabsBar(activeTab){
+  return '<div class="subtabs">'+FRONT_TABS.map(function(t){
+    return '<button class="subtab'+(t.id===activeTab?' active':'')+'" onclick="setFrontTab(\''+t.id+'\')">'+t.label+'</button>';
+  }).join('')+'</div>';
+}
+
 function renderStaff(){
   const now=simNow();
   const monday=addDays(getMonday(now), state.weekOffset*7);
@@ -5036,49 +4969,73 @@ function renderStaff(){
   const isPast = selectedDate < new Date(toKey(now));
   const closure=closedDayFor(selectedDate);
 
-  let html=renderCheckInSearchPanel();
-  html+=renderStaffCheckInPanel();
-  html+=renderCoverageRequestsPanel();
-  html+=renderEnrollmentRequestsPanel();
-  html+=renderCheckedInPanel();
-  html+=renderAvailabilityLookup();
-  html+=renderWaitlistPanel();
-  html+=renderClosedDaysPanel();
+  const tab=FRONT_TABS.some(function(t){ return t.id===state.frontTab; })? state.frontTab : 'today';
+  let html=renderFrontTabsBar(tab);
 
-  html+=sectionOpen('schedule','Schedule',
-      '<div style="display:flex;gap:6px;align-items:center">'
-        +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
-        +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
-        +'<input type="date" class="small" value="'+dayKey+'" max="'+toKey(addDays(now,365))+'" onchange="jumpToDate(this.value)" title="Jump to any date — including a past day, to see how it was seated"/>'
-        +(isPast || closure? '' : '<button class="btn sm primary" onclick="openBooking(null,\''+dayKey+'\')">+ Book a session</button>')
-      +'</div>');
-  html+='<div class="daypicker">'+weekDates.map(function(d){
-    const k=toKey(d);
-    return '<button class="daybtn'+(k===dayKey?' active':'')+'" onclick="selectDay(\''+k+'\')">'+WEEKDAY_KEYS[(d.getDay()+6)%7]+'<span class="d2">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
-  }).join('')+'</div>';
+  if(tab==='today'){
+    html+=renderCheckInSearchPanel();
+    html+=renderStaffCheckInPanel();
+    html+=renderCoverageRequestsPanel();
+    html+=renderEnrollmentRequestsPanel();
+    html+=renderCheckedInPanel();
+    html+=renderAvailabilityLookup();
+    html+=renderWaitlistPanel();
+    html+=renderClosedDaysPanel();
+  } else if(tab==='schedule'){
+    html+=sectionOpen('schedule','Schedule',
+        '<div style="display:flex;gap:6px;align-items:center">'
+          +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
+          +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
+          +'<input type="date" class="small" value="'+dayKey+'" max="'+toKey(addDays(now,365))+'" onchange="jumpToDate(this.value)" title="Jump to any date — including a past day, to see how it was seated"/>'
+          +(isPast || closure? '' : '<button class="btn sm primary" onclick="openBooking(null,\''+dayKey+'\')">+ Book a session</button>')
+        +'</div>');
+    html+='<div class="daypicker">'+weekDates.map(function(d){
+      const k=toKey(d);
+      return '<button class="daybtn'+(k===dayKey?' active':'')+'" onclick="selectDay(\''+k+'\')">'+WEEKDAY_KEYS[(d.getDay()+6)%7]+'<span class="d2">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
+    }).join('')+'</div>';
 
-  if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
+    if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
 
-  html+=renderCoverageGrid(weekDates);
+    html+=renderCoverageGrid(weekDates);
 
-  html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above — the pod
-                   // cards just rendered are the last thing that belongs inside it. This was
-                   // previously left unclosed (harmless before the collapsible-sections feature,
-                   // since it just meant later cards were technically-invalid nested children
-                   // rather than siblings) — now that collapsing hides a card's direct children,
-                   // that missing tag was making "Schedule" swallow everything after it.
+    html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above — the pod
+                     // cards just rendered are the last thing that belongs inside it. This was
+                     // previously left unclosed (harmless before the collapsible-sections feature,
+                     // since it just meant later cards were technically-invalid nested children
+                     // rather than siblings) — now that collapsing hides a card's direct children,
+                     // that missing tag was making "Schedule" swallow everything after it.
 
-  // Placed directly under Schedule, above Students (Sept 2026, per Allie: "place pod seating -
-  // permanent changes right under schedule, above students") — previously all the way at the bottom
-  // of the page. Collapsed by default and following whichever day is selected in the Schedule day
-  // picker above it, same as before; its "Move to" picker makes a PERMANENT standing change (see
-  // setPermanentSessionLocation) rather than a one-off swap, so this reads as an extension of
-  // Schedule's own seating rather than a roster-management afterthought.
-  html+=sectionOpen('podSeating','Pod seating — permanent changes')
-    +'<p class="small muted">Move a student here and it sticks — every '+weekday+' from '+fmtShort(selectedDate)+' onward, not just '+fmtShort(selectedDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead.</p>'
-    +renderPodSummaryStrip(dayKey, weekday)
-    +'</div>';
+    // Placed directly under Schedule, above Students (Sept 2026, per Allie: "place pod seating -
+    // permanent changes right under schedule, above students") — now that Students is a separate
+    // tab entirely, this just means staying on the Schedule tab rather than sitting below it on the
+    // same page. Collapsed by default and following whichever day is selected in the Schedule day
+    // picker above it; its "Move to" picker makes a PERMANENT standing change (see
+    // setPermanentSessionLocation) rather than a one-off swap, so this reads as an extension of
+    // Schedule's own seating rather than a roster-management afterthought.
+    html+=sectionOpen('podSeating','Pod seating — permanent changes')
+      +'<p class="small muted">Move a student here and it sticks — every '+weekday+' from '+fmtShort(selectedDate)+' onward, not just '+fmtShort(selectedDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead.</p>'
+      +renderPodSummaryStrip(dayKey, weekday)
+      +'</div>';
+  } else if(tab==='students'){
+    html+=renderStudentsPanel();
+  } else if(tab==='instructors'){
+    html+=renderInstructorsPanel();
+  } else if(tab==='parents'){
+    html+=renderParentsPanel();
+  } else if(tab==='staff'){
+    html+=renderFrontStaffPanel();
+    html+=renderStaffTimesheetPanel();
+  } else if(tab==='credits'){
+    html+=renderCreditsReport();
+    html+=renderSettledCreditsPanel();
+  }
 
+  // Modals always render regardless of which tab is active — every one of these is only ever
+  // opened from an action on whichever tab is currently showing, and the full-screen overlay they
+  // render as already blocks switching tabs underneath them while open, so there's no case where a
+  // modal needs to survive a tab switch. Kept unconditional (rather than scoped per-tab) simply
+  // because it's one line per modal instead of duplicating each render call into every tab branch
+  // that could conceivably open it.
   html+=renderBookingModal();
   html+=renderPodAssignModal();
   html+=renderCheckInModal();
@@ -5086,15 +5043,6 @@ function renderStaff(){
   html+=renderMoveModal();
   html+=renderWaitlistModal();
   html+=renderClosedDayModal();
-  html+=renderStudentsPanel();
-  html+=renderInstructorsPanel();
-  html+=renderParentsPanel();
-  html+=renderFrontStaffPanel();
-  html+=renderStaffTimesheetPanel();
-  html+=renderCreditsReport();
-  html+=renderSettledCreditsPanel();
-  html+=renderInactiveStudentsPanel();
-  html+=renderInactiveParentsPanel();
 
   return html;
 }
@@ -5812,13 +5760,7 @@ function saveNewParent(){
   if(!f.email.trim()){ f.error='Enter an email address.'; render(); return; }
   const existingParent=parents.find(function(p){ return p.email.toLowerCase()===f.email.trim().toLowerCase(); });
   if(existingParent){
-    if(isParentInactive(existingParent)){
-      const kids=inactiveChildrenOf(existingParent);
-      f.error='A parent with that email already exists but is inactive (all their children have stopped). Reactivate one instead of creating a duplicate: '
-        +kids.map(function(k){ return '<button class="btn sm" style="margin:2px 4px 0 0" onclick="closeNewParentForm();openReactivateStudentForm(\''+k.id+'\')">Reactivate '+k.name+'</button>'; }).join('');
-    } else {
-      f.error='A parent with that email already exists.';
-    }
+    f.error='A parent with that email already exists.';
     render(); return;
   }
   const newParent={id:newId()||('p'+(nextParentId++)), name:f.name.trim(), email:f.email.trim(), studentIds:[]};
@@ -5828,7 +5770,7 @@ function saveNewParent(){
   // its own isn't useful for anything else in the app, so there's no reason to make this a
   // separate trip back to the Students panel and having to find them in the dropdown.
   const dur=90, spw=2;
-  state.newStudentForm={ parentMode:'existing', parentId:newParent.id, parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), matchedInactiveId:null, confirmNewAnyway:false, error:'' };
+  state.newStudentForm={ parentMode:'existing', parentId:newParent.id, parentName:'', parentEmail:'', studentName:'', year:1, sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), error:'' };
   toast(newParent.name+' added — now add their first child below.');
   state.newParentForm=null;
   render();
@@ -6321,13 +6263,6 @@ function renderNewStudentModal(){
       +'<div><label>Parent email</label><input type="text" value="'+f.parentEmail+'" oninput="setNSF(\'parentEmail\', this.value)"/></div></div>';
   }
   html+='<label>Student name</label><input type="text" value="'+f.studentName+'" oninput="setNSF(\'studentName\', this.value)"/>';
-  if(f.matchedInactiveId){
-    const inact=findStudent(f.matchedInactiveId);
-    html+='<div class="banner danger">An inactive student named <b>'+inact.name+'</b> already exists'+(inact.stoppedFrom? ' (stopped '+fmtShort(inact.stoppedFrom)+')' : '')+'. '
-      +'<button class="btn sm" style="margin:4px 8px 4px 0" onclick="closeNewStudentForm();openReactivateStudentForm(\''+inact.id+'\')">Reactivate '+inact.name+'</button>'
-      +'<label style="display:inline-flex;align-items:center;gap:5px;font-weight:400;margin:0"><input type="checkbox" style="width:auto" '+(f.confirmNewAnyway?'checked':'')+' onchange="setNSF(\'confirmNewAnyway\', this.checked)"/> This is a different person — enroll as new</label>'
-    +'</div>';
-  }
   html+='<label>School year</label><select onchange="setNSF(\'year\', Number(this.value))">'
     +YEARS.map(function(y){ return '<option value="'+y+'"'+(y===f.year?' selected':'')+'>'+yearLabel(y)+'</option>'; }).join('')
     +'</select>';
@@ -6391,68 +6326,6 @@ function renderRecurringModal(){
   return html;
 }
 
-function renderReactivateStudentModal(){
-  const f=state.reactivateForm;
-  if(!f) return '';
-  const student=findStudent(f.studentId);
-  const starts=possibleStarts(f.duration);
-  let html='<div class="overlay" onclick="if(event.target===this) closeReactivateStudentForm()"><div class="modal">';
-  html+='<h3>Reactivate '+student.name+'</h3>';
-  html+='<p>'+student.name+' was marked stopped'+(student.stoppedFrom? ' from '+fmtShort(student.stoppedFrom) : '')+'. This clears that and sets a fresh regular schedule going forward — nothing about their history changes.</p>';
-  html+='<div class="row2"><div><label>Sessions per week</label><select onchange="setReactivateSessionsPerWeek(this.value)">'
-    +SESSIONS_PER_WEEK_OPTIONS.map(function(n){ return '<option value="'+n+'"'+(n===f.sessionsPerWeek?' selected':'')+'>'+n+'x/week</option>'; }).join('')
-    +'</select></div>'
-    +'<div><label>Session length</label><select onchange="setReactivateDuration(this.value)">'
-    +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===f.duration?' selected':'')+'>'+d+' min</option>'; }).join('')
-    +'</select></div></div>';
-  html+='<label>Regular schedule</label>';
-  html+=renderRecurringPickers(f.recurring, starts, 'setReactivateRecurring');
-  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
-  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
-    +'<button class="btn ghost" onclick="closeReactivateStudentForm()">Cancel</button>'
-    +'<button class="btn primary" onclick="confirmReactivateStudent()">Reactivate student</button>'
-  +'</div>';
-  html+='</div></div>';
-  return html;
-}
-
-/* ---------- Inactive Students / Inactive Parents panels (5.26) ---------- */
-function renderInactiveStudentsPanel(){
-  const list=students.filter(isStudentInactive).sort(function(a,b){ return a.name.localeCompare(b.name); });
-  let html=sectionOpen('inactiveStudents','Inactive Students ('+list.length+')', '');
-  html+='<p>Students whose enrolment was stopped. Adding a new student with a matching name will alert front desk and offer to reactivate here instead of creating a duplicate.</p>';
-  if(list.length===0){ html+='<div class="empty-note">No inactive students.</div>'; }
-  else{
-    html+='<table><tr><th>Student</th><th>Year</th><th>Parent</th><th>Stopped</th><th></th></tr>';
-    list.forEach(function(s){
-      const parent=parents.find(function(p){ return p.id===s.parentId; });
-      html+='<tr><td>'+s.name+'</td><td>'+yearLabel(s.year)+'</td><td class="small">'+(parent? parent.name : '—')+'</td><td class="small">'+(s.stoppedFrom? fmtShort(s.stoppedFrom) : '—')+'</td>'
-        +'<td><button class="btn sm primary" onclick="openReactivateStudentForm(\''+s.id+'\')">Reactivate</button></td></tr>';
-    });
-    html+='</table>';
-  }
-  html+='</div>';
-  html+=renderReactivateStudentModal();
-  return html;
-}
-function renderInactiveParentsPanel(){
-  const list=parents.filter(isParentInactive).sort(function(a,b){ return a.name.localeCompare(b.name); });
-  let html=sectionOpen('inactiveParents','Inactive Parents ('+list.length+')', '');
-  html+='<p>Parents whose every child has stopped. Reactivate a child from here (or from Inactive Students above) to bring the parent back to the main Parents list.</p>';
-  if(list.length===0){ html+='<div class="empty-note">No inactive parents.</div>'; }
-  else{
-    html+='<table><tr><th>Parent</th><th>Email</th><th>Children</th></tr>';
-    list.forEach(function(p){
-      const kids=inactiveChildrenOf(p);
-      html+='<tr><td>'+p.name+'</td><td class="small">'+p.email+'</td><td class="small">'
-        +kids.map(function(k){ return k.name+' <button class="btn sm ghost" onclick="openReactivateStudentForm(\''+k.id+'\')">Reactivate</button>'; }).join(', ')
-      +'</td></tr>';
-    });
-    html+='</table>';
-  }
-  html+='</div>';
-  return html;
-}
 
 // Shared row-builder for both the active and the settled make-up-credits tables below — identical
 // column layout either way, only which credits get fed in differs (Sept 2026, per Allie: "can we
