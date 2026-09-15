@@ -7507,7 +7507,14 @@ function afterLogin(){
         subscribeToLiveUpdates();
       }).catch(function(err){
         console.error(err);
-        showLoginScreen('Signed in, but loading your data failed — check your connection and reload.');
+        // Surface the actual database error (missing table, RLS permission denial, etc.) instead of a
+        // generic "check your connection" message — the connection is almost never the real cause,
+        // and the vague message left this undiagnosable without pulling up the browser console (Sept
+        // 2026, after "still saying loading data failed" persisted even once the expected fix — a
+        // missing migration — had already been applied, meaning the true cause was something else
+        // entirely and we needed the real error text to find it).
+        const detail=(err && (err.message||err.error_description||err.hint||err.details)) || String(err);
+        showLoginScreen('Signed in, but loading your data failed: '+detail);
       });
     });
   });
