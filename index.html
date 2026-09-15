@@ -4403,12 +4403,9 @@ function holdLateNoticeSessions(studentId, startKey, endKey){
 // locked in) get a make-up credit, while November sessions (plenty of notice by now) just get a
 // plain cancellation — exactly like an ordinary, well-notified hold.
 function applyHold(student, start, end, note, grantMakeupCredits){
-  const hold={id:newId()||('hold'+(nextSessionId++)), start:start, end:end, note:(note||'').trim()};
+  const hold={id:newId()||('hold'+(nextSessionId++)), start:start, end:end, note:(note||'').trim(), creditsIssued:0};
   student.holds=student.holds||[];
   student.holds.push(hold);
-  dbWrite('placing a hold', function(){ return supabaseClient.from('student_holds').insert({
-    id:hold.id, student_id:student.id, start_date:toKey(hold.start), end_date:toKey(hold.end), note:hold.note
-  }); });
   // Free up any of this student's own already-booked sessions that fall inside the hold window —
   // standing or one-off alike — so those Pod slots immediately show as available. A session paid
   // for with a make-up credit gets its credit restored (unless already past its own expiry),
@@ -4441,6 +4438,15 @@ function applyHold(student, start, end, note, grantMakeupCredits){
       }); });
     }
   });
+  hold.creditsIssued=madeUpCount;
+  // Fired only now, once creditsIssued is actually known — the hold row itself was pushed to local
+  // state above (so the UI reflects it immediately) but its remote insert waits until after the
+  // cancel/credit sweep so credits_issued lands correct on the very first write, rather than 0
+  // followed by a separate update (Sept 2026, per Allie: "how many makeup they got if any" — the new
+  // Holds tab's billing-support view).
+  dbWrite('placing a hold', function(){ return supabaseClient.from('student_holds').insert({
+    id:hold.id, student_id:student.id, start_date:toKey(hold.start), end_date:toKey(hold.end), note:hold.note, credits_issued:hold.creditsIssued
+  }); });
   toast(student.name+' placed on hold '+fmtShort(hold.start)+'–'+fmtShort(hold.end)
     +(cancelledCount>0? ' — '+cancelledCount+' session(s) freed up for one-off bookings.' : '.')
     +(madeUpCount>0? ' '+madeUpCount+' make-up credit(s) issued (late-notice hold).' : ''));
@@ -4469,6 +4475,96 @@ function removeHold(studentId, holdId){
   const made=regenerateAllRecurring();
   toast('Hold removed'+(made>0? ' — '+made+' standing session(s) re-booked.' : '.'));
   render();
+}
+
+/* ---------- Holds tab (billing support) ---------- */
+// Sept 2026, per Allie: "I need a new tab for holds. In there I need to keep track of which
+// students are on hold, how many makeup they got if any and how many sessions were cancelled if
+// any. This is for billing which i know we havent set up but will still help overall." Every hold
+// ever placed (front desk direct or an approved parent request — both funnel through applyHold())
+// stays on student.holds forever unless explicitly removed, so this is a straightforward ledger
+// over data that already exists, plus one new persisted field (hold.creditsIssued) for the one
+// number that genuinely can't be recomputed after the fact — the make-up-credit decision made at
+// the moment the hold was placed.
+function holdStatus(hold){
+  const now=simNow();
+  if(toKey(hold.end)<toKey(now)) return 'ended';
+  if(toKey(hold.start)<=toKey(now)) return 'active';
+  return 'upcoming';
+}
+// Every student's hold, flattened into one list with its owning student attached, most recent
+// start date first — mirrors how the Credits tab flattens every credit across every student rather
+// than making front desk hunt through each student's own record one at a time.
+function allHoldsFlat(){
+  const out=[];
+  students.forEach(function(s){
+    (s.holds||[]).forEach(function(h){ out.push({student:s, hold:h}); });
+  });
+  return out.sort(function(a,b){ return toKey(b.hold.start).localeCompare(toKey(a.hold.start)); });
+}
+// Splits a hold's effect on billing by calendar month — computed fresh from the student's actual
+// session records every time this renders, rather than frozen at whatever was known the moment the
+// hold was placed. That matters because a hold placed further out than the pre-booking horizon
+// (HORIZON_WEEKS) doesn't have every affected session's row created yet at that moment — this way,
+// as time passes and those occurrences are reached and cancelled for real, they show up here
+// automatically (Sept 2026, per Allie: "for the cancelled sessions they need to be split into
+// months and say x sessions cancelled in october, 3 scheduled to attend remaining").
+function holdMonthlyBreakdown(studentId, hold){
+  const startD=new Date(toKey(hold.start)), endD=new Date(toKey(hold.end));
+  const months=[], byKey={};
+  let y=startD.getFullYear(), m=startD.getMonth();
+  while(y<endD.getFullYear() || (y===endD.getFullYear() && m<=endD.getMonth())){
+    const key=y+'-'+m;
+    const entry={key:key, sortKey:y*12+m, label:new Date(y,m,1).toLocaleDateString('en-AU',{month:'long',year:'numeric'}), cancelled:0, scheduled:0};
+    months.push(entry); byKey[key]=entry;
+    m++; if(m>11){ m=0; y++; }
+  }
+  sessions.forEach(function(s){
+    if(s.studentId!==studentId) return;
+    const d=new Date(s.date);
+    const mk=d.getFullYear()+'-'+d.getMonth();
+    const entry=byKey[mk];
+    if(!entry) return; // outside every month this hold touches — not relevant here
+    const dk=toKey(s.date);
+    if(s.status==='cancelled' && dk>=toKey(hold.start) && dk<=toKey(hold.end)){
+      entry.cancelled++;
+    } else if(s.status==='scheduled' || s.status==='attended'){
+      // "Remaining" for that same month — whichever of the student's sessions that month AREN'T
+      // cancelled, whether they fall before/after the hold window within it or the hold only covers
+      // part of the month — so billing can see "still on track for N sessions in October" alongside
+      // however many were lost to the hold.
+      entry.scheduled++;
+    }
+  });
+  return months;
+}
+function renderHoldsPanel(){
+  const rows=allHoldsFlat();
+  let html=sectionOpen('holds','Holds',
+    '<span class="small muted">'+rows.length+'</span>');
+  html+='<p>Every hold on file — front desk placed (Students list, "Hold") or from an approved parent request — for keeping billing in sync: who\'s currently or about to be on hold, any make-up credits issued for late notice, and month by month how many sessions were cancelled versus how many they\'re still on track to attend.</p>';
+  if(rows.length===0){ html+='<div class="empty-note">No holds on file.</div>'; }
+  else{
+    html+='<table><tr><th>Student</th><th>Dates</th><th>Status</th><th>Note</th><th>Make-up credits</th><th>Sessions by month</th><th></th></tr>';
+    rows.forEach(function(r){
+      const st=holdStatus(r.hold);
+      const statusBadge = st==='active'? '<span class="badge hold">Active</span>' : st==='upcoming'? '<span class="badge soon">Upcoming</span>' : '<span class="badge completed">Ended</span>';
+      const breakdown=holdMonthlyBreakdown(r.student.id, r.hold);
+      const monthsCell = breakdown.length
+        ? breakdown.map(function(m){ return '<div>'+m.label+': <b>'+m.cancelled+'</b> cancelled, <b>'+m.scheduled+'</b> scheduled</div>'; }).join('')
+        : '<span class="small muted">—</span>';
+      html+='<tr><td>'+r.student.name+'</td>'
+        +'<td>'+fmtShort(r.hold.start)+'–'+fmtShort(r.hold.end)+'</td>'
+        +'<td>'+statusBadge+'</td>'
+        +'<td class="small">'+(r.hold.note||'—')+'</td>'
+        +'<td>'+(r.hold.creditsIssued||0)+'</td>'
+        +'<td class="small">'+monthsCell+'</td>'
+        +'<td><button class="btn sm ghost" onclick="removeHold(\''+r.student.id+'\',\''+r.hold.id+'\')">Remove</button></td></tr>';
+    });
+    html+='</table>';
+  }
+  html+='</div>';
+  return html;
 }
 
 /* ---------- render: shell ---------- */
@@ -5261,6 +5357,7 @@ var FRONT_TABS=[
   {id:'staff', label:'Staff'},
   {id:'timesheet', label:'Timesheet'},
   {id:'credits', label:'Credits'},
+  {id:'holds', label:'Holds'},
 ];
 function setFrontTab(id){
   // Sept 2026, per Allie: "whenever I click the credits tab it automatically opens up the dialogue
@@ -5359,6 +5456,8 @@ function renderStaff(){
     html+=renderCreditsReport();
     html+=renderBookedCreditsPanel();
     html+=renderSettledCreditsPanel();
+  } else if(tab==='holds'){
+    html+=renderHoldsPanel();
   }
 
   // Modals always render regardless of which tab is active — every one of these is only ever
@@ -8053,7 +8152,7 @@ function loadAllData(){
     T('pod_shift_one_off_coverage','block_id,the_date,instructor_id'),
     T('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date'),
     T('student_recurring_slots','student_id,weekday,start_min'),
-    T('student_holds','id,student_id,start_date,end_date,note'),
+    T('student_holds','id,student_id,start_date,end_date,note,credits_issued'),
     T('student_pod_assignments','id,student_id,pod_id,effective_from,weekday,online,instructor_id'),
     T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
@@ -8105,7 +8204,7 @@ function loadAllData(){
       id:r.id, parentId:r.parent_id, name:r.name, year:r.year, baseYear:r.base_year, yearBaseline:r.year_baseline,
       duration:r.duration, sessionsPerWeek:r.sessions_per_week, startDate: r.start_date? new Date(r.start_date) : null,
       recurring: slotRows.filter(function(s){ return s.student_id===r.id; }).map(function(s){ return {weekday:s.weekday, start:s.start_min}; }),
-      holds: holdRows.filter(function(h){ return h.student_id===r.id; }).map(function(h){ return {id:h.id, start:new Date(h.start_date), end:new Date(h.end_date), note:h.note||''}; }),
+      holds: holdRows.filter(function(h){ return h.student_id===r.id; }).map(function(h){ return {id:h.id, start:new Date(h.start_date), end:new Date(h.end_date), note:h.note||'', creditsIssued:h.credits_issued||0}; }),
       podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from), weekday:a.weekday||null, online:a.online||false, instructorId:a.instructor_id||null}; }),
       planChanges: planChangeRows.filter(function(pc){ return pc.student_id===r.id; }).map(function(pc){ return {
         id:pc.id, effectiveFrom:new Date(pc.effective_from), stopped:pc.stopped, sessionsPerWeek:pc.sessions_per_week,
