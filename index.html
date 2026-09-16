@@ -5473,7 +5473,31 @@ function renderExpectedHeadcountGrid(){
 // the minimum possible, since at every instant at least ceil(headcount/8) instructors must be
 // present regardless of how shifts are arranged — before SHIFT_WAIT_TOLERANCE/MIN_SHIFT_MINUTES (the
 // same two rules as before) pad each individual shift out where the business rules require it.
+//
+// One more hard rule, given directly (Sept 2026, per Allie): "I also must have an instructor in the
+// centre by 3pm" — regardless of whether any booking actually starts right at open, so the required-
+// instructor curve treats CENTER_OPEN as always needing at least 1, and that opening run's start
+// skips the usual arrival grace entirely (it's capped at CENTER_OPEN itself, not CENTER_OPEN+10) —
+// every OTHER run, at every other level, still gets the normal grace. ("Usually somebody will start
+// at 2 and help with phone calls, but not a necessity" — that earlier start is real practice, not a
+// rule this tool should bake in, so it isn't modelled here.)
+//
+// Padding a run out to MIN_SHIFT_MINUTES (or anchoring it to CENTER_OPEN) can occasionally stretch
+// it far enough to butt up against, or overlap, another run at that same level — e.g. a mandatory
+// "someone open at 3pm" shift padded out past a gap in bookings, right into a separate afternoon
+// run that starts on its own shortly after. mergeOverlapping() below collapses same-level runs like
+// that back into one, so the grid never shows two overlapping shifts for the same staffing level.
 var RATIO_PER_INSTRUCTOR=8; // the 1:8 ratio itself
+function mergeOverlapping(intervals){
+  const sorted=intervals.slice().sort(function(a,b){ return a.start-b.start; });
+  const out=[];
+  sorted.forEach(function(iv){
+    const last=out.length? out[out.length-1] : null;
+    if(last && iv.start<=last.end) last.end=Math.max(last.end, iv.end);
+    else out.push({start:iv.start, end:iv.end});
+  });
+  return out;
+}
 function suggestedShiftsForWeekday(wd){
   const dateKey=toKey(nextRegularOccurrence(wd));
   const dayList=scheduleListForDay(dateKey).filter(function(s){ return !s.online; });
@@ -5483,9 +5507,11 @@ function suggestedShiftsForWeekday(wd){
     const headcount=dayList.filter(function(s){ return s.start<t+15 && t<s.start+s.duration; }).length;
     return Math.ceil(headcount/RATIO_PER_INSTRUCTOR);
   });
+  required[0]=Math.max(required[0], 1); // someone must be in the centre right from CENTER_OPEN, bookings or not
   const peak=Math.max.apply(null, required.concat([0]));
   const shifts=[];
   for(let level=1; level<=peak; level++){
+    const raw=[];
     let i=0;
     while(i<slots.length){
       if(required[i]<level){ i++; continue; }
@@ -5493,18 +5519,33 @@ function suggestedShiftsForWeekday(wd){
       while(j<slots.length && required[j]>=level) j++;
       // This run covers slot indices [i, j-1] — minutes slots[i] through slots[j-1]+15.
       const rawStart=slots[i], rawEnd=slots[j-1]+15;
-      let start=rawStart+SHIFT_WAIT_TOLERANCE;
+      const openingRun = level===1 && rawStart===CENTER_OPEN;
+      let start=openingRun? CENTER_OPEN : rawStart+SHIFT_WAIT_TOLERANCE;
       let end=rawEnd;
       if(end-start<MIN_SHIFT_MINUTES){
         end=start+MIN_SHIFT_MINUTES;
         if(end>CENTER_CLOSE){ end=CENTER_CLOSE; start=end-MIN_SHIFT_MINUTES; }
       }
-      shifts.push({level:level, start:start, end:end});
+      raw.push({start:start, end:end});
       i=j;
     }
+    mergeOverlapping(raw).forEach(function(m){ shifts.push({level:level, start:m.start, end:m.end}); });
   }
   shifts.sort(function(a,b){ return a.start-b.start || a.end-b.end; });
   return {peak:peak, shifts:shifts, totalMinutes:shifts.reduce(function(sum,s){ return sum+(s.end-s.start); }, 0)};
+}
+// Total instructor-minutes CURRENTLY rostered across every Pod for a weekday — the comparison point
+// for the suggested total (Sept 2026, per Allie: "can you add a column to compare to current
+// totals?"). Summed across all Pods rather than any one, since the suggestion itself no longer is.
+function currentRosteredMinutesForWeekday(wd){
+  const today=simNow();
+  let total=0;
+  pods.forEach(function(pod){
+    podBlocksForDay(pod.id, wd).forEach(function(b){
+      if(blockInstructorOngoing(b, today)) total += (b.end-b.start);
+    });
+  });
+  return total;
 }
 // The read-only grid itself — one row per weekday rather than per Pod (Sept 2026, per Allie: "can we
 // build this as a section" — after weighing click-to-apply against a plain read-only display, she
@@ -5512,18 +5553,28 @@ function suggestedShiftsForWeekday(wd){
 // "Rostered shifts" cell to apply it to directly — it's a staffing target to roster instructors
 // against, however she splits them across Pods that day).
 function renderSuggestedShiftsGrid(){
-  let totalMinutesAll=0;
-  let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Day</th><th>Instructors needed at peak</th><th>Suggested shifts</th><th>Total</th></tr>';
+  let totalSuggestedAll=0, totalCurrentAll=0;
+  let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Day</th><th>Instructors needed at peak</th><th>Suggested shifts</th><th>Suggested total</th><th>Currently rostered</th></tr>';
   WEEKDAY_KEYS.forEach(function(wd){
     const result=suggestedShiftsForWeekday(wd);
-    totalMinutesAll+=result.totalMinutes;
+    const currentMin=currentRosteredMinutesForWeekday(wd);
+    const diff=currentMin-result.totalMinutes;
+    totalSuggestedAll+=result.totalMinutes;
+    totalCurrentAll+=currentMin;
     const shiftsHtml=result.shifts.length
       ? result.shifts.map(function(s){ return rangeLabel(s.start, s.end-s.start); }).join('<br>')
       : '<span class="small muted">No instructors needed</span>';
-    html+='<tr><td><b>'+wd+'</b></td><td style="text-align:center">'+result.peak+'</td><td>'+shiftsHtml+'</td><td style="text-align:center">'+hoursMinutesLabel(result.totalMinutes)+'</td></tr>';
+    html+='<tr><td><b>'+wd+'</b></td><td style="text-align:center">'+result.peak+'</td><td>'+shiftsHtml+'</td>'
+      +'<td style="text-align:center">'+hoursMinutesLabel(result.totalMinutes)+'</td>'
+      +'<td style="text-align:center">'+hoursMinutesLabel(currentMin)
+      +(diff!==0? '<br><span class="small muted">('+(diff>0?'–':'+')+hoursMinutesLabel(Math.abs(diff))+')</span>' : '')
+      +'</td></tr>';
   });
   html+='</table></div>';
-  html+='<p class="small muted">Total across the week: '+hoursMinutesLabel(totalMinutesAll)+' of instructor time to keep 1:'+RATIO_PER_INSTRUCTOR+' covered at every moment (10-min arrival grace, 2-hour minimum shift).</p>';
+  const totalDiff=totalCurrentAll-totalSuggestedAll;
+  html+='<p class="small muted">Total across the week: '+hoursMinutesLabel(totalSuggestedAll)+' suggested vs '+hoursMinutesLabel(totalCurrentAll)+' currently rostered'
+    +(totalDiff!==0? ' — a potential '+(totalDiff>0?'saving':'increase')+' of '+hoursMinutesLabel(Math.abs(totalDiff))+'.' : ' — already matched.')
+    +'</p>';
   return html;
 }
 
@@ -6337,7 +6388,7 @@ function renderStaff(){
       +'</div>';
 
     html+=sectionOpen('suggestedShifts','Suggested shift durations')
-      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. A student may wait up to 10 minutes for their instructor, and every shift stays at least 2 hours regardless.</p>'
+      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. Someone must be in the centre from 3pm regardless of bookings; after that, a student may wait up to 10 minutes for their instructor, and every shift stays at least 2 hours.</p>'
       +renderSuggestedShiftsGrid()
       +'</div>';
 
