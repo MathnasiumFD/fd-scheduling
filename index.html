@@ -6187,20 +6187,13 @@ function renderStaff(){
     html+=renderEnrollmentRequestsPanel();
     html+=renderCheckedInPanel();
     html+=renderClosedDaysPanel();
-  } else if(tab==='schedule'){
-    // Availability lookup sits at the top of Schedule (Sept 2026, per Allie: "move availability
-    // lookup to the top of the schedule tab"). Directly under it: the day-by-day coverage grid —
-    // week selector, day picker, +Book a session, the live/one-off-resolved Pod-by-Pod picture for
-    // whichever day is selected — which had briefly moved out to the Staff tab, then moved back here
-    // underneath Availability lookup (Sept 2026, per Allie: "move that schedule section inside the
-    // schedule tab under availability lookup"), and its own static companion right below that: the
-    // same Pod x weekday shape but showing the ONGOING rostered pattern with no dates at all, for a
-    // quick at-a-glance "what's the standing plan" view and a fast way into the ongoing Assign editor
-    // (renderRosteredShiftsGrid — Sept 2026, per Allie: "one that looks similar but is more static...
-    // showing the instructors regular rostered shifts"). Waitlist and Pod seating below are still the
-    // planning/kids' side of scheduling.
-    html+=renderAvailabilityLookup();
 
+    // The day-by-day coverage grid — week selector, day picker, +Book a session, the live/one-off-
+    // resolved Pod-by-Pod picture for whichever day is selected — moved here from the Schedule tab
+    // (Sept 2026, per Allie: "move the weekly schedule section to the Today tab") after a run of
+    // earlier relocations (Staff tab, then Schedule tab under Availability lookup). Defaults to
+    // today's own date already (see dayKey's fallback at the top of this function), so landing on
+    // this tab shows today's coverage without any extra click.
     html+=sectionOpen('schedule','Schedule',
         '<div style="display:flex;gap:6px;align-items:center">'
           +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
@@ -6218,6 +6211,13 @@ function renderStaff(){
     html+=renderCoverageGrid(weekDates);
 
     html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above.
+  } else if(tab==='schedule'){
+    // Availability lookup sits at the top of Schedule (Sept 2026, per Allie: "move availability
+    // lookup to the top of the schedule tab"). The day-by-day coverage grid that used to sit directly
+    // under it has since moved on to the Today tab (see the tab==='today' branch above) — Schedule is
+    // left with the planning tools (Availability lookup, the static rostered-shifts grid, Waitlist)
+    // and Pod seating, the kids' side of scheduling.
+    html+=renderAvailabilityLookup();
 
     html+=sectionOpen('rosteredShifts','Regular rostered shifts')
       +'<p class="small muted">The standing weekly pattern, ignoring any one-off swap or single-day change — click a cell to make an ongoing change (same editor as the "Assign" button below), effective from whichever date you choose.</p>'
@@ -6229,17 +6229,21 @@ function renderStaff(){
     // Pod seating now picks its own weekday (Sept 2026, per Allie: "I need the option to select
     // whether it's Monday, Tuesday, Wednesday, Thursday, or Friday... an overview of the regularly
     // attending kids so that I can set them to a pod and they always have a spot pre-assigned to
-    // them") — independent of the day-by-day picker, which has moved away to the Staff tab. Defaults
-    // to today's own weekday (falling back to Monday on a weekend, when there's no "today" to show)
-    // so this opens on something meaningful rather than blank.
+    // them") — independent of the day-by-day picker on the Today tab. Defaults to today's own weekday
+    // (falling back to Monday on a weekend, when there's no "today" to show) so this opens on
+    // something meaningful rather than blank. The picker itself lives in the section's HEADER, not
+    // its collapsible body (Sept 2026, per Allie: "put them in the header" — Pod seating starts
+    // collapsed by default, and a control buried in the collapsed body is invisible until you already
+    // know to expand the section first; the header is exempt from the collapse-hide CSS, so the day
+    // picker stays usable, and visible, whether the section is open or not).
     const seatingWeekday = state.podSeatingWeekday || (WEEKDAY_KEYS.indexOf(weekday)>=0? weekday : 'Mon');
     const seatingDate = nextRegularOccurrence(seatingWeekday);
     const seatingDateKey = toKey(seatingDate);
-    html+=sectionOpen('podSeating','Pod seating — permanent changes')
+    const seatingDaypickerHtml = '<div class="daypicker" style="margin-bottom:0">'+WEEKDAY_KEYS.map(function(wd){
+      return '<button class="daybtn'+(wd===seatingWeekday?' active':'')+'" onclick="setPodSeatingWeekday(\''+wd+'\')">'+wd+'<span class="d2">'+nextRegularOccurrence(wd).toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
+    }).join('')+'</div>';
+    html+=sectionOpen('podSeating','Pod seating — permanent changes', seatingDaypickerHtml)
       +'<p class="small muted">Move a student here and it sticks — every '+seatingWeekday+' from '+fmtShort(seatingDate)+' onward, not just '+fmtShort(seatingDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead. Every regularly-scheduled ("· regular") session below should end up with a Pod of its own here — the only kids who should ever show up Unassigned on a normal day are a make-up or an extra one-off session, not a standing one.</p>'
-      +'<div class="daypicker">'+WEEKDAY_KEYS.map(function(wd){
-        return '<button class="daybtn'+(wd===seatingWeekday?' active':'')+'" onclick="setPodSeatingWeekday(\''+wd+'\')">'+wd+'<span class="d2">'+nextRegularOccurrence(wd).toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
-      }).join('')+'</div>'
       +renderPodSummaryStrip(seatingDateKey, seatingWeekday)
       +'</div>';
   } else if(tab==='students'){
@@ -6247,9 +6251,9 @@ function renderStaff(){
   } else if(tab==='parents'){
     html+=renderParentsPanel();
   } else if(tab==='staff'){
-    // The day-by-day coverage grid used to live here (Sept 2026 reorg); it's since moved back to the
-    // Schedule tab, under Availability lookup (see the tab==='schedule' branch above) — this tab is
-    // just the instructor/front-desk-staff roster now.
+    // The day-by-day coverage grid used to live here (Sept 2026 reorg); it's since moved on to the
+    // Today tab (see the tab==='today' branch above) — this tab is just the instructor/front-desk-
+    // staff roster now.
     html+=renderFrontStaffPanel();
     html+=renderInstructorsPanel();
   } else if(tab==='timesheet'){
