@@ -1198,6 +1198,12 @@ var state={
   offsetDays:0,
   weekOffset:0,
   selectedDayKey:null,
+  // Which weekday "Pod seating — permanent changes" is showing (Sept 2026, per Allie: "I need the
+  // option to select whether it's Monday, Tuesday, Wednesday, Thursday, or Friday" for pod seating,
+  // independent of whichever date happens to be selected on the day-by-day schedule — that now
+  // lives on the Staff tab entirely). null until first touched, so it can default to today's own
+  // weekday (see renderStaff()) without needing a value baked in here.
+  podSeatingWeekday:null,
   parentLoggedIn:null,
   loginForm:{email:'', error:''},
   instructorLoggedIn:null,
@@ -4049,6 +4055,13 @@ function nextRegularOccurrence(weekday){
   while(closedDayFor(d)){ d=addDays(d,7); }
   return d;
 }
+// "Pod seating — permanent changes" picks its own weekday independently of whatever date the
+// day-by-day schedule (now on the Staff tab) happens to be showing (Sept 2026, per Allie: "I need
+// the option to select whether it's Monday, Tuesday, Wednesday, Thursday, or Friday"). Picking
+// today's own weekday resolves to today itself via nextRegularOccurrence (nextDateForWeekday is a
+// no-op when the target weekday is already today), so the live checked-in view still works exactly
+// as before for that one case — every other weekday shows its next real, non-closed occurrence.
+function setPodSeatingWeekday(weekday){ state.podSeatingWeekday=weekday; render(); }
 // Same shape as peakInWindow, but returns which students are actually occupying the window instead
 // of just the peak count — used only to work out whose seat a "opening soon" slot belongs to, never
 // for capacity math itself (openSeatsAt/peakInWindow, above, are untouched).
@@ -6035,13 +6048,44 @@ function renderStaff(){
     html+=renderCheckedInPanel();
     html+=renderClosedDaysPanel();
   } else if(tab==='schedule'){
-    // Availability lookup and Waitlist sit at the very top of Schedule, above the day-by-day
-    // Schedule card itself (Sept 2026, per Allie: "move waitlist to schedule" + "move availability
-    // lookup to the top of the schedule tab") — both are forward-looking planning tools (what's
-    // regularly open, who's waiting for a slot), distinct from the day-to-day coverage grid below,
-    // so they lead the tab rather than trailing after it.
+    // Availability lookup and Waitlist sit at the top of Schedule (Sept 2026, per Allie: "move
+    // waitlist to schedule" + "move availability lookup to the top of the schedule tab") — both are
+    // forward-looking planning tools (what's regularly open, who's waiting for a slot). The day-by-
+    // day coverage grid that used to sit below them (week selector, day picker, +Book a session)
+    // has since moved to the Staff tab entirely (Sept 2026, per Allie: "move that schedule bit that
+    // just has what stuff on what days or what weeks to the staff tab") — "who's working where on
+    // what day" reads as a staffing concern, so it now lives alongside the instructor/front-desk-
+    // staff roster instead. Schedule itself is left with the planning tools above and Pod seating
+    // below — the kids' side of scheduling, not the day-to-day coverage grid.
     html+=renderAvailabilityLookup();
     html+=renderWaitlistPanel();
+
+    // Pod seating now picks its own weekday (Sept 2026, per Allie: "I need the option to select
+    // whether it's Monday, Tuesday, Wednesday, Thursday, or Friday... an overview of the regularly
+    // attending kids so that I can set them to a pod and they always have a spot pre-assigned to
+    // them") — independent of the day-by-day picker, which has moved away to the Staff tab. Defaults
+    // to today's own weekday (falling back to Monday on a weekend, when there's no "today" to show)
+    // so this opens on something meaningful rather than blank.
+    const seatingWeekday = state.podSeatingWeekday || (WEEKDAY_KEYS.indexOf(weekday)>=0? weekday : 'Mon');
+    const seatingDate = nextRegularOccurrence(seatingWeekday);
+    const seatingDateKey = toKey(seatingDate);
+    html+=sectionOpen('podSeating','Pod seating — permanent changes')
+      +'<p class="small muted">Move a student here and it sticks — every '+seatingWeekday+' from '+fmtShort(seatingDate)+' onward, not just '+fmtShort(seatingDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead. Every regularly-scheduled ("· regular") session below should end up with a Pod of its own here — the only kids who should ever show up Unassigned on a normal day are a make-up or an extra one-off session, not a standing one.</p>'
+      +'<div class="daypicker">'+WEEKDAY_KEYS.map(function(wd){
+        return '<button class="daybtn'+(wd===seatingWeekday?' active':'')+'" onclick="setPodSeatingWeekday(\''+wd+'\')">'+wd+'<span class="d2">'+nextRegularOccurrence(wd).toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
+      }).join('')+'</div>'
+      +renderPodSummaryStrip(seatingDateKey, seatingWeekday)
+      +'</div>';
+  } else if(tab==='students'){
+    html+=renderStudentsPanel();
+  } else if(tab==='parents'){
+    html+=renderParentsPanel();
+  } else if(tab==='staff'){
+    // The day-by-day coverage grid — week selector, day picker, +Book a session, the Pod-by-Pod
+    // roster for whichever day is selected — moved here from the Schedule tab (Sept 2026, per
+    // Allie: "move that schedule bit that just has what stuff on what days or what weeks to the
+    // staff tab"), so "who's working, where, and on what" lives in one place alongside the
+    // instructor/front-desk-staff roster below it, rather than split across two tabs.
     html+=sectionOpen('schedule','Schedule',
         '<div style="display:flex;gap:6px;align-items:center">'
           +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
@@ -6059,28 +6103,8 @@ function renderStaff(){
     html+=renderCoverageGrid(weekDates);
 
     html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above — the pod
-                     // cards just rendered are the last thing that belongs inside it. This was
-                     // previously left unclosed (harmless before the collapsible-sections feature,
-                     // since it just meant later cards were technically-invalid nested children
-                     // rather than siblings) — now that collapsing hides a card's direct children,
-                     // that missing tag was making "Schedule" swallow everything after it.
+                     // cards just rendered are the last thing that belongs inside it.
 
-    // Placed directly under Schedule, above Students (Sept 2026, per Allie: "place pod seating -
-    // permanent changes right under schedule, above students") — now that Students is a separate
-    // tab entirely, this just means staying on the Schedule tab rather than sitting below it on the
-    // same page. Collapsed by default and following whichever day is selected in the Schedule day
-    // picker above it; its "Move to" picker makes a PERMANENT standing change (see
-    // setPermanentSessionLocation) rather than a one-off swap, so this reads as an extension of
-    // Schedule's own seating rather than a roster-management afterthought.
-    html+=sectionOpen('podSeating','Pod seating — permanent changes')
-      +'<p class="small muted">Move a student here and it sticks — every '+weekday+' from '+fmtShort(selectedDate)+' onward, not just '+fmtShort(selectedDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead.</p>'
-      +renderPodSummaryStrip(dayKey, weekday)
-      +'</div>';
-  } else if(tab==='students'){
-    html+=renderStudentsPanel();
-  } else if(tab==='parents'){
-    html+=renderParentsPanel();
-  } else if(tab==='staff'){
     html+=renderFrontStaffPanel();
     html+=renderInstructorsPanel();
   } else if(tab==='timesheet'){
@@ -8765,12 +8789,25 @@ function showLoginScreen(errorMsg){
 }
 
 function doLogin(){
+  // Trimmed on both ends (Sept 2026, per Allie: "sometimes it says invalid login details") — a
+  // trailing/leading space (easy to pick up from autocomplete, or a keyboard's own autocorrect on
+  // a phone) makes the password no longer match, and Supabase's error for that is the same generic
+  // "Invalid login credentials" as an actually-wrong password, so it looks identical from here.
+  // This can't fix every cause of that message (a genuinely wrong password still needs a reset —
+  // see "Forgot password?" below), but it removes the one silent, invisible-to-the-user cause.
   const email=(document.getElementById('loginEmail').value||'').trim();
-  const password=document.getElementById('loginPassword').value||'';
+  const password=(document.getElementById('loginPassword').value||'').trim();
   if(!email || !password){ showLoginScreen('Enter your email and password.'); return; }
   supabaseClient.auth.signInWithPassword({email, password}).then(function(res){
     if(res.error){ showLoginScreen(res.error.message); return; }
     afterLogin();
+  }).catch(function(err){
+    // A network hiccup (dropped connection, Supabase briefly unreachable) previously failed
+    // silently here — the button just did nothing, with no feedback at all — since only res.error
+    // was ever handled, never a rejected promise. Sept 2026, per Allie: "sometimes it says invalid
+    // login details" — this doesn't produce that exact message, but it's the other way a sign-in
+    // attempt can go wrong unexplained, so it gets its own clear message instead of failing quietly.
+    showLoginScreen('Could not reach the server — check your connection and try again.');
   });
 }
 
