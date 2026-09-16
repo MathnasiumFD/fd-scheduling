@@ -341,12 +341,18 @@ var HOUR_BLOCKS=[900,960,1020,1080]; // hourly marks, used only for reference/la
 var CENTER_OPEN=900;   // 3:00pm
 var CENTER_CLOSE=1140; // 7:00pm
 // Suggested shift durations (Sept 2026, per Allie: "is there a way you can suggest the most
-// efficient shift durations?"). Two hard rules she gave directly: a student may wait up to 10
-// minutes for their instructor to arrive (so a shift needn't start right when the first booking
-// does), and every shift must still run at least 2 hours regardless of how short the actual demand
-// window is. See suggestedShiftFor()/renderSuggestedShiftsGrid() below.
-var SHIFT_WAIT_TOLERANCE=10; // minutes a student may wait for their instructor to arrive
+// efficient shift durations?"). Hard rules she gave directly: a student may wait up to
+// SHIFT_WAIT_TOLERANCE minutes for their instructor to arrive (so a shift needn't start right when
+// the first booking does; raised from 10 to 15 minutes — "change the 10min alone rule to 15 min
+// alone"), every shift must still run at least 2 hours regardless of how short the actual demand
+// window is, and an instructor may run over the 1:8 ratio by one kid for up to
+// INSTRUCTOR_OVERLOAD_TOLERANCE_MIN minutes — "an instructor can be overload for about 10 min to
+// help pack up another kid" — so a departing kid overlapping a newly-arriving one for a brief
+// handover doesn't by itself require a second instructor. See suggestedShiftsForWeekday()/
+// renderSuggestedShiftsGrid() below.
+var SHIFT_WAIT_TOLERANCE=15; // minutes a student may wait for their instructor to arrive
 var MIN_SHIFT_MINUTES=120;   // minimum shift length (2 hours)
+var INSTRUCTOR_OVERLOAD_TOLERANCE_MIN=10; // minutes an instructor may briefly run over the 1:8 ratio by one kid, to help a departing kid pack up while a new one settles in
 // Same-day make-up cutoff (5.7): a parent can't request a make-up for today once it's past
 // 10:00am — after that, today drops out of the picker entirely and the earliest offered slot is
 // tomorrow. Measured against the real wall-clock time of day (like the checked-in countdown,
@@ -1471,14 +1477,18 @@ var STUDENT_OVERLAP_TOLERANCE_MIN = 15;
 // earlier-starting interval's end, before computing peak concurrency. Sorting by start first means
 // each interval is only ever nudged relative to intervals that were already "in the room" before
 // it arrived — matching the real handover direction (later arrival defers to the almost-finished
-// earlier one), not the other way around. Ends are never adjusted, only starts.
-function tolerantOccupancyIntervals(list){
+// earlier one), not the other way around. Ends are never adjusted, only starts. `toleranceMin`
+// defaults to STUDENT_OVERLAP_TOLERANCE_MIN (Pod-seat handover forgiveness); suggestedShiftsForWeekday
+// below passes INSTRUCTOR_OVERLOAD_TOLERANCE_MIN instead, for the same shape of forgiveness applied
+// to the 1:8 staffing ratio rather than Pod seats.
+function tolerantOccupancyIntervals(list, toleranceMin){
+  const tol = toleranceMin==null? STUDENT_OVERLAP_TOLERANCE_MIN : toleranceMin;
   const sorted=list.slice().sort(function(a,b){ return a.start-b.start; });
   const adjusted=[];
   sorted.forEach(function(iv){
     let start=iv.start;
     adjusted.forEach(function(prev){
-      if(prev.end>start && prev.end-start<=STUDENT_OVERLAP_TOLERANCE_MIN){
+      if(prev.end>start && prev.end-start<=tol){
         start=Math.max(start, Math.min(iv.end, prev.end));
       }
     });
@@ -5501,10 +5511,17 @@ function mergeOverlapping(intervals){
 function suggestedShiftsForWeekday(wd){
   const dateKey=toKey(nextRegularOccurrence(wd));
   const dayList=scheduleListForDay(dateKey).filter(function(s){ return !s.online; });
+  // A departing kid overlapping a newly-arriving one for a brief handover doesn't need a second
+  // instructor just for that overlap (INSTRUCTOR_OVERLOAD_TOLERANCE_MIN) — same mechanism as the
+  // Pod-seat handover forgiveness above, applied to the ratio instead of a seat.
+  const tolerant=tolerantOccupancyIntervals(
+    dayList.map(function(s){ return {start:s.start, end:s.start+s.duration}; }),
+    INSTRUCTOR_OVERLOAD_TOLERANCE_MIN
+  );
   const slots=[];
   for(let t=CENTER_OPEN; t<CENTER_CLOSE; t+=15) slots.push(t);
   const required=slots.map(function(t){
-    const headcount=dayList.filter(function(s){ return s.start<t+15 && t<s.start+s.duration; }).length;
+    const headcount=tolerant.filter(function(iv){ return iv.start<t+15 && t<iv.end; }).length;
     return Math.ceil(headcount/RATIO_PER_INSTRUCTOR);
   });
   required[0]=Math.max(required[0], 1); // someone must be in the centre right from CENTER_OPEN, bookings or not
@@ -6388,7 +6405,7 @@ function renderStaff(){
       +'</div>';
 
     html+=sectionOpen('suggestedShifts','Suggested shift durations')
-      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. Someone must be in the centre from 3pm regardless of bookings; after that, a student may wait up to 10 minutes for their instructor, and every shift stays at least 2 hours.</p>'
+      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. Someone must be in the centre from 3pm regardless of bookings; after that, a student may wait up to 15 minutes for their instructor, an instructor may briefly run over the ratio by one kid for up to 10 minutes to help a departing kid pack up, and every shift stays at least 2 hours.</p>'
       +renderSuggestedShiftsGrid()
       +'</div>';
 
