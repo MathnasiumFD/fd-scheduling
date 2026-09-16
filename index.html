@@ -703,6 +703,61 @@ function termBreakOpenSeatsAt(termBreak, weekday, dateKey, blockStart, blockLen)
   seats = Math.max(0, seats - unassignedPeakInWindow(dateKey, blockStart, blockEnd));
   return {seats, staffed};
 }
+// One reference date per weekday within a term break's own range — same idea as
+// nextRegularOccurrence() (one real occurrence per weekday, not a shifting week-by-week number),
+// just bounded to the break's own start/end instead of always the very next calendar occurrence,
+// since a term break's coverage is a flat weekday map that only actually applies inside that range
+// (Sept 2026, per Allie: "in summer tab, I need an availability table as well").
+function termBreakDateForWeekday(termBreak, weekday){
+  const from = toKey(simNow())>toKey(termBreak.startDate)? simNow() : termBreak.startDate;
+  let d=nextDateForWeekday(from, weekday);
+  while(toKey(d)<=toKey(termBreak.endDate) && closedDayFor(d)){ d=addDays(d,7); }
+  if(toKey(d)>toKey(termBreak.endDate)){
+    // Every remaining occurrence this week onward is closed, or the break is already fully in the
+    // past — fall back to the first occurrence of this weekday within the range regardless, so the
+    // grid still shows something meaningful rather than nothing at all.
+    d=nextDateForWeekday(termBreak.startDate, weekday);
+  }
+  return d;
+}
+var TERM_BREAK_AVAIL_STEP=30; // matches AVAIL_STEP — half-hour columns across the break's own morning window
+function setTermBreakAvailLen(v){ state.termBreakAvailLen=Number(v); render(); }
+// The Summer tab's own availability table — same aggregate open-seats-by-weekday/time-of-day idea
+// as renderAvailabilityLookup() on the Schedule tab, just scoped to one term break's own morning
+// window and flat weekday coverage map instead of the centre's regular hours (Sept 2026, per Allie:
+// "in summer tab, I need an availability table as well"). No Online row and no click-to-waitlist —
+// summer hours don't run Online sessions, and a full column here just means "no morning slots left
+// for that day," not something front desk maintains its own waitlist queue against.
+function renderTermBreakAvailability(termBreak){
+  const sessionLen=state.termBreakAvailLen||AVAIL_MIN_SESSION_LEN;
+  const blocks=[];
+  for(let t=termBreak.morningStart; t<termBreak.morningEnd; t+=TERM_BREAK_AVAIL_STEP) blocks.push(t);
+  let html='<div style="margin-top:14px"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">'
+    +'<b class="small">Availability</b>'
+    +'<select class="btn sm" style="padding:5px 8px" onchange="setTermBreakAvailLen(this.value)" title="Check against a specific session length">'
+      +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===sessionLen?' selected':'')+'>'+d+' min</option>'; }).join('')
+    +'</select>'
+  +'</div>';
+  if(blocks.length===0){ html+='<div class="empty-note">This window is too short to show a grid.</div></div>'; return html; }
+  html+='<div class="avail-grid" style="grid-template-columns:90px repeat('+blocks.length+',1fr)">';
+  html+='<div></div>'+blocks.map(function(hb){ return '<div class="cal-head">'+minToLabel(hb)+'</div>'; }).join('');
+  WEEKDAY_KEYS.forEach(function(weekday){
+    const d=termBreakDateForWeekday(termBreak, weekday);
+    const dateKey=toKey(d);
+    html+='<div class="cal-row-label">'+weekday+' <span class="small muted" style="font-weight:400">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></div>';
+    blocks.forEach(function(hb){
+      if(hb+sessionLen>termBreak.morningEnd){ html+='<div class="avail-cell small muted">—</div>'; return; }
+      const r=termBreakOpenSeatsAt(termBreak, weekday, dateKey, hb, sessionLen);
+      let cls='avail-cell', label;
+      if(r.staffed===0){ cls+=' nostaff-cell'; label='No staff'; }
+      else if(r.seats===0){ cls+=' full-cell'; label='Full'; }
+      else { cls+=' on'; label=r.seats+' open'; }
+      html+='<div class="'+cls+'">'+label+'</div>';
+    });
+  });
+  html+='</div></div>';
+  return html;
+}
 function openAddTermBreakForm(){
   state.termBreakForm={label:'Summer hours', startDate:'', endDate:'', morningStart:480, morningEnd:720, error:''};
   render();
@@ -1169,6 +1224,7 @@ var state={
   waitlistForm:null,
   parentWaitlistForm:null,
   termBreakRecurringForm:null,
+  termBreakAvailLen:null, // session length the Summer tab's availability table is checked against — see renderTermBreakAvailability()
   closedDayForm:null,
   holdRequestForm:null,
   cancelRequestForm:null,
@@ -5925,7 +5981,9 @@ function renderTermBreaksPanel(){
           +'</select></td>';
         }).join('')+'</tr>';
       });
-      html+='</table></div></div>';
+      html+='</table></div>';
+      html+=renderTermBreakAvailability(t);
+      html+='</div>';
     });
   }
   html+='</div>';
