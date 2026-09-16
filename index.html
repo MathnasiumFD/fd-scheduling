@@ -340,6 +340,13 @@ var MATHQ_LOGO="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCA
 var HOUR_BLOCKS=[900,960,1020,1080]; // hourly marks, used only for reference/labels
 var CENTER_OPEN=900;   // 3:00pm
 var CENTER_CLOSE=1140; // 7:00pm
+// Suggested shift durations (Sept 2026, per Allie: "is there a way you can suggest the most
+// efficient shift durations?"). Two hard rules she gave directly: a student may wait up to 10
+// minutes for their instructor to arrive (so a shift needn't start right when the first booking
+// does), and every shift must still run at least 2 hours regardless of how short the actual demand
+// window is. See suggestedShiftFor()/renderSuggestedShiftsGrid() below.
+var SHIFT_WAIT_TOLERANCE=10; // minutes a student may wait for their instructor to arrive
+var MIN_SHIFT_MINUTES=120;   // minimum shift length (2 hours)
 // Same-day make-up cutoff (5.7): a parent can't request a make-up for today once it's past
 // 10:00am — after that, today drops out of the picker entirely and the earliest offered slot is
 // tomorrow. Measured against the real wall-clock time of day (like the checked-in countdown,
@@ -5449,6 +5456,84 @@ function renderExpectedHeadcountGrid(){
   return html;
 }
 
+// Per-Pod, per-weekday shift math shared by renderSuggestedShiftsGrid() below (Sept 2026, per
+// Allie). Uses the exact same "next occurrence of this weekday" standing pattern as Rostered
+// shifts/Pod seating/Expected headcount, so it's always comparing against the current pattern,
+// whatever day it actually is. The suggested window is the tightest shift that still: (a) never
+// makes a student wait more than SHIFT_WAIT_TOLERANCE minutes for their instructor (so it can start
+// as late as the first booking's own start time + that grace, but no later), (b) runs through to the
+// last booking's own finish with no grace on that end, and (c) is padded back out to
+// MIN_SHIFT_MINUTES if the above would come in under that — extending later where there's room
+// before CENTER_CLOSE, otherwise pulling the start earlier instead. A Pod with no bookings that
+// weekday has no suggestion at all (hasDemand:false) — if it's still currently staffed, that's a
+// pure "nobody's coming, why is someone rostered" flag, not a duration to tighten.
+function suggestedShiftFor(pod, wd){
+  const today=simNow();
+  const dateKey=toKey(nextRegularOccurrence(wd));
+  const dayList=scheduleListForDay(dateKey).filter(function(s){ return s.podId===pod.id; });
+  const blocks=podBlocksForDay(pod.id, wd);
+  const staffedBlocks=blocks.filter(function(b){ return blockInstructorOngoing(b, today); });
+  const currentMin=staffedBlocks.reduce(function(sum,b){ return sum+(b.end-b.start); }, 0);
+  const currentWindow=staffedBlocks.map(function(b){ return rangeLabel(b.start, b.end-b.start); }).join(', ');
+  if(dayList.length===0) return {hasDemand:false, currentMin:currentMin, currentWindow:currentWindow};
+
+  const demandStart=Math.min.apply(null, dayList.map(function(s){ return s.start; }));
+  const demandEnd=Math.max.apply(null, dayList.map(function(s){ return s.start+s.duration; }));
+  let suggestedStart=demandStart+SHIFT_WAIT_TOLERANCE;
+  let suggestedEnd=demandEnd;
+  if(suggestedEnd-suggestedStart<MIN_SHIFT_MINUTES){
+    suggestedEnd=suggestedStart+MIN_SHIFT_MINUTES;
+    if(suggestedEnd>CENTER_CLOSE){ suggestedEnd=CENTER_CLOSE; suggestedStart=suggestedEnd-MIN_SHIFT_MINUTES; }
+  }
+  return {
+    hasDemand:true, demandStart:demandStart, demandEnd:demandEnd,
+    suggestedStart:suggestedStart, suggestedEnd:suggestedEnd,
+    currentMin:currentMin, currentWindow:currentWindow,
+    savings: currentMin-(suggestedEnd-suggestedStart),
+  };
+}
+// The read-only grid itself — same Pod-rows/weekday-columns layout as Regular rostered shifts,
+// showing what to change TO, not changing anything (Sept 2026, per Allie: "can we build this as a
+// section" — after weighing click-to-apply against a plain read-only display, she went with
+// read-only; the actual change still happens through the Rostered shifts grid above, same editor as
+// always).
+function renderSuggestedShiftsGrid(){
+  let totalCurrent=0, totalSuggested=0;
+  let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Pod</th>'
+    + WEEKDAY_KEYS.map(function(wd){ return '<th>'+wd+'</th>'; }).join('')
+    + '</tr>';
+  pods.forEach(function(pod){
+    html+='<tr><td><b>'+pod.name+'</b></td>';
+    WEEKDAY_KEYS.forEach(function(wd){
+      const r=suggestedShiftFor(pod, wd);
+      let cell;
+      if(!r.hasDemand){
+        if(r.currentMin>0){
+          totalCurrent+=r.currentMin;
+          cell='<span style="color:var(--danger)">No bookings</span><br><span class="small muted">currently staffed '+r.currentWindow+'</span>';
+        } else {
+          cell='<span class="small muted">—</span>';
+        }
+      } else {
+        totalCurrent+=r.currentMin;
+        totalSuggested+=(r.suggestedEnd-r.suggestedStart);
+        cell=rangeLabel(r.suggestedStart, r.suggestedEnd-r.suggestedStart)
+          +'<br><span class="small muted">now: '+(r.currentWindow||'unassigned')
+          +(r.savings? ' ('+(r.savings>0?'–':'+')+hoursMinutesLabel(Math.abs(r.savings))+')' : '')
+          +'</span>';
+      }
+      html+='<td title="Booked '+(r.hasDemand? rangeLabel(r.demandStart, r.demandEnd-r.demandStart) : 'no bookings')+'">'+cell+'</td>';
+    });
+    html+='</tr>';
+  });
+  html+='</table></div>';
+  const totalSavings=totalCurrent-totalSuggested;
+  html+='<p class="small muted">Currently rostered: '+hoursMinutesLabel(totalCurrent)+'/week. Tightened to demand (10-min arrival grace, 2-hour minimum shift): '+hoursMinutesLabel(totalSuggested)+'/week'
+    +(totalSavings!==0? ' — a potential '+(totalSavings>0?'saving':'increase')+' of '+hoursMinutesLabel(Math.abs(totalSavings))+'.' : '.')
+    +'</p>';
+  return html;
+}
+
 // Per-Pod cards for the day the Schedule section is showing — capacity, who's covering it, and the
 // actual seated roster, all together (brought back Sept 2026, per Allie: "we need to bring back
 // the pod-based scheduling" — this had briefly been split into a compact badge/pill strip plus one
@@ -6256,6 +6341,11 @@ function renderStaff(){
     html+=sectionOpen('expectedHeadcount','Expected headcount')
       +'<p class="small muted">How many kids are expected to physically be in the centre, in 15-min slots across the afternoon — the standing weekly pattern, same as Regular rostered shifts above. Online sessions aren\'t counted here.</p>'
       +renderExpectedHeadcountGrid()
+      +'</div>';
+
+    html+=sectionOpen('suggestedShifts','Suggested shift durations')
+      +'<p class="small muted">The tightest shift that still covers every booking, this weekday\'s standing pattern — a student may wait up to 10 minutes for their instructor, and every shift stays at least 2 hours regardless. Read-only: make the actual change through Regular rostered shifts above.</p>'
+      +renderSuggestedShiftsGrid()
       +'</div>';
 
     html+=renderWaitlistPanel();
