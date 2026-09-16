@@ -518,6 +518,23 @@ var podSchedule={
 };
 var nextBlockId=100;
 
+// A single-date-only Pod coverage/time change (Sept 2026, per Allie: "click on a staff or unassigned
+// name in the schedule grid, and let me change the instructor and/or times for that day and pod, but
+// I don't want the change to reflect on the ongoing scheduling") — deliberately its own flat list
+// rather than living inside a shift block's oneOffCoverage (see shiftBlock() above), since it needs
+// to work even on a Pod/weekday with no shift block at all (a normally-closed day can still get an
+// ad hoc one-off arrangement for a single date). Resolved entirely inside podCoverageDetail() below,
+// which every consumer (search, booking, session generation, the coverage grid itself) already goes
+// through — so nothing else needed to change to have this override "just work" everywhere a Pod's
+// coverage for a specific date is asked about. instructorId null means "explicitly Unassigned for
+// this one date," distinct from simply having no override at all (which falls back to the normal
+// weekly pattern).
+var podDayOverrides=[];
+var nextDayOverrideId=1;
+function dayOverrideFor(podId, dateKey){
+  return podDayOverrides.find(function(o){ return o.podId===podId && toKey(o.date)===dateKey; }) || null;
+}
+
 // Shift coverage requests — an instructor flagging they can't work one specific dated occurrence
 // of their own shift (not an ongoing change, see 5.3/5.2 for that). Front desk sees it flagged and
 // picks a qualified, available replacement for just that date via fillCoverageRequest(), which
@@ -1050,6 +1067,14 @@ function blockInstructorOn(block, date){
   // dated assignment history applies for every other date, untouched.
   const oneOff=(block.oneOffCoverage||[]).find(function(o){ return toKey(o.date)===dateKey; });
   if(oneOff) return oneOff.instructorId;
+  return blockInstructorOngoing(block, date);
+}
+// Same resolution as blockInstructorOn(), minus the same-day swap check — "who's ROSTERED onto this
+// block," ignoring any one-off exception in effect for this particular date. Used by the static
+// rostered-shifts grid (renderRosteredShiftsGrid) so it always reads as the standing pattern, not
+// whatever happens to be swapped for today specifically.
+function blockInstructorOngoing(block, date){
+  const dateKey=toKey(date);
   const candidates=block.assignments.filter(function(a){ return toKey(a.effectiveFrom)<=dateKey; });
   if(candidates.length===0) return null;
   candidates.sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); });
@@ -1662,6 +1687,17 @@ var UNATTENDED_TOLERANCE_MIN = 15;
 // unstaffed in that case).
 function podCoverageDetail(podId, weekday, start, duration, date){
   const end=start+duration;
+  // A one-off single-day override (Sept 2026, see podDayOverrides above) replaces the normal weekly
+  // block computation entirely for this exact date — whether or not a real weekly block even exists
+  // here — and every consumer of podCoverageDetail (search, booking, session generation/reassignment,
+  // the coverage grid's own display) picks it up automatically by going through this one function.
+  const dayOv=dayOverrideFor(podId, toKey(date));
+  if(dayOv){
+    if(!dayOv.instructorId) return {gapMinutes:duration, ok:false, primaryInstructorId:null, secondaryInstructorId:null, handoffAt:null};
+    const covStart=Math.max(dayOv.start,start), covEnd=Math.min(dayOv.end,end);
+    const covered=Math.max(0, covEnd-covStart);
+    return {gapMinutes:duration-covered, ok:(duration-covered)<=UNATTENDED_TOLERANCE_MIN, primaryInstructorId: covered>0? dayOv.instructorId : null, secondaryInstructorId:null, handoffAt:null};
+  }
   const segs=podBlocksForDay(podId, weekday)
     .map(function(b){ return {start:Math.max(b.start,start), end:Math.min(b.end,end), instructorId:blockInstructorOn(b, date)}; })
     .filter(function(s){ return s.instructorId && s.end>s.start; })
@@ -3886,6 +3922,68 @@ function openPodAssignForm(podId, weekday){
 }
 function closePodAssignForm(){ state.podAssignForm=null; render(); }
 
+// Opens the ONE-OFF, single-date editor from a click on the date-based coverage grid (Sept 2026, per
+// Allie — see podDayOverrides above). Deliberately separate from openPodAssignForm()/podAssignForm
+// above: that one edits the ongoing weekly pattern (dated assignment history, applies every future
+// occurrence of the weekday from a chosen date forward); this one only ever touches this exact date.
+// Defaults to whatever's already in effect for this Pod/date (an existing override, or else the
+// normal weekly pattern's own span/instructor) so opening the form and hitting Save with no changes
+// is a no-op, not a surprise.
+function openDayOverrideForm(podId, dateKey){
+  const weekday=WEEKDAY_KEYS[(new Date(dateKey).getDay()+6)%7];
+  const existing=dayOverrideFor(podId, dateKey);
+  const blocks=podBlocksForDay(podId, weekday);
+  const defStart = existing? existing.start : (blocks.length? blocks[0].start : CENTER_OPEN);
+  const defEnd = existing? existing.end : (blocks.length? blocks[blocks.length-1].end : CENTER_CLOSE);
+  let defInstructorId='';
+  if(existing) defInstructorId = existing.instructorId||'';
+  else { const b=blocks.find(function(bl){ return blockInstructorOn(bl, new Date(dateKey)); }); if(b) defInstructorId=blockInstructorOn(b, new Date(dateKey)); }
+  state.dayOverrideForm={podId, dateKey, weekday, instructorId:defInstructorId, start:defStart, end:defEnd, error:''};
+  render();
+}
+function closeDayOverrideForm(){ state.dayOverrideForm=null; render(); }
+function setDayOverrideField(field, value){
+  const f=state.dayOverrideForm;
+  if(!f) return;
+  f[field] = (field==='start'||field==='end')? Number(value) : value;
+  f.error='';
+  render();
+}
+function saveDayOverride(){
+  const f=state.dayOverrideForm;
+  if(!f) return;
+  if(f.end<=f.start){ f.error='End time must be after the start time.'; render(); return; }
+  let ov=dayOverrideFor(f.podId, f.dateKey);
+  if(ov){
+    ov.instructorId=f.instructorId||null; ov.start=f.start; ov.end=f.end;
+    dbWrite('updating a one-off Pod day change', function(){ return supabaseClient.from('pod_day_overrides').update({
+      instructor_id:ov.instructorId, start_min:ov.start, end_min:ov.end
+    }).eq('id', ov.id); });
+  } else {
+    ov={id:newId()||('dov'+(nextDayOverrideId++)), podId:f.podId, date:new Date(f.dateKey), instructorId:f.instructorId||null, start:f.start, end:f.end};
+    podDayOverrides.push(ov);
+    dbWrite('adding a one-off Pod day change', function(){ return supabaseClient.from('pod_day_overrides').insert({
+      id:ov.id, pod_id:ov.podId, the_date:f.dateKey, instructor_id:ov.instructorId, start_min:ov.start, end_min:ov.end
+    }); });
+  }
+  // Re-sync any session already booked into this Pod/date to the new coverage — same mechanism a
+  // formal coverage-request swap already uses (reassignSessionsForCoverageChange, below), and it
+  // works here unmodified because podCoverageDetail() already resolves this exact override.
+  reassignSessionsForCoverageChange(f.podId, f.weekday, f.dateKey);
+  state.dayOverrideForm=null;
+  render();
+}
+function clearDayOverride(podId, dateKey){
+  const ov=dayOverrideFor(podId, dateKey);
+  if(!ov) return;
+  podDayOverrides=podDayOverrides.filter(function(o){ return o.id!==ov.id; });
+  dbWrite('removing a one-off Pod day change', function(){ return supabaseClient.from('pod_day_overrides').delete().eq('id', ov.id); });
+  const weekday=WEEKDAY_KEYS[(new Date(dateKey).getDay()+6)%7];
+  reassignSessionsForCoverageChange(podId, weekday, dateKey);
+  state.dayOverrideForm=null;
+  render();
+}
+
 function addPodShiftBlock(podId, weekday){
   const blocks=podBlocksForDay(podId, weekday);
   const lastEnd = blocks.length? blocks[blocks.length-1].end : CENTER_OPEN;
@@ -5245,6 +5343,8 @@ function renderRole(){
 
 /* ---------- STAFF ---------- */
 function podCoverageSummary(podId, weekday, date){
+  const dayOv=dayOverrideFor(podId, toKey(date));
+  if(dayOv) return (dayOv.instructorId? findInstructor(dayOv.instructorId).name : 'Unassigned')+' '+rangeLabel(dayOv.start,dayOv.end-dayOv.start)+' · one-off';
   const blocks=podBlocksForDay(podId, weekday);
   if(blocks.length===0) return 'Unassigned';
   return blocks.map(function(b){
@@ -5270,9 +5370,49 @@ function renderCoverageGrid(weekDates){
     html+='<tr><td><b>'+pod.name+'</b></td>';
     weekDates.forEach(function(d){
       const wd=WEEKDAY_KEYS[(d.getDay()+6)%7];
+      const dk=toKey(d);
       const summary=podCoverageSummary(pod.id, wd, d);
       const gap=summary==='Unassigned' || summary.indexOf('Unassigned')>=0;
-      html+='<td'+(gap?' style="color:var(--danger)"':'')+'>'+summary+'</td>';
+      // Every cell is clickable (Sept 2026, per Allie: "click on a staff or unassigned name in the
+      // schedule grid ... change the instructor and/or times for that day and pod, but I don't want
+      // the change to reflect on the ongoing scheduling") — opens a one-off, single-date-only editor
+      // (openDayOverrideForm/renderDayOverrideModal) regardless of whether this cell currently shows
+      // the normal weekly pattern, an existing one-off, or "Unassigned" with no shift here at all.
+      html+='<td style="cursor:pointer'+(gap?';color:var(--danger)':'')+'" onclick="openDayOverrideForm(\''+pod.id+'\',\''+dk+'\')" title="Click to change '+pod.name+' for '+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+' only — won\'t touch the regular '+wd+' schedule">'+summary+'</td>';
+    });
+    html+='</tr>';
+  });
+  html+='</table></div>';
+  return html;
+}
+
+// The "regular" companion to the grid above — Mon-Fri column headers with no dates, so it doesn't
+// change week to week, and each cell shows who's ROSTERED onto that Pod/weekday from the ongoing
+// assignment history alone (blockInstructorOngoing — see blockInstructorOn() above), ignoring any
+// one-off swap or single-day override in effect right now. This is "what the roster says," not
+// "what's actually happening this particular week" (that's the grid above). Clicking a cell opens
+// the existing ongoing/effective-dated editor (openPodAssignForm/renderPodAssignModal, same as the
+// "Assign" button on the Pod seating cards) — a change made here is a real, permanent change to the
+// weekly schedule from whichever date is chosen in that editor, not a one-off (Sept 2026, per Allie:
+// "one that looks similar but is more static... showing the instructors regular rostered shifts...
+// allow me to click on a cell to make changes but this time ongoing changes").
+function renderRosteredShiftsGrid(){
+  const today=simNow();
+  let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Pod</th>'
+    + WEEKDAY_KEYS.map(function(wd){ return '<th>'+wd+'</th>'; }).join('')
+    + '</tr>';
+  pods.forEach(function(pod){
+    html+='<tr><td><b>'+pod.name+'</b></td>';
+    WEEKDAY_KEYS.forEach(function(wd){
+      const blocks=podBlocksForDay(pod.id, wd);
+      let summary;
+      if(blocks.length===0) summary='Unassigned';
+      else summary=blocks.map(function(b){
+        const instrId=blockInstructorOngoing(b, today);
+        return (instrId? findInstructor(instrId).name : 'Unassigned')+' '+rangeLabel(b.start,b.end-b.start);
+      }).join(' → ');
+      const gap=summary==='Unassigned' || summary.indexOf('Unassigned')>=0;
+      html+='<td style="cursor:pointer'+(gap?';color:var(--danger)':'')+'" onclick="openPodAssignForm(\''+pod.id+'\',\''+wd+'\')" title="Change '+pod.name+'\'s regular '+wd+' shift — an ongoing change, from whichever date you choose">'+summary+'</td>';
     });
     html+='</tr>';
   });
@@ -6048,16 +6188,42 @@ function renderStaff(){
     html+=renderCheckedInPanel();
     html+=renderClosedDaysPanel();
   } else if(tab==='schedule'){
-    // Availability lookup and Waitlist sit at the top of Schedule (Sept 2026, per Allie: "move
-    // waitlist to schedule" + "move availability lookup to the top of the schedule tab") — both are
-    // forward-looking planning tools (what's regularly open, who's waiting for a slot). The day-by-
-    // day coverage grid that used to sit below them (week selector, day picker, +Book a session)
-    // has since moved to the Staff tab entirely (Sept 2026, per Allie: "move that schedule bit that
-    // just has what stuff on what days or what weeks to the staff tab") — "who's working where on
-    // what day" reads as a staffing concern, so it now lives alongside the instructor/front-desk-
-    // staff roster instead. Schedule itself is left with the planning tools above and Pod seating
-    // below — the kids' side of scheduling, not the day-to-day coverage grid.
+    // Availability lookup sits at the top of Schedule (Sept 2026, per Allie: "move availability
+    // lookup to the top of the schedule tab"). Directly under it: the day-by-day coverage grid —
+    // week selector, day picker, +Book a session, the live/one-off-resolved Pod-by-Pod picture for
+    // whichever day is selected — which had briefly moved out to the Staff tab, then moved back here
+    // underneath Availability lookup (Sept 2026, per Allie: "move that schedule section inside the
+    // schedule tab under availability lookup"), and its own static companion right below that: the
+    // same Pod x weekday shape but showing the ONGOING rostered pattern with no dates at all, for a
+    // quick at-a-glance "what's the standing plan" view and a fast way into the ongoing Assign editor
+    // (renderRosteredShiftsGrid — Sept 2026, per Allie: "one that looks similar but is more static...
+    // showing the instructors regular rostered shifts"). Waitlist and Pod seating below are still the
+    // planning/kids' side of scheduling.
     html+=renderAvailabilityLookup();
+
+    html+=sectionOpen('schedule','Schedule',
+        '<div style="display:flex;gap:6px;align-items:center">'
+          +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
+          +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
+          +'<input type="date" class="small" value="'+dayKey+'" max="'+toKey(addDays(now,365))+'" onchange="jumpToDate(this.value)" title="Jump to any date — including a past day, to see how it was seated"/>'
+          +(isPast || closure? '' : '<button class="btn sm primary" onclick="openBooking(null,\''+dayKey+'\')">+ Book a session</button>')
+        +'</div>');
+    html+='<div class="daypicker">'+weekDates.map(function(d){
+      const k=toKey(d);
+      return '<button class="daybtn'+(k===dayKey?' active':'')+'" onclick="selectDay(\''+k+'\')">'+WEEKDAY_KEYS[(d.getDay()+6)%7]+'<span class="d2">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
+    }).join('')+'</div>';
+
+    if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
+
+    html+=renderCoverageGrid(weekDates);
+
+    html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above.
+
+    html+=sectionOpen('rosteredShifts','Regular rostered shifts')
+      +'<p class="small muted">The standing weekly pattern, ignoring any one-off swap or single-day change — click a cell to make an ongoing change (same editor as the "Assign" button below), effective from whichever date you choose.</p>'
+      +renderRosteredShiftsGrid()
+      +'</div>';
+
     html+=renderWaitlistPanel();
 
     // Pod seating now picks its own weekday (Sept 2026, per Allie: "I need the option to select
@@ -6081,30 +6247,9 @@ function renderStaff(){
   } else if(tab==='parents'){
     html+=renderParentsPanel();
   } else if(tab==='staff'){
-    // The day-by-day coverage grid — week selector, day picker, +Book a session, the Pod-by-Pod
-    // roster for whichever day is selected — moved here from the Schedule tab (Sept 2026, per
-    // Allie: "move that schedule bit that just has what stuff on what days or what weeks to the
-    // staff tab"), so "who's working, where, and on what" lives in one place alongside the
-    // instructor/front-desk-staff roster below it, rather than split across two tabs.
-    html+=sectionOpen('schedule','Schedule',
-        '<div style="display:flex;gap:6px;align-items:center">'
-          +'<button class="btn sm'+(state.weekOffset===0?' primary':'')+'" onclick="setWeek(0)">This week</button>'
-          +'<button class="btn sm'+(state.weekOffset===1?' primary':'')+'" onclick="setWeek(1)">Next week</button>'
-          +'<input type="date" class="small" value="'+dayKey+'" max="'+toKey(addDays(now,365))+'" onchange="jumpToDate(this.value)" title="Jump to any date — including a past day, to see how it was seated"/>'
-          +(isPast || closure? '' : '<button class="btn sm primary" onclick="openBooking(null,\''+dayKey+'\')">+ Book a session</button>')
-        +'</div>');
-    html+='<div class="daypicker">'+weekDates.map(function(d){
-      const k=toKey(d);
-      return '<button class="daybtn'+(k===dayKey?' active':'')+'" onclick="selectDay(\''+k+'\')">'+WEEKDAY_KEYS[(d.getDay()+6)%7]+'<span class="d2">'+d.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
-    }).join('')+'</div>';
-
-    if(closure){ html+='<div class="banner danger">Centre closed this day — "'+closure.label+'". Nothing can be booked here; anything already scheduled was cancelled and credited when this closure was added.</div>'; }
-
-    html+=renderCoverageGrid(weekDates);
-
-    html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above — the pod
-                     // cards just rendered are the last thing that belongs inside it.
-
+    // The day-by-day coverage grid used to live here (Sept 2026 reorg); it's since moved back to the
+    // Schedule tab, under Availability lookup (see the tab==='schedule' branch above) — this tab is
+    // just the instructor/front-desk-staff roster now.
     html+=renderFrontStaffPanel();
     html+=renderInstructorsPanel();
   } else if(tab==='timesheet'){
@@ -6129,6 +6274,7 @@ function renderStaff(){
   // that could conceivably open it.
   html+=renderBookingModal();
   html+=renderPodAssignModal();
+  html+=renderDayOverrideModal();
   html+=renderCheckInModal();
   html+=renderCheckOutModal();
   html+=renderMoveModal();
@@ -6188,6 +6334,42 @@ function renderPodAssignModal(){
   html+='<button class="btn sm ghost" onclick="addPodShiftBlock(\''+f.podId+'\',\''+f.weekday+'\')">+ Add shift</button>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn primary" onclick="closePodAssignForm()">Done</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+
+// The one-off, single-date companion to renderPodAssignModal() above — same Pod/instructor/time
+// controls, but scoped to exactly one date via podDayOverrides, and with no "effective from" picker
+// at all since it never reaches into the future or lingers past this one day.
+function renderDayOverrideModal(){
+  const f=state.dayOverrideForm;
+  if(!f) return '';
+  const pod=findPod(f.podId);
+  const date=new Date(f.dateKey);
+  let html='<div class="overlay" onclick="if(event.target===this) closeDayOverrideForm()"><div class="modal">';
+  html+='<h3>'+pod.name+' — '+fmtShort(date)+' only</h3>';
+  html+='<p>A one-off change for this single date — it doesn\'t touch '+f.weekday+'\'s regular schedule, and reverts back to the normal pattern on its own from the next '+f.weekday+' onward.</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  const options=instructors.filter(function(i){ return i.active!==false; }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); });
+  html+='<div><label>Covering instructor</label><select onchange="setDayOverrideField(\'instructorId\',this.value)">'
+    +'<option value=""'+(!f.instructorId?' selected':'')+'>Unassigned</option>'
+    +options.map(function(i){ return '<option value="'+i.id+'"'+(i.id===f.instructorId?' selected':'')+'>'+i.name+'</option>'; }).join('')
+  +'</select></div>';
+  html+='<div class="row2" style="align-items:flex-end;margin-top:8px">'
+    +'<div><label>From</label><select onchange="setDayOverrideField(\'start\',this.value)">'
+      +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+    +'</select></div>'
+    +'<div><label>To</label><select onchange="setDayOverrideField(\'end\',this.value)">'
+      +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+    +'</select></div>'
+  +'</div>';
+  if(dayOverrideFor(f.podId, f.dateKey)){
+    html+='<button class="btn sm ghost" style="margin-top:10px" onclick="clearDayOverride(\''+f.podId+'\',\''+f.dateKey+'\')">Remove this one-off change — go back to the normal schedule</button>';
+  }
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeDayOverrideForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveDayOverride()">Save for this day only</button>'
   +'</div>';
   html+='</div></div>';
   return html;
@@ -7956,6 +8138,33 @@ function openCoverageRequestsSortedForInstructor(instructorId){
   });
   return tagged;
 }
+// Re-resolves instructor coverage for every session ALREADY sitting in this Pod on this exact date
+// — not just future/still-unassigned ones — whenever a one-off coverage swap changes who's actually
+// covering (Sept 2026, root cause of "an instructor covering someone else's shift can't check a
+// student out — after they do, the student goes back to the list", reported after a shift-coverage
+// swap). generateRecurringSessions()'s own self-heal (see the "previously-unassigned occurrence"
+// comment above it) only ever re-resolves a session that had NO instructor at all — a session that
+// was already staffed by the ORIGINAL instructor keeps their id untouched, which is correct for
+// every other kind of change, but wrong here: a one-off coverage swap is specifically the one case
+// where WHO covers an already-assigned session needs to change too. Left as-is, the covering
+// instructor could still see the student (coverage lookups like instructorPodIdsToday resolve the
+// swap live), but any write they made to that session — check-out, check-in, no-show — was silently
+// rejected: instructor_update_own_sessions' RLS only lets an instructor touch a row that already
+// lists them as instructor_id/instructor_id_2, and an UPDATE whose RLS condition matches zero rows
+// doesn't error, it just quietly succeeds having touched nothing — so the local "checked out" flag
+// got overwritten back to false the moment data next reloaded, with no error ever shown.
+function reassignSessionsForCoverageChange(podId, weekday, dateKey){
+  const date=new Date(dateKey);
+  sessions.filter(function(s){ return s.podId===podId && !s.online && toKey(s.date)===dateKey && s.status!=='cancelled'; })
+    .forEach(function(s){
+      const cov=podCoverageDetail(podId, weekday, s.start, s.duration, date);
+      if(cov.primaryInstructorId===s.instructorId && (cov.secondaryInstructorId||null)===(s.instructorId2||null) && (cov.handoffAt||null)===(s.handoff||null)) return; // nothing actually changed for this session
+      s.instructorId=cov.primaryInstructorId; s.instructorId2=cov.secondaryInstructorId; s.handoff=cov.handoffAt;
+      dbWrite('updating coverage on an already-scheduled session', function(){ return supabaseClient.from('sessions').update({
+        instructor_id:s.instructorId, instructor_id_2:s.instructorId2, handoff_min:s.handoff
+      }).eq('id', s.id); });
+    });
+}
 function fillCoverageRequest(requestId, instructorId){
   const req=coverageRequests.find(function(r){ return r.id===requestId; });
   const block=podBlocksForDay(req.podId, req.weekday).find(function(b){ return b.id===req.blockId; });
@@ -7971,6 +8180,7 @@ function fillCoverageRequest(requestId, instructorId){
       return supabaseClient.from('pod_shift_one_off_coverage').insert({block_id:block.id, the_date:dateKey, instructor_id:instructorId});
     });
   });
+  reassignSessionsForCoverageChange(req.podId, req.weekday, dateKey);
   regenerateAllRecurring();
   toast(findInstructor(instructorId).name+' is covering '+findPod(req.podId).name+'’s '+req.weekday+' shift on '+fmtShort(req.date)+'.');
   render();
@@ -8007,6 +8217,7 @@ function markCoverageUncovered(requestId){
       return supabaseClient.from('pod_shift_one_off_coverage').insert({block_id:block.id, the_date:dateKey, instructor_id:null});
     });
   });
+  reassignSessionsForCoverageChange(req.podId, req.weekday, dateKey);
   regenerateAllRecurring();
   toast(findPod(req.podId).name+' is marked unstaffed for '+fmtShort(req.date)+' — no replacement found.'+(alreadyNotified? '' : ' Emailed '+MANAGER_EMAIL+'.'));
   render();
@@ -8761,15 +8972,28 @@ function renderParentCredit(c, student){
   } else if(st==='booked'){
     const sess=findSession(c.redeemedSessionId);
     // Sept 2026, root cause of "Signed in, but loading your data failed: undefined is not an object
-    // (evaluating 'findInstructor(sess.instructorId).name')" — a make-up can be booked with no Pod
-    // chosen yet (front desk's own openBookingForCredit flow explicitly allows this — "no Pod
-    // chosen, pick one any time from the Schedule list"), which leaves instructorId null too. This
-    // unconditionally called findInstructor() on it, crashing the ENTIRE parent view on login for
-    // that family — not just this one credit card — since the whole render throws. Now falls back
-    // to the same "not yet assigned" wording an unassigned session gets elsewhere in the app.
-    const instrLabel119=sess.instructorId? findInstructor(sess.instructorId).name : 'an instructor — not yet assigned';
-    html+='<div class="row"><div><b>Make-up booked</b><div class="small muted">'+fmtShort(sess.date)+', '+rangeLabel(sess.start,sess.duration)+' with '+instrLabel119+'</div></div><span class="badge booked">Booked</span></div>';
-    html+='<button class="btn sm danger" onclick="cancelMakeUp(\''+c.id+'\')">Cancel this booking</button>';
+    // (evaluating 'findInstructor(sess.instructorId).name')" — crashed the ENTIRE parent view on
+    // login for that family, not just this one credit card, since the whole render throws. Two
+    // separate gaps, both now guarded: (1) a make-up can be booked with no Pod chosen yet (front
+    // desk's own openBookingForCredit flow explicitly allows this — "no Pod chosen, pick one any
+    // time from the Schedule list"), leaving instructorId null; (2) the first fix only checked
+    // sess.instructorId was truthy before calling findInstructor() on it, which still crashed
+    // whenever instructorId pointed at an instructor no longer in the table at all (a genuinely
+    // orphaned id — the reported crash recurred verbatim after deploying fix #1, meaning this was
+    // the real remaining case) — findInstructor() can return undefined even for a non-null id, so
+    // the RESULT needs checking, not just the id. Also guards sess itself: creditDisplayStatus()
+    // returns 'booked' whenever c.status is 'redeemed', even if redeemedSessionId no longer points
+    // to a real row (e.g. a deleted duplicate — see dedupe_sessions_v2.sql's ON DELETE SET NULL,
+    // which only protects a credit still pointing at a row, not one that already went stale another
+    // way), so this card can't assume sess exists either.
+    if(!sess){
+      html+='<div class="row"><div><b>Make-up booked</b><div class="small muted">Details unavailable — contact us if this looks wrong.</div></div><span class="badge booked">Booked</span></div>';
+    } else {
+      const instr119=sess.instructorId? findInstructor(sess.instructorId) : null;
+      const instrLabel119=instr119? instr119.name : 'an instructor — not yet assigned';
+      html+='<div class="row"><div><b>Make-up booked</b><div class="small muted">'+fmtShort(sess.date)+', '+rangeLabel(sess.start,sess.duration)+' with '+instrLabel119+'</div></div><span class="badge booked">Booked</span></div>';
+      html+='<button class="btn sm danger" onclick="cancelMakeUp(\''+c.id+'\')">Cancel this booking</button>';
+    }
   } else if(st==='completed'){
     const sess=findSession(c.redeemedSessionId);
     html+='<div class="row"><div><b>Make-up completed</b><div class="small muted">Attended '+fmtShort(sess.date)+'</div></div><span class="badge completed">Completed</span></div>';
@@ -8947,7 +9171,7 @@ function scheduleLiveSync(){
   }, 500);
 }
 var LIVE_SYNC_TABLES=['instructors','instructor_avail_rules','instructor_one_offs','pods','pod_shift_blocks',
-  'pod_shift_assignments','pod_shift_one_off_coverage','students','student_recurring_slots','student_holds',
+  'pod_shift_assignments','pod_shift_one_off_coverage','pod_day_overrides','students','student_recurring_slots','student_holds',
   'student_pod_assignments','student_plan_changes','student_plan_change_recurring','parents','sessions',
   'credits','coverage_requests','coverage_request_notified_instructors','waitlist_entries','closed_days',
   'enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring','staff_members',
@@ -9053,6 +9277,7 @@ function loadAllData(){
     T('pod_shift_blocks','id,pod_id,weekday,start_min,end_min'),
     T('pod_shift_assignments','block_id,instructor_id,effective_from'),
     T('pod_shift_one_off_coverage','block_id,the_date,instructor_id'),
+    T('pod_day_overrides','id,pod_id,the_date,instructor_id,start_min,end_min'),
     T('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date'),
     T('student_recurring_slots','student_id,weekday,start_min'),
     T('student_holds','id,student_id,start_date,end_date,note,credits_issued'),
@@ -9075,7 +9300,7 @@ function loadAllData(){
     T('term_breaks','id,label,start_date,end_date,morning_start,morning_end,visible_to_parents'),
     T('term_break_coverage','term_break_id,pod_id,weekday,instructor_id'),
   ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows,staffShiftRows,staffAttendanceRows,termBreakRows,termBreakCoverRows]=t;
+    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,dayOverrideRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows,staffShiftRows,staffAttendanceRows,termBreakRows,termBreakCoverRows]=t;
 
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
@@ -9103,6 +9328,10 @@ function loadAllData(){
       if(!podSchedule[b.pod_id]) podSchedule[b.pod_id]={};
       if(!podSchedule[b.pod_id][b.weekday]) podSchedule[b.pod_id][b.weekday]=[];
       podSchedule[b.pod_id][b.weekday].push(block);
+    });
+
+    podDayOverrides=dayOverrideRows.map(function(r){
+      return {id:r.id, podId:r.pod_id, date:new Date(r.the_date), instructorId:r.instructor_id, start:r.start_min, end:r.end_min};
     });
 
     students=studentRows.map(function(r){ return {
