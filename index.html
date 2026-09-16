@@ -8760,7 +8760,15 @@ function renderParentCredit(c, student){
     else html+='<button class="btn primary sm" onclick="startBookMakeUp(\''+c.id+'\')">Book a make-up</button>';
   } else if(st==='booked'){
     const sess=findSession(c.redeemedSessionId);
-    html+='<div class="row"><div><b>Make-up booked</b><div class="small muted">'+fmtShort(sess.date)+', '+rangeLabel(sess.start,sess.duration)+' with '+findInstructor(sess.instructorId).name+'</div></div><span class="badge booked">Booked</span></div>';
+    // Sept 2026, root cause of "Signed in, but loading your data failed: undefined is not an object
+    // (evaluating 'findInstructor(sess.instructorId).name')" — a make-up can be booked with no Pod
+    // chosen yet (front desk's own openBookingForCredit flow explicitly allows this — "no Pod
+    // chosen, pick one any time from the Schedule list"), which leaves instructorId null too. This
+    // unconditionally called findInstructor() on it, crashing the ENTIRE parent view on login for
+    // that family — not just this one credit card — since the whole render throws. Now falls back
+    // to the same "not yet assigned" wording an unassigned session gets elsewhere in the app.
+    const instrLabel119=sess.instructorId? findInstructor(sess.instructorId).name : 'an instructor — not yet assigned';
+    html+='<div class="row"><div><b>Make-up booked</b><div class="small muted">'+fmtShort(sess.date)+', '+rangeLabel(sess.start,sess.duration)+' with '+instrLabel119+'</div></div><span class="badge booked">Booked</span></div>';
     html+='<button class="btn sm danger" onclick="cancelMakeUp(\''+c.id+'\')">Cancel this booking</button>';
   } else if(st==='completed'){
     const sess=findSession(c.redeemedSessionId);
