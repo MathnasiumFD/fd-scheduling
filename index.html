@@ -5420,6 +5420,35 @@ function renderRosteredShiftsGrid(){
   return html;
 }
 
+// Total expected PHYSICAL headcount across the whole centre, bucketed into 15-min intervals across
+// the afternoon (Sept 2026, per Allie: "one more section that shows me the number of kids expected
+// in the centre split into 15 min intervals"). A staffing-planning view, not a live board — like
+// Regular rostered shifts and Pod seating above, each weekday uses its own next upcoming occurrence
+// (nextRegularOccurrence) so it always reflects the CURRENT standing pattern regardless of what day
+// it actually is right now, and every non-cancelled session that weekday overlapping a given 15-min
+// slot counts toward it — Online sessions are deliberately excluded, since this is specifically about
+// who's physically walking in the door (not the day's total enrolment; Online already has its own
+// occupancy badges elsewhere).
+function renderExpectedHeadcountGrid(){
+  const slots=[];
+  for(let t=CENTER_OPEN; t<CENTER_CLOSE; t+=15) slots.push(t);
+  let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Day</th>'
+    + slots.map(function(t){ return '<th>'+minToLabel(t)+'</th>'; }).join('')
+    + '</tr>';
+  WEEKDAY_KEYS.forEach(function(wd){
+    const dateKey=toKey(nextRegularOccurrence(wd));
+    const dayList=scheduleListForDay(dateKey).filter(function(s){ return !s.online; });
+    html+='<tr><td><b>'+wd+'</b></td>';
+    slots.forEach(function(t){
+      const count=dayList.filter(function(s){ return s.start<t+15 && t<s.start+s.duration; }).length;
+      html+='<td class="'+(count===0?'muted':'')+'" style="text-align:center">'+count+'</td>';
+    });
+    html+='</tr>';
+  });
+  html+='</table></div>';
+  return html;
+}
+
 // Per-Pod cards for the day the Schedule section is showing — capacity, who's covering it, and the
 // actual seated roster, all together (brought back Sept 2026, per Allie: "we need to bring back
 // the pod-based scheduling" — this had briefly been split into a compact badge/pill strip plus one
@@ -6222,6 +6251,11 @@ function renderStaff(){
     html+=sectionOpen('rosteredShifts','Regular rostered shifts')
       +'<p class="small muted">The standing weekly pattern, ignoring any one-off swap or single-day change — click a cell to make an ongoing change (same editor as the "Assign" button below), effective from whichever date you choose.</p>'
       +renderRosteredShiftsGrid()
+      +'</div>';
+
+    html+=sectionOpen('expectedHeadcount','Expected headcount')
+      +'<p class="small muted">How many kids are expected to physically be in the centre, in 15-min slots across the afternoon — the standing weekly pattern, same as Regular rostered shifts above. Online sessions aren\'t counted here.</p>'
+      +renderExpectedHeadcountGrid()
       +'</div>';
 
     html+=renderWaitlistPanel();
