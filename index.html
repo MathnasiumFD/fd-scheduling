@@ -8560,6 +8560,34 @@ function renderHoldRequestModal(){
   +'</div></div></div>';
   return html;
 }
+// Read-only preview of a student's own upcoming scheduled sessions — same row style (date chip,
+// time, Pod/instructor, type badge) as the parent's main "Upcoming sessions" list on their dashboard,
+// just without the Cancel button or the view-all toggle, since this is only ever shown as reference
+// context inside another form, never as the place to act on a session directly. Sept 2026, per
+// Allie: "as a parent when making changes to permanent schedule, i need it to also display their
+// current [scheduled] attendances, just like front view [i.e. the parent's own dashboard] staff
+// [sees]" — parents previously only saw a terse "Currently: Mon 900, Wed 900" pattern summary here,
+// not the actual dated sessions on the books.
+function renderUpcomingSessionsPreview(studentId){
+  const upcoming=sessions.filter(function(s){ return s.studentId===studentId && s.status==='scheduled' && toKey(s.date)>=toKey(simNow()); })
+    .sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)) || a.start-b.start; });
+  let html='<div class="section-label">Upcoming sessions</div>';
+  if(upcoming.length===0){ html+='<div class="empty-note">No upcoming sessions scheduled.</div>'; return html; }
+  const shown=upcoming.slice(0,8);
+  html+='<div class="session-list">'+shown.map(function(s){
+    const pod=findPod(s.podId);
+    const instr=s.instructorId? findInstructor(s.instructorId) : null;
+    const isMakeUp=credits.some(function(c){ return c.redeemedSessionId===s.id; });
+    const typeBadge=s.termBreak? '<span class="badge soon">Summer</span>' : (s.recurring? '<span class="badge booked">Regular</span>' : (isMakeUp? '<span class="badge available">Make-Up</span>' : '<span class="badge soon">One-off</span>'));
+    return '<div class="session-row">'
+      +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
+      +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(s.online?'Online':(pod?pod.name:'—'))+' · '+(instr?instr.name:'Unassigned')+'</div></div>'
+      +typeBadge
+    +'</div>';
+  }).join('')+'</div>';
+  if(upcoming.length>shown.length) html+='<div class="small muted" style="margin-top:4px">+'+(upcoming.length-shown.length)+' more upcoming session'+(upcoming.length-shown.length===1?'':'s')+' not shown here.</div>';
+  return html;
+}
 function renderTimeChangeRequestModal(){
   const f=state.timeChangeRequestForm;
   if(!f) return '';
@@ -8577,6 +8605,9 @@ function renderTimeChangeRequestModal(){
   html+='<div class="small muted" style="margin-bottom:12px"><b>Currently:</b> '
     +(f.currentRecurring.length? f.currentRecurring.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ') : 'no regular schedule on file')
   +'</div>';
+  // The actual dated sessions on the books, not just the recurring pattern — see
+  // renderUpcomingSessionsPreview (Sept 2026, per Allie).
+  html+=renderUpcomingSessionsPreview(f.studentId);
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   // The time dropdown itself is filtered to only genuinely-open times per day (Sept 2026, per
   // Allie: "Only available session times will be shown") rather than showing every time slot with a
@@ -8780,12 +8811,31 @@ function showLoginScreen(errorMsg){
     +'<h2>Sign in</h2>'
     +(errorMsg? '<div class="banner danger">'+errorMsg+'</div>' : '')
     +'<label>Email</label><input id="loginEmail" type="email" autocomplete="username" />'
-    +'<label>Password</label><input id="loginPassword" type="password" autocomplete="current-password" />'
+    +'<label>Password</label>'
+    +'<div style="position:relative">'
+      +'<input id="loginPassword" type="password" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding-right:40px"/>'
+      +'<button type="button" id="loginPwToggle" onclick="toggleLoginPasswordVisibility()" aria-label="Show password" title="Show password" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;padding:4px;font-size:16px;line-height:1">👁</button>'
+    +'</div>'
     +'<button class="btn" onclick="doLogin()">Sign in</button>'
     +'<p style="text-align:center;margin-top:12px"><a href="#" onclick="showForgotPasswordScreen();return false;" class="small">Forgot password?</a></p>'
     +'</div></div>';
   const pw=document.getElementById('loginPassword');
   if(pw) pw.addEventListener('keydown', function(e){ if(e.key==='Enter') doLogin(); });
+}
+
+// Lets someone see exactly what's actually in the password field before submitting — added Sept
+// 2026 alongside the "invalid login details" investigation, since the most likely cause turned out
+// to be Chrome autofill silently filling in a stale saved password: it looks right (dots, right
+// length) but isn't, and there was previously no way to check without retyping blind.
+function toggleLoginPasswordVisibility(){
+  const pw=document.getElementById('loginPassword');
+  const btn=document.getElementById('loginPwToggle');
+  if(!pw || !btn) return;
+  const showing = pw.type==='text';
+  pw.type = showing ? 'password' : 'text';
+  btn.textContent = showing ? '👁' : '🚫';
+  btn.title = showing ? 'Show password' : 'Hide password';
+  btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
 }
 
 function doLogin(){
