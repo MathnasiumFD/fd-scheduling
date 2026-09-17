@@ -353,6 +353,13 @@ var CENTER_CLOSE=1140; // 7:00pm
 var SHIFT_WAIT_TOLERANCE=15; // minutes a student may wait for their instructor to arrive
 var MIN_SHIFT_MINUTES=120;   // minimum shift length (2 hours)
 var INSTRUCTOR_OVERLOAD_TOLERANCE_MIN=10; // minutes an instructor may briefly run over the 1:8 ratio by one kid, to help a departing kid pack up while a new one settles in
+// A brief lull in demand at a given instructor level (e.g. a dip from 5 needed down to 2, then back
+// up to 5 twenty minutes later) isn't worth sending an instructor home and calling a new one back in
+// for — bridge gaps this short into one continuous run BEFORE padding to MIN_SHIFT_MINUTES, so two
+// short bursts sitting close together don't each get padded toward each other and merge into one
+// shift stretching all the way to close (Sept 2026, per Allie, re: a Tuesday 5-5:30pm dip that made
+// three different instructor levels all display as "3:45pm-7pm" instead of their real, shorter needs).
+var SHORT_GAP_MERGE_MINUTES=30;
 // Same-day make-up cutoff (5.7): a parent can't request a make-up for today once it's past
 // 10:00am — after that, today drops out of the picker entirely and the earliest offered slot is
 // tomorrow. Measured against the real wall-clock time of day (like the checked-in countdown,
@@ -5528,24 +5535,36 @@ function suggestedShiftsForWeekday(wd){
   const peak=Math.max.apply(null, required.concat([0]));
   const shifts=[];
   for(let level=1; level<=peak; level++){
-    const raw=[];
+    // First pass: every maximal raw (unpadded) run of slots at this level — this run covers slot
+    // indices [i, j-1], i.e. minutes slots[i] through slots[j-1]+15.
+    const runs=[];
     let i=0;
     while(i<slots.length){
       if(required[i]<level){ i++; continue; }
       let j=i;
       while(j<slots.length && required[j]>=level) j++;
-      // This run covers slot indices [i, j-1] — minutes slots[i] through slots[j-1]+15.
-      const rawStart=slots[i], rawEnd=slots[j-1]+15;
-      const openingRun = level===1 && rawStart===CENTER_OPEN;
-      let start=openingRun? CENTER_OPEN : rawStart+SHIFT_WAIT_TOLERANCE;
-      let end=rawEnd;
+      runs.push({rawStart:slots[i], rawEnd:slots[j-1]+15});
+      i=j;
+    }
+    // Bridge short gaps between consecutive raw runs BEFORE padding (see SHORT_GAP_MERGE_MINUTES) —
+    // otherwise two nearby short bursts can each get padded toward each other and merge into one
+    // shift spanning the whole gap plus both paddings, stretching much further than either needed.
+    const bridged=[];
+    runs.forEach(function(r){
+      const last=bridged.length? bridged[bridged.length-1] : null;
+      if(last && r.rawStart-last.rawEnd<=SHORT_GAP_MERGE_MINUTES) last.rawEnd=r.rawEnd;
+      else bridged.push({rawStart:r.rawStart, rawEnd:r.rawEnd});
+    });
+    const raw=bridged.map(function(r){
+      const openingRun = level===1 && r.rawStart===CENTER_OPEN;
+      let start=openingRun? CENTER_OPEN : r.rawStart+SHIFT_WAIT_TOLERANCE;
+      let end=r.rawEnd;
       if(end-start<MIN_SHIFT_MINUTES){
         end=start+MIN_SHIFT_MINUTES;
         if(end>CENTER_CLOSE){ end=CENTER_CLOSE; start=end-MIN_SHIFT_MINUTES; }
       }
-      raw.push({start:start, end:end});
-      i=j;
-    }
+      return {start:start, end:end};
+    });
     mergeOverlapping(raw).forEach(function(m){ shifts.push({level:level, start:m.start, end:m.end}); });
   }
   shifts.sort(function(a,b){ return a.start-b.start || a.end-b.end; });
@@ -6405,7 +6424,7 @@ function renderStaff(){
       +'</div>';
 
     html+=sectionOpen('suggestedShifts','Suggested shift durations')
-      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. Someone must be in the centre from 3pm regardless of bookings; after that, a student may wait up to 15 minutes for their instructor, an instructor may briefly run over the ratio by one kid for up to 10 minutes to help a departing kid pack up, and every shift stays at least 2 hours.</p>'
+      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. Someone must be in the centre from 3pm regardless of bookings; after that, a student may wait up to 15 minutes for their instructor, an instructor may briefly run over the ratio by one kid for up to 10 minutes to help a departing kid pack up, every shift stays at least 2 hours, and a lull of 30 minutes or less doesn\'t split a shift in two.</p>'
       +renderSuggestedShiftsGrid()
       +'</div>';
 
