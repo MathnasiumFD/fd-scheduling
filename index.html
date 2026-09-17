@@ -354,12 +354,16 @@ var SHIFT_WAIT_TOLERANCE=15; // minutes a student may wait for their instructor 
 var MIN_SHIFT_MINUTES=120;   // minimum shift length (2 hours)
 var INSTRUCTOR_OVERLOAD_TOLERANCE_MIN=10; // minutes an instructor may briefly run over the 1:8 ratio by one kid, to help a departing kid pack up while a new one settles in
 // A brief lull in demand at a given instructor level (e.g. a dip from 5 needed down to 2, then back
-// up to 5 twenty minutes later) isn't worth sending an instructor home and calling a new one back in
-// for — bridge gaps this short into one continuous run BEFORE padding to MIN_SHIFT_MINUTES, so two
-// short bursts sitting close together don't each get padded toward each other and merge into one
-// shift stretching all the way to close (Sept 2026, per Allie, re: a Tuesday 5-5:30pm dip that made
-// three different instructor levels all display as "3:45pm-7pm" instead of their real, shorter needs).
-var SHORT_GAP_MERGE_MINUTES=30;
+// up to 5 shortly after) isn't worth sending an instructor home and calling a new one back in for —
+// bridge gaps this short into one continuous run BEFORE padding to MIN_SHIFT_MINUTES, so two short
+// bursts sitting close together don't each get padded toward each other and merge into one shift
+// stretching all the way to close (Sept 2026, per Allie, re: a Tuesday 5-5:30pm dip that made three
+// different instructor levels all display as "3:45pm-7pm" instead of their real, shorter needs).
+// Raised from 30 to 60 minutes (Sept 2026, per Allie: "cant you change it to be more efficient?") —
+// every extra instructor level that DOESN'T bridge gets its own fresh MIN_SHIFT_MINUTES floor, so the
+// wider this is, the fewer separate 2-hour commitments the suggestion piles up; the tradeoff is more
+// built-in idle time within a bridged shift during the lull itself.
+var SHORT_GAP_MERGE_MINUTES=60;
 // Same-day make-up cutoff (5.7): a parent can't request a make-up for today once it's past
 // 10:00am — after that, today drops out of the picker entirely and the earliest offered slot is
 // tomorrow. Measured against the real wall-clock time of day (like the checked-in countdown,
@@ -2879,14 +2883,30 @@ function setBookingLocation(v){ state.bookingForm.location=v; state.bookingForm.
 function toggleOverride(){ state.bookingForm.overrideOk=!state.bookingForm.overrideOk; render(); }
 
 // Applies the "they're here right now" quick check-in to a session that confirmBooking() just
-// created, returning a note to tack onto the usual booking toast. Only ever invoked for a same-day
-// booking (see the checkInNow guard in confirmBooking()) — arrival defaults to the same "nearest
-// 5-minute mark, capped 3 minutes ahead" smart default the Check-in modal itself uses.
+// created, returning a note to tack onto the usual booking toast plus the check-in's own remote
+// write, deferred rather than fired here. Only ever invoked for a same-day booking (see the
+// checkInNow guard in confirmBooking()) — arrival defaults to the same "nearest 5-minute mark,
+// capped 3 minutes ahead" smart default the Check-in modal itself uses.
+// The write MUST be deferred and chained after the new session's own insert commits, the same way
+// redeemCreditForBooking() already is just below — firing it independently raced the insert (this
+// session's id doesn't exist in Postgres yet), so the check-in UPDATE could reach the server first,
+// match zero rows, and silently do nothing: the booking looked checked-in locally (and the toast said
+// so) but the student was never actually signed in on the server (Sept 2026, per Allie: "when booking
+// a session if i click the box that says student is already here, they are still not getting signed
+// in" — same class of race as the earlier make-up-credit bug).
 function checkInNewBookingNow(sess){
   const arrival=nearestOption(checkInArrivalOptions(sess), nowMinutesOfDay());
   const exitTime=autoExitTime(sess, arrival-sess.start);
-  applyCheckIn(sess, arrival, exitTime);
-  return ' Checked in immediately — running '+minToLabel(sess.actualStart)+'–'+minToLabel(sess.actualEnd)+'.';
+  const write=applyCheckIn(sess, arrival, exitTime, true);
+  return { msg:' Checked in immediately — running '+minToLabel(sess.actualStart)+'–'+minToLabel(sess.actualEnd)+'.', write:write };
+}
+// Runs a deferred remote write (see redeemCreditForBooking()/checkInNewBookingNow() above) only after
+// the promise it's chained onto resolved without error — and only if there IS one to run at all (the
+// ordinary case, where nothing needed deferring). Used to chain zero, one, or two dependent writes
+// (a redeemed credit, an immediate check-in, either, neither, or both) onto a session's own insert,
+// in order, so none of them can ever reach Postgres before the row they depend on exists.
+function chainAfterInsert(insertPromise, writeFn){
+  return insertPromise.then(function(r){ return (r && r.error) || !writeFn ? r : writeFn(); });
 }
 // Marks the credit a booking was made against as redeemed, once the session it's tied to actually
 // exists locally (mirrors what bookSlot() already does for the parent's own self-service flow) — a
@@ -2942,12 +2962,18 @@ function confirmBooking(){
     // independent, unordered requests could have the credit update reach Postgres first and fail
     // against a session row that doesn't exist yet (Sept 2026 fix).
     const redeemWrite=redeemCreditForBooking(creditId, newSess.id);
-    dbWrite('booking an online session'+(redeemWrite? ' and redeeming its make-up credit':''), function(){ return supabaseClient.from('sessions').insert({
-      id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:newSess.instructorId, instructor_id_2:null, handoff_min:null, online:true,
-      the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
-    }).then(function(r){ return (r.error || !redeemWrite)? r : redeemWrite(); }); });
+    const checkInResult=checkInNow? checkInNewBookingNow(newSess) : null;
+    dbWrite('booking an online session'+(redeemWrite? ' and redeeming its make-up credit':'')+(checkInResult? ' and checking in':''), function(){
+      let p=supabaseClient.from('sessions').insert({
+        id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:newSess.instructorId, instructor_id_2:null, handoff_min:null, online:true,
+        the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
+      });
+      p=chainAfterInsert(p, redeemWrite);
+      p=chainAfterInsert(p, checkInResult && checkInResult.write);
+      return p;
+    });
     let msg=(creditId? 'Make-up booked — ' : '')+student.name+' booked into Online — '+instr.name+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+'.';
-    if(checkInNow) msg+=checkInNewBookingNow(newSess);
+    if(checkInResult) msg+=checkInResult.msg;
     toast(msg);
     state.booking=null;
     render();
@@ -2961,12 +2987,18 @@ function confirmBooking(){
     sessions.push(newSess);
     // See the Online branch above for why this is chained rather than fired independently.
     const redeemWrite=redeemCreditForBooking(creditId, newSess.id);
-    dbWrite('booking an unassigned session'+(redeemWrite? ' and redeeming its make-up credit':''), function(){ return supabaseClient.from('sessions').insert({
-      id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:null, instructor_id_2:null, handoff_min:null,
-      the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
-    }).then(function(r){ return (r.error || !redeemWrite)? r : redeemWrite(); }); });
+    const checkInResult=checkInNow? checkInNewBookingNow(newSess) : null;
+    dbWrite('booking an unassigned session'+(redeemWrite? ' and redeeming its make-up credit':'')+(checkInResult? ' and checking in':''), function(){
+      let p=supabaseClient.from('sessions').insert({
+        id:newSess.id, student_id:newSess.studentId, pod_id:null, instructor_id:null, instructor_id_2:null, handoff_min:null,
+        the_date:toKey(newSess.date), start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
+      });
+      p=chainAfterInsert(p, redeemWrite);
+      p=chainAfterInsert(p, checkInResult && checkInResult.write);
+      return p;
+    });
     let msg=(creditId? 'Make-up booked — ' : '')+student.name+' booked '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+' — no Pod chosen, pick one any time from the Schedule list.';
-    if(checkInNow) msg+=checkInNewBookingNow(newSess);
+    if(checkInResult) msg+=checkInResult.msg;
     toast(msg);
     state.booking=null;
     render();
@@ -3003,17 +3035,23 @@ function confirmBooking(){
   sessions.push(newSess);
   // See the Online branch above for why this is chained rather than fired independently.
   const redeemWrite=redeemCreditForBooking(creditId, newSess.id);
-  dbWrite('booking a session'+(redeemWrite? ' and redeeming its make-up credit':''), function(){ return supabaseClient.from('sessions').insert({
-    id:newSess.id, student_id:newSess.studentId, pod_id:newSess.podId, instructor_id:newSess.instructorId,
-    instructor_id_2:newSess.instructorId2, handoff_min:newSess.handoff, the_date:toKey(newSess.date),
-    start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
-  }).then(function(r){ return (r.error || !redeemWrite)? r : redeemWrite(); }); });
+  const checkInResult=checkInNow? checkInNewBookingNow(newSess) : null;
+  dbWrite('booking a session'+(redeemWrite? ' and redeeming its make-up credit':'')+(checkInResult? ' and checking in':''), function(){
+    let p=supabaseClient.from('sessions').insert({
+      id:newSess.id, student_id:newSess.studentId, pod_id:newSess.podId, instructor_id:newSess.instructorId,
+      instructor_id_2:newSess.instructorId2, handoff_min:newSess.handoff, the_date:toKey(newSess.date),
+      start_min:newSess.start, duration:newSess.duration, status:newSess.status, booked_by:newSess.bookedBy, credit_id:newSess.creditId
+    });
+    p=chainAfterInsert(p, redeemWrite);
+    p=chainAfterInsert(p, checkInResult && checkInResult.write);
+    return p;
+  });
   const handoffNote = cov.secondaryInstructorId? (' with a handoff to '+findInstructor(cov.secondaryInstructorId).name+' at '+minToLabel(cov.handoffAt)) : '';
   const withNote = cov.primaryInstructorId? (' with '+findInstructor(cov.primaryInstructorId).name) : '';
   const gapNote = (cov.gapMinutes>0 && cov.ok)? (' ('+cov.gapMinutes+' min unattended — within the '+UNATTENDED_TOLERANCE_MIN+'-min tolerance)') : '';
   const capacityNote = overCapacityToday? (' — over capacity ('+wouldBePeak+'/'+cap+'), allowed since it\'s today') : '';
   let msg=(creditId? 'Make-up booked — ' : '')+student.name+' booked into '+pod.name+withNote+', '+fmtShort(date)+' '+rangeLabel(f.start,f.duration)+handoffNote+gapNote+capacityNote+'.';
-  if(checkInNow) msg+=checkInNewBookingNow(newSess);
+  if(checkInResult) msg+=checkInResult.msg;
   toast(msg);
   state.booking=null;
   render();
@@ -3335,16 +3373,25 @@ function setCheckInExit(v){ state.checkIn.exitTime=Number(v); render(); }
 // option on a same-day booking (confirmBooking(), below) can apply the exact same effect — status,
 // actual start/end, checkInOffset, and the parent notification — without duplicating it (Sept 2026,
 // per Allie: "i need an option to add a student on a day when they show up unexpectedly").
-function applyCheckIn(sess, arrival, exitTime){
+// deferWrite (Sept 2026, per the checkInNewBookingNow() fix above): when true, local state is still
+// applied immediately as always, but the remote write is NOT fired here — it's handed back for the
+// caller to chain onto something else first (a new session's own insert, so the UPDATE can never
+// reach Postgres before the row it's matching against exists). Every other, pre-existing caller
+// (confirmCheckIn — the session it's checking in already exists on the server) leaves this off and
+// keeps firing immediately, exactly as before.
+function applyCheckIn(sess, arrival, exitTime, deferWrite){
   const offset=arrival-sess.start;
   sess.checkInOffset=offset;
   sess.actualStart=arrival;
   sess.actualEnd=exitTime;
   sess.status='attended';
-  dbWrite('checking in', function(){ return supabaseClient.from('sessions').update({
-    check_in_offset:sess.checkInOffset, actual_start_min:sess.actualStart, actual_end_min:sess.actualEnd, status:sess.status
-  }).eq('id', sess.id); });
-  notifyParentOfCheckIn(sess.id, sess.actualStart, sess.actualEnd);
+  const write=function(){
+    return supabaseClient.from('sessions').update({
+      check_in_offset:sess.checkInOffset, actual_start_min:sess.actualStart, actual_end_min:sess.actualEnd, status:sess.status
+    }).eq('id', sess.id).then(function(r){ if(!r || !r.error) notifyParentOfCheckIn(sess.id, sess.actualStart, sess.actualEnd); return r; });
+  };
+  if(deferWrite) return write;
+  dbWrite('checking in', write);
   return offset;
 }
 function confirmCheckIn(){
@@ -6424,7 +6471,7 @@ function renderStaff(){
       +'</div>';
 
     html+=sectionOpen('suggestedShifts','Suggested shift durations')
-      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. Someone must be in the centre from 3pm regardless of bookings; after that, a student may wait up to 15 minutes for their instructor, an instructor may briefly run over the ratio by one kid for up to 10 minutes to help a departing kid pack up, every shift stays at least 2 hours, and a lull of 30 minutes or less doesn\'t split a shift in two.</p>'
+      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. Someone must be in the centre from 3pm regardless of bookings; after that, a student may wait up to 15 minutes for their instructor, an instructor may briefly run over the ratio by one kid for up to 10 minutes to help a departing kid pack up, every shift stays at least 2 hours, and a lull of an hour or less doesn\'t split a shift in two.</p>'
       +renderSuggestedShiftsGrid()
       +'</div>';
 
