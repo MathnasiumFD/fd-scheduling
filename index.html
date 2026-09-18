@@ -3309,9 +3309,20 @@ function renderCheckInSearchPanel(){
           const pod=findPod(s.podId);
           const where = s.online? ('Online'+(findInstructor(s.instructorId)? ' — '+findInstructor(s.instructorId).name : '')) : (pod? pod.name : 'Unassigned');
           const actionBadge = alreadyHere? '<span class="badge soon">Check out</span>' : '<span class="badge available">Check in</span>';
-          return '<button class="btn sm ghost" style="text-align:left;justify-content:flex-start;width:100%" onclick="selectCheckInSearchResult(\''+s.id+'\')">'
-            +'<b>'+r.name+'</b> · '+rangeLabel(s.start,s.duration)+' · '+where+' &nbsp; '+actionBadge
-          +'</button>';
+          // Marking someone absent only makes sense before they've actually arrived — once alreadyHere,
+          // the only sensible action left is checking them back out (Sept 2026, per Allie: buttons for
+          // "Issue Make-up Credit" and "Not in Today" right next to the check-in button in this same
+          // dropdown, same two actions the Schedule list's own row buttons already offer as
+          // Excused/No-show — see markStatus() — just reachable without leaving the search box).
+          const extraActions = alreadyHere? '' :
+            '<button class="btn sm ghost" title="They let us know in advance — issues a make-up credit" onclick="markStatus(\''+s.id+'\',\'excused\')">Issue Make-up Credit</button>'
+            +'<button class="btn sm danger" title="No word from them — no make-up credit" onclick="markStatus(\''+s.id+'\',\'no-show\')">Not in Today</button>';
+          return '<div style="display:flex;gap:4px;align-items:stretch">'
+            +'<button class="btn sm ghost" style="text-align:left;justify-content:flex-start;flex:1;min-width:0" onclick="selectCheckInSearchResult(\''+s.id+'\')">'
+              +'<b>'+r.name+'</b> · '+rangeLabel(s.start,s.duration)+' · '+where+' &nbsp; '+actionBadge
+            +'</button>'
+            +extraActions
+          +'</div>';
         }).join('')
         +'</div>';
     } else {
