@@ -5089,7 +5089,14 @@ function applyHold(student, start, end, note, grantMakeupCredits){
       // Named to this specific missed session's own date, not the hold's overall start–end range —
       // a hold that straddles a late-notice month and a well-notified one only issues credits for
       // sessions in the former, so the note should point at the actual session, not the whole hold.
-      const issued=simNow(), expiry=addMonths(issued,3);
+      // issuedDate is likewise the missed SESSION's own date, not simNow() (today, whenever the hold
+      // happens to get entered/approved) — same convention every other absence-driven credit already
+      // follows (closure cancellations and ordinary excused-absence credits, just above and below),
+      // so the Credits section lists it against when it was actually earned, not when it was
+      // processed (Sept 2026, per Allie: "when issuing makeup credits for hold periods with
+      // insufficient notice... i need it to be issued for the missed sessions, not for when they were
+      // put through").
+      const issued=s.date, expiry=addMonths(issued,3);
       const c={id:newId()||('c'+(nextCreditId++)), studentId:student.id, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:'Missed during a late-notice hold — session on '+fmtShort(s.date)};
       credits.push(c);
       madeUpCount++;
