@@ -1253,6 +1253,13 @@ var state={
   // lives on the Staff tab entirely). null until first touched, so it can default to today's own
   // weekday (see renderStaff()) without needing a value baked in here.
   podSeatingWeekday:null,
+  // "From" date for the Expected headcount grid (Sept 2026, per Allie: "in expected headcount, i
+  // need to be able to select a 'from' date") — null until first touched, defaulting to today via
+  // simNow() inside renderExpectedHeadcountGrid/nextRegularOccurrence, same null-until-touched
+  // pattern as podSeatingWeekday above. Lets Allie preview the standing pattern as it'll look
+  // starting from any future (or past) date, e.g. after a batch of schedule changes take effect
+  // next month, rather than only ever seeing each weekday's very next occurrence from today.
+  expectedHeadcountFromDate:null,
   parentLoggedIn:null,
   loginForm:{email:'', error:''},
   instructorLoggedIn:null,
@@ -4240,8 +4247,8 @@ function onlineSeatsAt(dateKey, weekday, blockStart, blockLen){
 // than the standing pattern actually is. There's now exactly one reference date per weekday — the
 // next real occurrence of it, skipping a closed day — so the grid always answers "what does a normal
 // Monday at 3pm look like", not "what does the Monday two Tuesdays from now happen to look like".
-function nextRegularOccurrence(weekday){
-  let d=nextDateForWeekday(simNow(), weekday);
+function nextRegularOccurrence(weekday, fromDate){
+  let d=nextDateForWeekday(fromDate||simNow(), weekday);
   while(closedDayFor(d)){ d=addDays(d,7); }
   return d;
 }
@@ -5528,16 +5535,26 @@ function renderRosteredShiftsGrid(){
 // slot counts toward it — Online sessions are deliberately excluded, since this is specifically about
 // who's physically walking in the door (not the day's total enrolment; Online already has its own
 // occupancy badges elsewhere).
+//
+// "From" date (Sept 2026, per Allie: "in expected headcount, i need to be able to select a 'from'
+// date") — state.expectedHeadcountFromDate, set via setExpectedHeadcountFromDate() from the date
+// input in this section's header (see renderStaff()). Each weekday's "next occurrence" is worked
+// out relative to THIS date instead of always today, so Allie can preview the standing pattern as
+// it'll look starting from any date she chooses — e.g. after a batch of schedule changes take
+// effect next month — not just whatever the very next week happens to show. Defaults to today
+// (null → simNow() inside nextRegularOccurrence) until the picker is first touched.
 function renderExpectedHeadcountGrid(){
+  const fromDate = state.expectedHeadcountFromDate? new Date(state.expectedHeadcountFromDate) : simNow();
   const slots=[];
   for(let t=CENTER_OPEN; t<CENTER_CLOSE; t+=15) slots.push(t);
   let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Day</th>'
     + slots.map(function(t){ return '<th>'+minToLabel(t)+'</th>'; }).join('')
     + '</tr>';
   WEEKDAY_KEYS.forEach(function(wd){
-    const dateKey=toKey(nextRegularOccurrence(wd));
+    const occurrence=nextRegularOccurrence(wd, fromDate);
+    const dateKey=toKey(occurrence);
     const dayList=scheduleListForDay(dateKey).filter(function(s){ return !s.online; });
-    html+='<tr><td><b>'+wd+'</b></td>';
+    html+='<tr><td><b>'+wd+'</b> <span class="small muted">'+occurrence.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></td>';
     slots.forEach(function(t){
       const count=dayList.filter(function(s){ return s.start<t+15 && t<s.start+s.duration; }).length;
       html+='<td class="'+(count===0?'muted':'')+'" style="text-align:center">'+count+'</td>';
@@ -5547,6 +5564,7 @@ function renderExpectedHeadcountGrid(){
   html+='</table></div>';
   return html;
 }
+function setExpectedHeadcountFromDate(value){ state.expectedHeadcountFromDate=value||null; render(); }
 
 // Suggested shift durations — NOT per Pod (Sept 2026, per Allie: "i dont want it to be matched per
 // pod, the instructors are very able to walk around, the main thing is maintaining the 1:8"). Works
@@ -6493,7 +6511,12 @@ function renderStaff(){
       +renderRosteredShiftsGrid()
       +'</div>';
 
-    html+=sectionOpen('expectedHeadcount','Expected headcount')
+    html+=sectionOpen('expectedHeadcount','Expected headcount',
+        '<div style="display:flex;gap:6px;align-items:center">'
+          +'<label class="small muted" style="margin:0">From</label>'
+          +'<input type="date" class="small" value="'+(state.expectedHeadcountFromDate||toKey(now))+'" onchange="setExpectedHeadcountFromDate(this.value)" title="Preview the standing pattern as it\'ll look starting from this date"/>'
+          +(state.expectedHeadcountFromDate? '<button class="btn sm" onclick="setExpectedHeadcountFromDate(null)">Today</button>' : '')
+        +'</div>')
       +'<p class="small muted">How many kids are expected to physically be in the centre, in 15-min slots across the afternoon — the standing weekly pattern, same as Regular rostered shifts above. Online sessions aren\'t counted here.</p>'
       +renderExpectedHeadcountGrid()
       +'</div>';
