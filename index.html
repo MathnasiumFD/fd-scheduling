@@ -8857,6 +8857,10 @@ function renderParent(){
 
   parent.studentIds.forEach(function(sid){
     const student=findStudent(sid);
+    // Belt-and-suspenders alongside the studentIds-resync fix in fetchStudentsGroup(): if this id
+    // still somehow doesn't resolve (a stale render mid-refresh, a genuinely removed student), skip
+    // just this card instead of crashing the whole parent view on the next line's student.name.
+    if(!student) return;
     const studentCredits=credits.filter(function(c){ return c.studentId===sid; })
       .sort(function(a,b){ return a.expiryDate-b.expiryDate; });
     const initials=student.name.split(' ').filter(Boolean).slice(0,2).map(function(w){ return w[0]; }).join('').toUpperCase();
@@ -9004,6 +9008,7 @@ function renderParentSummerTab(parent){
 
   parent.studentIds.forEach(function(sid){
     const student=findStudent(sid);
+    if(!student) return; // same defensive guard as renderParent() — see its own comment
     const total=studentTermBreakCredits(tb, sid);
     const remaining=studentTermBreakRemaining(tb, sid);
     const used=total-remaining;
@@ -9699,6 +9704,21 @@ function fetchStudentsGroup(){
         recurring: planChangeRecurRows.filter(function(rec){ return rec.plan_change_id===pc.id; }).map(function(rec){ return {weekday:rec.weekday, start:rec.start_min}; }),
       }; }),
     }; });
+    // parents[].studentIds is derived FROM students, not its own column — so it goes stale the
+    // instant students refreshes without parents also refreshing in the same batch, which is exactly
+    // what a targeted live-sync refresh does most of the time (editing/enrolling a student changes
+    // only the students table, not parents). Left unrepaired, a parent's studentIds could keep
+    // pointing at an id that's dropped out of the fresh `students` array, and renderParent()'s
+    // findStudent(sid) would come back undefined — crashing on the very next line reading .name
+    // ("Cannot read properties of undefined (reading 'name')", Sept 2026, Allie: this exact error at
+    // parent login). Recomputing it here, every time students loads, keeps it correct regardless of
+    // which groups were actually requested — no extra network call, since `parents` itself is
+    // already in memory; this just re-derives one field on it from the students array just fetched.
+    if(typeof parents!=='undefined' && parents && parents.length){
+      parents.forEach(function(p){
+        p.studentIds = students.filter(function(s){ return s.parentId===p.id; }).map(function(s){ return s.id; });
+      });
+    }
   });
 }
 
@@ -9845,7 +9865,18 @@ function loadDataGroups(groupIds){
   groupIds.forEach(function(g){ if(GROUP_LOADERS[g]) set[g]=true; });
   const tasks=[];
   if(set.students){
-    tasks.push(fetchStudentsGroup().then(function(){ return set.parents? fetchParentsGroup() : null; }));
+    // Sept 2026 fix: this used to read `set.parents` from INSIDE the .then() callback below, but
+    // `delete set.parents` on the very next line ran synchronously, immediately after — long before
+    // that callback ever actually fired (it only runs once fetchStudentsGroup()'s own fetch resolves,
+    // well after this line). So the callback always saw `set.parents` as already-deleted/undefined
+    // and fetchParentsGroup() silently never ran, in EVERY call — including the full-reload path at
+    // login — leaving `parents` permanently stuck at whatever it was before this bug shipped (its
+    // demo-seed/empty initial value on a fresh page load, since nothing else ever wrote to it). Root
+    // cause of "cannot read properties of undefined (reading 'name')" at parent login. Fixed by
+    // capturing the flag into a plain local boolean BEFORE deleting anything, so the callback reads
+    // a value that was safely captured at the right time instead of the mutated `set` object later.
+    const alsoParents=!!set.parents;
+    tasks.push(fetchStudentsGroup().then(function(){ return alsoParents? fetchParentsGroup() : null; }));
     delete set.students; delete set.parents;
   } else if(set.parents){
     tasks.push(fetchParentsGroup());
