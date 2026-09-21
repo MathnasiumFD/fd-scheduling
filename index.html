@@ -2387,6 +2387,16 @@ function joinWaitlistFromTimeChangeRequest(idx){
   state.timeChangeRequestForm=null;
   openParentWaitlistForm(studentId, slot.weekday, slot.start, currentSlot);
 }
+// The generic "can't find a day/time that works" entry point from inside the schedule-change form
+// itself (Sept 2026, per Allie — see renderTimeChangeRequestModal) — unlike
+// joinWaitlistFromTimeChangeRequest above, this isn't tied to any one row going full, so it opens
+// the waitlist form with no weekday/start/swap slot pre-filled; the parent picks those fresh.
+function openParentWaitlistFromTimeChangeRequest(){
+  const f=state.timeChangeRequestForm;
+  const studentId=f.studentId;
+  state.timeChangeRequestForm=null;
+  openParentWaitlistForm(studentId);
+}
 // Applies immediately — no front-desk approval step (Sept 2026, per Allie: "as a parent, they
 // should be able to change days and times permanently or one off without front desk permission").
 // Before this, submitting here only created a pending enrollment_requests row that front desk had
@@ -7895,19 +7905,27 @@ function renderRecurringPickers(slots, starts, setter, podSetter, originals){
 // changing the Day dropdown never silently strands the Time dropdown on a now-invalid value — the
 // per-row "Full right now" + join-waitlist affordance below the picker (in
 // renderTimeChangeRequestModal) covers that case instead.
-function renderTimeChangeRecurringPickers(slots, duration, year){
+// Each row states the change in plain "from X to Y" terms (Sept 2026, per Allie: "when booking a
+// permanent change to schedule ... I want it to state the child's regular attendance so it says
+// change from x day to y day") rather than leaving the parent to infer it from a bare day/time
+// picker. currentSlots is the frozen snapshot (f.currentRecurring) paired 1:1 by index with the
+// editable slots being picked here — see openTimeChangeRequestForm().
+function renderTimeChangeRecurringPickers(slots, currentSlots, duration, year){
   const allStarts=possibleStarts(duration);
   let html='';
   slots.forEach(function(s, idx){
     const openStarts=allStarts.filter(function(t){ return standingSlotHasAvailability(s.weekday, t, duration, year); });
     const starts = openStarts.indexOf(s.start)>=0 ? openStarts : openStarts.concat([s.start]).sort(function(a,b){ return a-b; });
-    html+='<div class="row2 recurring-row"><div><label>Day '+(idx+1)+'</label><select onchange="setTimeChangeRecurringSlot('+idx+',\'weekday\',this.value)">'
+    const current=currentSlots && currentSlots[idx];
+    html+='<div class="recurring-row-group" style="margin-bottom:10px">';
+    if(current) html+='<div class="small muted" style="margin-bottom:4px">Change <b>'+current.weekday+' '+minToLabel(current.start)+'</b> to:</div>';
+    html+='<div class="row2 recurring-row"><div><label>New day</label><select onchange="setTimeChangeRecurringSlot('+idx+',\'weekday\',this.value)">'
         +WEEKDAY_KEYS.map(function(d){ return '<option value="'+d+'"'+(d===s.weekday?' selected':'')+'>'+d+'</option>'; }).join('')
       +'</select></div>'
-      +'<div><label>Time</label><select onchange="setTimeChangeRecurringSlot('+idx+',\'start\',this.value)">'
+      +'<div><label>New time</label><select onchange="setTimeChangeRecurringSlot('+idx+',\'start\',this.value)">'
         +(starts.length? starts.map(function(t){ return '<option value="'+t+'"'+(t===s.start?' selected':'')+'>'+minToLabel(t)+(openStarts.indexOf(t)>=0?'':' (full)')+'</option>'; }).join('')
           : '<option value="'+s.start+'">No open times this day right now</option>')
-      +'</select></div></div>';
+      +'</select></div></div></div>';
   });
   return html;
 }
@@ -8856,7 +8874,6 @@ function renderParent(){
         +(openHoldCount>0? '<span class="small muted">'+openHoldCount+' hold request'+(openHoldCount===1?'':'s')+' pending</span>' : '')
         +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Change regular day/time</a>')
         +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>')
-        +'<a href="#" class="small" onclick="openParentWaitlistForm(\''+sid+'\');return false;">Join the waitlist for another day/time</a>'
       +'</div></div>';
 
     // -- This child's own waitlist entries (5.17, parent self-service Sept 2026) — a parent can see
@@ -9080,34 +9097,6 @@ function renderHoldRequestModal(){
   +'</div></div></div>';
   return html;
 }
-// Read-only preview of a student's own upcoming scheduled sessions — same row style (date chip,
-// time, Pod/instructor, type badge) as the parent's main "Upcoming sessions" list on their dashboard,
-// just without the Cancel button or the view-all toggle, since this is only ever shown as reference
-// context inside another form, never as the place to act on a session directly. Sept 2026, per
-// Allie: "as a parent when making changes to permanent schedule, i need it to also display their
-// current [scheduled] attendances, just like front view [i.e. the parent's own dashboard] staff
-// [sees]" — parents previously only saw a terse "Currently: Mon 900, Wed 900" pattern summary here,
-// not the actual dated sessions on the books.
-function renderUpcomingSessionsPreview(studentId){
-  const upcoming=sessions.filter(function(s){ return s.studentId===studentId && s.status==='scheduled' && toKey(s.date)>=toKey(simNow()); })
-    .sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)) || a.start-b.start; });
-  let html='<div class="section-label">Upcoming sessions</div>';
-  if(upcoming.length===0){ html+='<div class="empty-note">No upcoming sessions scheduled.</div>'; return html; }
-  const shown=upcoming.slice(0,8);
-  html+='<div class="session-list">'+shown.map(function(s){
-    const pod=findPod(s.podId);
-    const instr=s.instructorId? findInstructor(s.instructorId) : null;
-    const isMakeUp=credits.some(function(c){ return c.redeemedSessionId===s.id; });
-    const typeBadge=s.termBreak? '<span class="badge soon">Summer</span>' : (s.recurring? '<span class="badge booked">Regular</span>' : (isMakeUp? '<span class="badge available">Make-Up</span>' : '<span class="badge soon">One-off</span>'));
-    return '<div class="session-row">'
-      +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
-      +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(s.online?'Online':(pod?pod.name:'—'))+' · '+(instr?instr.name:'Unassigned')+'</div></div>'
-      +typeBadge
-    +'</div>';
-  }).join('')+'</div>';
-  if(upcoming.length>shown.length) html+='<div class="small muted" style="margin-top:4px">+'+(upcoming.length-shown.length)+' more upcoming session'+(upcoming.length-shown.length===1?'':'s')+' not shown here.</div>';
-  return html;
-}
 function renderTimeChangeRequestModal(){
   const f=state.timeChangeRequestForm;
   if(!f) return '';
@@ -9118,23 +9107,22 @@ function renderTimeChangeRequestModal(){
   // Sept 2026, per Allie's own wording for this box.
   html+='<p>Select the new regular day(s) and time(s) you would like. Only available session times will be shown.</p>'
     +'<p>Once confirmed, your new schedule will be updated automatically.</p>';
-  // Current schedule shown as its own, un-editable reference point (Sept 2026, per Allie: "it needs
-  // to show the current scheduled days and times, and allow for a parent to select when they would
-  // like to come in instead") — pulled from currentRecurring, a frozen snapshot taken when the form
-  // opened, so it keeps reading correctly even after the picker below has been changed.
-  html+='<div class="small muted" style="margin-bottom:12px"><b>Currently:</b> '
-    +(f.currentRecurring.length? f.currentRecurring.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ') : 'no regular schedule on file')
-  +'</div>';
-  // The actual dated sessions on the books, not just the recurring pattern — see
-  // renderUpcomingSessionsPreview (Sept 2026, per Allie).
-  html+=renderUpcomingSessionsPreview(f.studentId);
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  // States the child's regular attendance directly as a from/to change, per row (Sept 2026, per
+  // Allie: "i dont want a list of upcoming sessions, I want it to state the child's regular
+  // attendance so it says change from x day to y day") — replaces the earlier "Currently: ..."
+  // summary line plus a full list of dated upcoming sessions (task #204) with the plainer framing
+  // Allie actually asked for here. currentRecurring is the frozen snapshot taken when the form
+  // opened, paired 1:1 with the editable picker below.
+  if(!f.currentRecurring.length){
+    html+='<p class="small muted">No regular schedule on file yet — contact us if you\'d like to set one up.</p>';
+  }
   // The time dropdown itself is filtered to only genuinely-open times per day (Sept 2026, per
   // Allie: "Only available session times will be shown") rather than showing every time slot with a
   // badge after the fact. The one exception: whatever the parent currently has selected always stays
   // in the list even if it's since gone full, so the dropdown never silently discards their pick out
   // from under them — that case is instead flagged right below with a "Join waitlist" button.
-  html+=renderTimeChangeRecurringPickers(f.recurring, student.duration, student.year);
+  html+=renderTimeChangeRecurringPickers(f.recurring, f.currentRecurring, student.duration, student.year);
   html+='<div style="margin:-8px 0 14px">'+f.recurring.map(function(slot, idx){
     const available=standingSlotHasAvailability(slot.weekday, slot.start, student.duration, student.year);
     return available? '' : '<div class="small" style="margin-bottom:6px">'+slot.weekday+' '+minToLabel(slot.start)+' — '
@@ -9143,6 +9131,11 @@ function renderTimeChangeRequestModal(){
   }).join('')+'</div>';
   html+='<label>Effective from</label><input type="date" value="'+f.effectiveFrom+'" onchange="setTimeChangeRequestField(\'effectiveFrom\',this.value)"/>';
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. school sport moved to Tuesdays" value="'+f.note+'" oninput="setTimeChangeRequestField(\'note\',this.value)"/>';
+  // Folded in here rather than kept as its own separate button on the parent dashboard (Sept 2026,
+  // per Allie: "also join the waitlist needs to be embedded into change regular day/time, not out
+  // as it's own button") — a parent who can't find a day/time that works in the pickers above now
+  // starts a waitlist join from right here instead of a standalone dashboard link.
+  html+='<div style="margin-top:10px"><a href="#" class="small" onclick="openParentWaitlistFromTimeChangeRequest();return false;">Can\'t find a day/time that works? Join the waitlist instead</a></div>';
   html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeTimeChangeRequestForm()">Cancel</button>'
     +'<button class="btn primary" onclick="submitTimeChangeRequest()">Confirm change</button>'
