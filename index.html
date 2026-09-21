@@ -9471,24 +9471,51 @@ function logOut(){
 // is deliberately NOT re-run here — whichever tab actually made the change already ran it (and
 // persisted the result), so re-running it again on every other tab's every refresh would risk two
 // tabs racing to fill the same gap at once for no benefit.
+// Which in-memory "group" each realtime table feeds. A change to any ONE table only needs the
+// group(s) it belongs to re-fetched and re-applied — not the other ~14 groups' worth of tables,
+// which is what a bare loadAllData() re-run used to do on every single write anywhere (Sept 2026,
+// found while tracing a Supabase egress/fair-use warning: every open tab — staff, instructor, or
+// parent — was pulling the ENTIRE database on every write from ANYONE, plus again on an
+// unconditional 30s timer, compounding hard across concurrently-open tabs and growing history).
+var DATA_GROUP_TABLES={
+  instructors:['instructors','instructor_avail_rules','instructor_one_offs'],
+  pods:['pods','pod_shift_blocks','pod_shift_assignments','pod_shift_one_off_coverage'],
+  podDayOverrides:['pod_day_overrides'],
+  students:['students','student_recurring_slots','student_holds','student_pod_assignments','student_plan_changes','student_plan_change_recurring'],
+  parents:['parents'],
+  sessions:['sessions'],
+  credits:['credits'],
+  coverageRequests:['coverage_requests','coverage_request_notified_instructors'],
+  waitlist:['waitlist_entries'],
+  closedDays:['closed_days'],
+  enrollmentRequests:['enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring'],
+  staffMembers:['staff_members'],
+  staffRosteredShifts:['staff_rostered_shifts'],
+  staffAttendance:['staff_attendance'],
+  termBreaks:['term_breaks','term_break_coverage'],
+};
+var TABLE_TO_GROUP={};
+Object.keys(DATA_GROUP_TABLES).forEach(function(g){ DATA_GROUP_TABLES[g].forEach(function(t){ TABLE_TO_GROUP[t]=g; }); });
+var LIVE_SYNC_TABLES=Object.keys(TABLE_TO_GROUP);
+
 var liveSyncTimer=null;
-function scheduleLiveSync(){
+var pendingLiveSyncTables={};
+function scheduleLiveSync(tableName){
+  if(tableName) pendingLiveSyncTables[tableName]=true;
   if(liveSyncTimer) clearTimeout(liveSyncTimer);
   liveSyncTimer=setTimeout(function(){
     liveSyncTimer=null;
-    loadAllData().then(renderUnlessEditing).catch(function(err){ console.error('Live sync refresh failed', err); });
+    const tables=Object.keys(pendingLiveSyncTables);
+    pendingLiveSyncTables={};
+    const groups={};
+    tables.forEach(function(t){ const g=TABLE_TO_GROUP[t]; if(g) groups[g]=true; });
+    loadDataGroups(Object.keys(groups)).then(renderUnlessEditing).catch(function(err){ console.error('Live sync refresh failed', err); });
   }, 500);
 }
-var LIVE_SYNC_TABLES=['instructors','instructor_avail_rules','instructor_one_offs','pods','pod_shift_blocks',
-  'pod_shift_assignments','pod_shift_one_off_coverage','pod_day_overrides','students','student_recurring_slots','student_holds',
-  'student_pod_assignments','student_plan_changes','student_plan_change_recurring','parents','sessions',
-  'credits','coverage_requests','coverage_request_notified_instructors','waitlist_entries','closed_days',
-  'enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring','staff_members',
-  'staff_rostered_shifts','staff_attendance','term_breaks','term_break_coverage'];
 function subscribeToLiveUpdates(){
   let channel=supabaseClient.channel('live-updates');
   LIVE_SYNC_TABLES.forEach(function(t){
-    channel=channel.on('postgres_changes', {event:'*', schema:'public', table:t}, scheduleLiveSync);
+    channel=channel.on('postgres_changes', {event:'*', schema:'public', table:t}, function(){ scheduleLiveSync(t); });
   });
   // Logged rather than silent — Realtime depends on several things lining up (the table actually
   // being in the supabase_realtime publication, the project's Realtime feature, the connecting
@@ -9528,12 +9555,19 @@ function afterLogin(){
         // subscription below never actually connects (it depends on several things — the table
         // being in the right Supabase publication, project settings, permissions — that can silently
         // fail in ways invisible from here). Worst case with Realtime working, staff see each
-        // other's changes within about a second; worst case without it, within 30 seconds; either
+        // other's changes within about a second; worst case without it, within 3 minutes; either
         // way, never "not until someone reloads the page" again.
+        //
+        // Stretched from every 30s to every 3 minutes (Sept 2026, egress fix) — this is purely a
+        // fallback for the rare case Realtime isn't connected, and it was doing a FULL re-fetch of
+        // every table, unconditionally, per open tab, every 30 seconds, all day — one of the two
+        // biggest contributors (with the old whole-database live-sync refresh above) to a Supabase
+        // Fair Use Policy bandwidth warning. Realtime (subscribeToLiveUpdates below) is now the fast
+        // path for real changes; this timer only needs to be frequent enough to catch a missed push.
         setInterval(function(){
           loadAllData().then(function(){ applyPromotions(); applyPlanChanges(); autoCheckOutPastClose(); renderUnlessEditing(); })
             .catch(function(err){ console.error('Heartbeat refresh failed', err); });
-        }, 30000);
+        }, 180000);
         subscribeToLiveUpdates();
       }).catch(function(err){
         console.error(err);
@@ -9554,63 +9588,44 @@ function afterLogin(){
 // to their role) and reshapes it into the exact in-memory structures the rest of the app already
 // reads/writes — so every existing render/business-logic function keeps working completely
 // unchanged, whether its data came from the demo arrays or from a real database.
-function loadAllData(){
-  // Supabase/PostgREST silently caps a plain .select() at 1000 rows (its default page size) — with
-  // well over 1000 real session rows once a centre's been running a few months, a plain select()
-  // here was quietly loading only an arbitrary ~1000-row slice of the sessions table and treating
-  // that as the whole schedule. Every "session per student per day" dedup check downstream then
-  // saw a huge blind spot: a real, already-booked session that just didn't happen to be in that
-  // slice looked exactly like "nothing booked yet" and got a brand-new duplicate row inserted for
-  // it — on every single page load, forever, since the new duplicate had no better a chance of
-  // landing in the next arbitrary 1000-row slice either. That's what actually produced the tens of
-  // thousands of duplicate rows discovered Sept 2026 (see the one-time cleanup script), and why the
-  // schedule looked like it was silently rewriting itself. Paginate every table in full via .range()
-  // so this can never truncate silently again, no matter how large any of them grow.
+//
+// Restructured (Sept 2026, egress fix) into one small fetch-and-apply function per DATA_GROUP_TABLES
+// group above, so a targeted live-sync refresh can re-run just the 1-2 groups a given write actually
+// touched instead of always re-running every group. loadAllData() itself is unchanged in effect —
+// it's now just "run every group" — so the login/heartbeat full-reload path behaves exactly as
+// before, table-for-table and column-for-column.
+//
+// Supabase/PostgREST silently caps a plain .select() at 1000 rows (its default page size) — with
+// well over 1000 real session rows once a centre's been running a few months, a plain select()
+// here was quietly loading only an arbitrary ~1000-row slice of the sessions table and treating
+// that as the whole schedule. Every "session per student per day" dedup check downstream then
+// saw a huge blind spot: a real, already-booked session that just didn't happen to be in that
+// slice looked exactly like "nothing booked yet" and got a brand-new duplicate row inserted for
+// it — on every single page load, forever, since the new duplicate had no better a chance of
+// landing in the next arbitrary 1000-row slice either. That's what actually produced the tens of
+// thousands of duplicate rows discovered Sept 2026 (see the one-time cleanup script), and why the
+// schedule looked like it was silently rewriting itself. Paginate every table in full via .range()
+// so this can never truncate silently again, no matter how large any of them grow.
+function fetchTablePaginated(name, sel){
   const PAGE=1000;
-  const T=function(name, sel){
-    return (function fetchPage(from, acc){
-      return supabaseClient.from(name).select(sel).range(from, from+PAGE-1).then(function(r){
-        if(r.error) throw r.error;
-        const rows=r.data||[];
-        const all=acc.concat(rows);
-        if(rows.length<PAGE) return all; // last page — fewer than a full page means nothing left
-        return fetchPage(from+PAGE, all);
-      });
-    })(0, []);
-  };
-  return Promise.all([
-    T('instructors','id,name,email,year_min,year_max,auth_user_id,active,pack_up_custom_colors'),
-    T('instructor_avail_rules','instructor_id,weekday,effective_from,off,start_min,end_min'),
-    T('instructor_one_offs','instructor_id,the_date,off,start_min,end_min'),
-    T('pods','id,name,capacity'),
-    T('pod_shift_blocks','id,pod_id,weekday,start_min,end_min'),
-    T('pod_shift_assignments','block_id,instructor_id,effective_from'),
-    T('pod_shift_one_off_coverage','block_id,the_date,instructor_id'),
-    T('pod_day_overrides','id,pod_id,the_date,instructor_id,start_min,end_min'),
-    T('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date'),
-    T('student_recurring_slots','student_id,weekday,start_min'),
-    T('student_holds','id,student_id,start_date,end_date,note,credits_issued'),
-    T('student_pod_assignments','id,student_id,pod_id,effective_from,weekday,online,instructor_id'),
-    T('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
-    T('student_plan_change_recurring','plan_change_id,weekday,start_min'),
-    T('parents','id,name,email,auth_user_id'),
-    T('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break'),
-    T('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note'),
-    T('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
-    T('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
-    T('waitlist_entries','id,student_id,name,year,weekday,start_min,duration,swap_weekday,swap_start_min,note,status,notified,date_added'),
-    T('closed_days','id,the_date,label,recurring'),
-    T('enrollment_requests','id,student_id,type,start_date,end_date,effective_from,note,status,created_at'),
-    T('enrollment_request_recurring','id,request_id,weekday,start_min'),
-    T('enrollment_request_previous_recurring','id,request_id,weekday,start_min'),
-    T('staff_members','id,name,email,auth_user_id'),
-    T('staff_rostered_shifts','id,staff_id,weekday,start_min,end_min'),
-    T('staff_attendance','id,staff_id,instructor_id,the_date,check_in_min,check_out_min'),
-    T('term_breaks','id,label,start_date,end_date,morning_start,morning_end,visible_to_parents'),
-    T('term_break_coverage','term_break_id,pod_id,weekday,instructor_id'),
-  ]).then(function(t){
-    const [instrRows,availRows,oneOffRows,podRows,blockRows,assignRows,coverRows,dayOverrideRows,studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,parentRows,sessionRows,creditRows,covReqRows,covNotifRows,waitlistRows,closedDayRows,enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows,staffMemberRows,staffShiftRows,staffAttendanceRows,termBreakRows,termBreakCoverRows]=t;
+  return (function fetchPage(from, acc){
+    return supabaseClient.from(name).select(sel).range(from, from+PAGE-1).then(function(r){
+      if(r.error) throw r.error;
+      const rows=r.data||[];
+      const all=acc.concat(rows);
+      if(rows.length<PAGE) return all; // last page — fewer than a full page means nothing left
+      return fetchPage(from+PAGE, all);
+    });
+  })(0, []);
+}
 
+function fetchInstructorsGroup(){
+  return Promise.all([
+    fetchTablePaginated('instructors','id,name,email,year_min,year_max,auth_user_id,active,pack_up_custom_colors'),
+    fetchTablePaginated('instructor_avail_rules','instructor_id,weekday,effective_from,off,start_min,end_min'),
+    fetchTablePaginated('instructor_one_offs','instructor_id,the_date,off,start_min,end_min'),
+  ]).then(function(t){
+    const [instrRows,availRows,oneOffRows]=t;
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
       authUserId:r.auth_user_id, active: r.active!==false, packUpCustomColors: !!r.pack_up_custom_colors,
@@ -9621,7 +9636,17 @@ function loadAllData(){
         return {date:new Date(o.the_date), off:o.off, start:o.start_min, end:o.end_min};
       }),
     }; });
+  });
+}
 
+function fetchPodsGroup(){
+  return Promise.all([
+    fetchTablePaginated('pods','id,name,capacity'),
+    fetchTablePaginated('pod_shift_blocks','id,pod_id,weekday,start_min,end_min'),
+    fetchTablePaginated('pod_shift_assignments','block_id,instructor_id,effective_from'),
+    fetchTablePaginated('pod_shift_one_off_coverage','block_id,the_date,instructor_id'),
+  ]).then(function(t){
+    const [podRows,blockRows,assignRows,coverRows]=t;
     pods=podRows.map(function(r){ return {id:r.id, name:r.name, capacity:r.capacity}; });
 
     podSchedule={};
@@ -9638,11 +9663,27 @@ function loadAllData(){
       if(!podSchedule[b.pod_id][b.weekday]) podSchedule[b.pod_id][b.weekday]=[];
       podSchedule[b.pod_id][b.weekday].push(block);
     });
+  });
+}
 
+function fetchPodDayOverridesGroup(){
+  return fetchTablePaginated('pod_day_overrides','id,pod_id,the_date,instructor_id,start_min,end_min').then(function(dayOverrideRows){
     podDayOverrides=dayOverrideRows.map(function(r){
       return {id:r.id, podId:r.pod_id, date:new Date(r.the_date), instructorId:r.instructor_id, start:r.start_min, end:r.end_min};
     });
+  });
+}
 
+function fetchStudentsGroup(){
+  return Promise.all([
+    fetchTablePaginated('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date'),
+    fetchTablePaginated('student_recurring_slots','student_id,weekday,start_min'),
+    fetchTablePaginated('student_holds','id,student_id,start_date,end_date,note,credits_issued'),
+    fetchTablePaginated('student_pod_assignments','id,student_id,pod_id,effective_from,weekday,online,instructor_id'),
+    fetchTablePaginated('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
+    fetchTablePaginated('student_plan_change_recurring','plan_change_id,weekday,start_min'),
+  ]).then(function(t){
+    const [studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows]=t;
     students=studentRows.map(function(r){ return {
       id:r.id, parentId:r.parent_id, name:r.name, year:r.year, baseYear:r.base_year, yearBaseline:r.year_baseline,
       duration:r.duration, sessionsPerWeek:r.sessions_per_week, startDate: r.start_date? new Date(r.start_date) : null,
@@ -9654,40 +9695,78 @@ function loadAllData(){
         recurring: planChangeRecurRows.filter(function(rec){ return rec.plan_change_id===pc.id; }).map(function(rec){ return {weekday:rec.weekday, start:rec.start_min}; }),
       }; }),
     }; });
+  });
+}
 
+// Depends on `students` already being populated (fills each parent's studentIds from it), so
+// loadDataGroups() always runs the students group first and waits for it before running this one.
+function fetchParentsGroup(){
+  return fetchTablePaginated('parents','id,name,email,auth_user_id').then(function(parentRows){
     parents=parentRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, authUserId:r.auth_user_id,
       studentIds: students.filter(function(s){ return s.parentId===r.id; }).map(function(s){ return s.id; }),
     }; });
+  });
+}
 
+function fetchSessionsGroup(){
+  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break').then(function(sessionRows){
     sessions=sessionRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
       actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false,
       bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false, termBreak:r.term_break||false,
     }; });
+  });
+}
 
+function fetchCreditsGroup(){
+  return fetchTablePaginated('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note').then(function(creditRows){
     credits=creditRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, issuedDate:new Date(r.issued_date), expiryDate:new Date(r.expiry_date),
       status:r.status, redeemedSessionId:r.redeemed_session_id, warningSent:r.warning_sent, source:r.source, note:r.note||'',
     }; });
+  });
+}
 
+function fetchCoverageRequestsGroup(){
+  return Promise.all([
+    fetchTablePaginated('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
+    fetchTablePaginated('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
+  ]).then(function(t){
+    const [covReqRows,covNotifRows]=t;
     coverageRequests=covReqRows.map(function(r){ return {
       id:r.id, podId:r.pod_id, blockId:r.block_id, weekday:r.weekday, date:new Date(r.the_date), requestedBy:r.requested_by,
       note:r.note||'', status:r.status, filledBy:r.filled_by, managerNotified:r.manager_notified,
       notifiedInstructorIds: covNotifRows.filter(function(n){ return n.coverage_request_id===r.id; }).map(function(n){ return n.instructor_id; }),
     }; });
+  });
+}
 
+function fetchWaitlistGroup(){
+  return fetchTablePaginated('waitlist_entries','id,student_id,name,year,weekday,start_min,duration,swap_weekday,swap_start_min,note,status,notified,date_added').then(function(waitlistRows){
     waitlist=waitlistRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, name:r.name, year:r.year, weekday:r.weekday, start:r.start_min, duration:r.duration,
       swapWeekday:r.swap_weekday||null, swapStart: r.swap_start_min!=null? r.swap_start_min : null,
       note:r.note||'', dateAdded:new Date(r.date_added), notified:r.notified, status:r.status,
     }; });
+  });
+}
 
+function fetchClosedDaysGroup(){
+  return fetchTablePaginated('closed_days','id,the_date,label,recurring').then(function(closedDayRows){
     closedDays=closedDayRows.map(function(r){ return {
       id:r.id, date:new Date(r.the_date), label:r.label, recurring:r.recurring,
     }; });
+  });
+}
 
+function fetchTermBreaksGroup(){
+  return Promise.all([
+    fetchTablePaginated('term_breaks','id,label,start_date,end_date,morning_start,morning_end,visible_to_parents'),
+    fetchTablePaginated('term_break_coverage','term_break_id,pod_id,weekday,instructor_id'),
+  ]).then(function(t){
+    const [termBreakRows,termBreakCoverRows]=t;
     termBreaks=termBreakRows.map(function(r){
       const coverage={};
       termBreakCoverRows.filter(function(c){ return c.term_break_id===r.id; }).forEach(function(c){
@@ -9696,7 +9775,16 @@ function loadAllData(){
       });
       return {id:r.id, label:r.label, startDate:new Date(r.start_date), endDate:new Date(r.end_date), morningStart:r.morning_start, morningEnd:r.morning_end, visibleToParents:!!r.visible_to_parents, coverage:coverage};
     });
+  });
+}
 
+function fetchEnrollmentRequestsGroup(){
+  return Promise.all([
+    fetchTablePaginated('enrollment_requests','id,student_id,type,start_date,end_date,effective_from,note,status,created_at'),
+    fetchTablePaginated('enrollment_request_recurring','id,request_id,weekday,start_min'),
+    fetchTablePaginated('enrollment_request_previous_recurring','id,request_id,weekday,start_min'),
+  ]).then(function(t){
+    const [enrollRequestRows,enrollRequestRecurRows,enrollRequestPrevRecurRows]=t;
     enrollmentRequests=enrollRequestRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, type:r.type,
       start: r.start_date? new Date(r.start_date) : null,
@@ -9708,19 +9796,63 @@ function loadAllData(){
         .map(function(rr){ return {weekday:rr.weekday, start:rr.start_min}; }),
       note:r.note||'', status:r.status, createdAt:new Date(r.created_at),
     }; });
+  });
+}
 
+function fetchStaffMembersGroup(){
+  return fetchTablePaginated('staff_members','id,name,email,auth_user_id').then(function(staffMemberRows){
     staffMembers=staffMemberRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, authUserId:r.auth_user_id,
     }; });
+  });
+}
 
+function fetchStaffRosteredShiftsGroup(){
+  return fetchTablePaginated('staff_rostered_shifts','id,staff_id,weekday,start_min,end_min').then(function(staffShiftRows){
     staffRosteredShifts=staffShiftRows.map(function(r){ return {
       id:r.id, staffId:r.staff_id, weekday:r.weekday, start:r.start_min, end:r.end_min,
     }; });
+  });
+}
 
+function fetchStaffAttendanceGroup(){
+  return fetchTablePaginated('staff_attendance','id,staff_id,instructor_id,the_date,check_in_min,check_out_min').then(function(staffAttendanceRows){
     staffAttendance=staffAttendanceRows.map(function(r){ return {
       id:r.id, staffId:r.staff_id, instructorId:r.instructor_id, date:new Date(r.the_date), checkIn:r.check_in_min, checkOut:r.check_out_min,
     }; });
   });
+}
+
+var GROUP_LOADERS={
+  instructors:fetchInstructorsGroup, pods:fetchPodsGroup, podDayOverrides:fetchPodDayOverridesGroup,
+  students:fetchStudentsGroup, parents:fetchParentsGroup, sessions:fetchSessionsGroup, credits:fetchCreditsGroup,
+  coverageRequests:fetchCoverageRequestsGroup, waitlist:fetchWaitlistGroup, closedDays:fetchClosedDaysGroup,
+  enrollmentRequests:fetchEnrollmentRequestsGroup, staffMembers:fetchStaffMembersGroup,
+  staffRosteredShifts:fetchStaffRosteredShiftsGroup, staffAttendance:fetchStaffAttendanceGroup, termBreaks:fetchTermBreaksGroup,
+};
+var ALL_DATA_GROUPS=Object.keys(DATA_GROUP_TABLES);
+
+// Fetches + applies only the requested groups (see DATA_GROUP_TABLES above). `students` and
+// `parents` are special-cased to run in that order, never in parallel, since parents' mapping
+// reads the just-built `students` array — every other requested group is independent and safe to
+// run alongside the rest at once.
+function loadDataGroups(groupIds){
+  const set={};
+  groupIds.forEach(function(g){ if(GROUP_LOADERS[g]) set[g]=true; });
+  const tasks=[];
+  if(set.students){
+    tasks.push(fetchStudentsGroup().then(function(){ return set.parents? fetchParentsGroup() : null; }));
+    delete set.students; delete set.parents;
+  } else if(set.parents){
+    tasks.push(fetchParentsGroup());
+    delete set.parents;
+  }
+  Object.keys(set).forEach(function(g){ tasks.push(GROUP_LOADERS[g]()); });
+  return Promise.all(tasks);
+}
+
+function loadAllData(){
+  return loadDataGroups(ALL_DATA_GROUPS);
 }
 
 if(supabaseClient){
