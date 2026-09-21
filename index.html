@@ -8546,6 +8546,11 @@ function renderInstructor(){
   const instrId = supabaseClient ? (currentUser && currentUser.instructorId) : state.instructorLoggedIn;
   if(!instrId) return supabaseClient? '<div class="card"><p class="small muted">Your login isn\'t linked to an instructor record — ask front desk to check your account.</p></div>' : renderInstructorLogin();
   const instr=findInstructor(instrId);
+  // Same class of bug as the parent-view guard just below (and #205/#206 before it) — instrId being
+  // SET doesn't guarantee it still matches a loaded instructor row (a stale/orphaned link, or one RLS
+  // is filtering out), which used to throw "Cannot read properties of undefined (reading 'name')" on
+  // the very next line. Sept 2026, added defensively after the same crash surfaced for a parent.
+  if(!instr) return '<div class="card"><p class="small muted">Your login isn\'t linked to an instructor record — ask front desk to check your account.</p></div>';
   let html='<div class="card"><div class="card-head"><h2>Welcome, '+instr.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'instructorLogout()')+'">Log out</button></div>'
     +'<p>Best suited for: <b>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</b> <span class="small muted">(a preference only — you can be assigned or booked for any year)</span></p>'
     +'<p>You can only see and manage your own availability — not other instructors\'.</p></div>';
@@ -8834,6 +8839,12 @@ function renderParent(){
   const parentId = supabaseClient ? (currentUser && currentUser.parentId) : state.parentLoggedIn;
   if(!parentId) return supabaseClient? '<div class="card"><p class="small muted">Your login isn\'t linked to a parent record — ask front desk to check your account.</p></div>' : renderParentLogin();
   const parent=parents.find(function(p){ return p.id===parentId; });
+  // Same class of bug as #205/#206 (parent login crashing on an unguarded lookup) — here it's the
+  // parent record itself: their login is linked to a parentId that doesn't match any row actually
+  // loaded into `parents` (a stale/orphaned link, or a row RLS is filtering out), which used to throw
+  // "Cannot read properties of undefined (reading 'name')" on the very next line and take down their
+  // whole view. Sept 2026, after Allie reported "loading data has failed" for a parent at login.
+  if(!parent) return '<div class="card"><p class="small muted">Your login isn\'t linked to a parent record — ask front desk to check your account.</p></div>';
   const tab=PARENT_TABS.some(function(t){ return t.id===state.parentTab; })? state.parentTab : 'home';
   let html=renderParentTabsBar(tab);
   if(tab==='summer'){ html+=renderParentSummerTab(parent); html+=renderTermBreakBookingModal(); html+=renderTermBreakRecurringModal(); return html; }
