@@ -2730,15 +2730,24 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
         if(dup.podId==null && !dup.online){
           const loc=resolveStandingLocation(student.id, weekday, dateKey, date, slot.start, student.duration, student.year);
           if(loc.podId || loc.online){
+            // Only staff logins (or offline/demo mode) may actually persist this self-heal —
+            // a parent or instructor login has no valid RLS write permission for this
+            // administrative correction (a parent's only matching UPDATE policy is cancel-only
+            // and its WITH CHECK rejects a write that doesn't set status='cancelled'; an
+            // instructor's policy can't match a session with no instructor assigned at all).
+            // The local in-memory fields below are still set unconditionally so that whichever
+            // role is viewing right now sees the corrected Pod/instructor immediately — only the
+            // actual server write is skipped for roles that can't legally make it.
+            const canPersist = !currentUser || currentUser.role==='staff';
             if(loc.online){
               dup.podId=null; dup.online=true; dup.instructorId=loc.instructorId; dup.instructorId2=null; dup.handoff=null;
-              dbWrite('filling a previously-unassigned standing session (Online)', function(){ return supabaseClient.from('sessions').update({
+              if(canPersist) dbWrite('filling a previously-unassigned standing session (Online)', function(){ return supabaseClient.from('sessions').update({
                 pod_id:null, online:true, instructor_id:dup.instructorId, instructor_id_2:null, handoff_min:null
               }).eq('id', dup.id); });
             } else {
               const cov=podCoverageDetail(loc.podId, weekday, slot.start, student.duration, date);
               dup.podId=loc.podId; dup.instructorId=cov.primaryInstructorId; dup.instructorId2=cov.secondaryInstructorId; dup.handoff=cov.handoffAt;
-              dbWrite('filling a previously-unassigned standing session', function(){ return supabaseClient.from('sessions').update({
+              if(canPersist) dbWrite('filling a previously-unassigned standing session', function(){ return supabaseClient.from('sessions').update({
                 pod_id:dup.podId, instructor_id:dup.instructorId, instructor_id_2:dup.instructorId2, handoff_min:dup.handoff
               }).eq('id', dup.id); });
             }
