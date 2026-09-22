@@ -2450,22 +2450,21 @@ function openTimeChangeRequestForm(studentId){
   state.timeChangeRequestForm={
     studentId, effectiveFrom:toKey(earliestTimeChangeDate()),
     currentRecurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
+    // Every regular slot the child has gets its own New day/New time picker, all showing at once
+    // (Sept 2026, per Allie: "I need to be able to swap both sessions (if they do 2 sessions) in
+    // one dialogue box as well" — a 2x/week family used to see only ONE row's picker at a time,
+    // picked from a "Select the day you wish to cancel" dropdown, with the other slot left
+    // untouched unless they came back and reopened the form for it. submitTimeChangeRequest()
+    // already compares each row to its currentRecurring counterpart and only re-validates/applies
+    // the ones that actually changed (task 240), so showing every row's picker here needed no
+    // change to the submit logic at all — only to what's rendered.
     recurring: hasCurrent? (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }) : blankRecurring,
-    // Which of the child's current regular slots the parent is changing right now (Sept 2026, per
-    // Allie: "Select the day you wish to cancel" — a dropdown listing the 1 or 2 days the child
-    // attends, so a parent picks ONE to change at a time rather than every row being editable at
-    // once). Defaults to the first (only) slot; a 2-slot child can switch which one the picker below
-    // targets via setTimeChangeSelectedSlot(). null when there's no CURRENT regular schedule to pick
-    // from — that dropdown wouldn't make sense with nothing to "cancel", so every blank row above
-    // shows its own picker at once instead (see renderTimeChangeRequestModal).
-    selectedSlotIdx: hasCurrent? 0 : null,
     note:'', error:''
   };
   render();
 }
 function closeTimeChangeRequestForm(){ state.timeChangeRequestForm=null; render(); }
 function setTimeChangeRequestField(field, value){ state.timeChangeRequestForm[field]=value; state.timeChangeRequestForm.error=''; render(); }
-function setTimeChangeSelectedSlot(idx){ state.timeChangeRequestForm.selectedSlotIdx=Number(idx); state.timeChangeRequestForm.error=''; render(); }
 function setTimeChangeRecurringSlot(idx, field, value){
   state.timeChangeRequestForm.recurring[idx][field] = field==='start'? Number(value) : value;
   state.timeChangeRequestForm.error='';
@@ -2519,6 +2518,19 @@ function submitTimeChangeRequest(){
   if(!f.recurring || f.recurring.length===0){ f.error='Add at least one day/time.'; render(); return; }
   const student=findStudent(f.studentId);
   const recurring=f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; });
+  // A student's plan only ever holds ONE slot per weekday — generateRecurringSessions() looks up a
+  // date's session via plan.recurring.find(r => r.weekday===weekday), so two rows landing on the
+  // same weekday would silently collapse to just the first one, quietly dropping a session the
+  // parent thinks they still have. Both rows now show their own picker at once (Sept 2026, per
+  // Allie: "swap both sessions ... in one dialogue box"), which makes it easy to point two rows at
+  // the same day by accident — block that outright rather than letting it through to vanish later.
+  const weekdayCounts={};
+  recurring.forEach(function(r){ weekdayCounts[r.weekday]=(weekdayCounts[r.weekday]||0)+1; });
+  const dupedWeekday=Object.keys(weekdayCounts).find(function(wd){ return weekdayCounts[wd]>1; });
+  if(dupedWeekday){
+    f.error='You\'ve picked '+dupedWeekday+' for more than one session — choose a different day for one of them.';
+    render(); return;
+  }
   // Every row a parent actually PICKED came from a dropdown already filtered to open times (see
   // renderTimeChangeRecurringPickers), so this is almost always true by construction for that row —
   // it's only false if a picked time went full in the moments between opening the form and hitting
@@ -2528,13 +2540,12 @@ function submitTimeChangeRequest(){
   // each full row already shows its own "Join waitlist" escape hatch above, so this should be rare.
   //
   // Only rows the parent actually CHANGED are checked (Sept 2026, per Allie: "One of your picked
-  // times just filled up (Fri 3:15pm) ... when I wasn't changing that day") — a 2-slot family only
-  // ever gets ONE row's picker open at a time (see "Select the day you wish to cancel" above), so the
-  // OTHER slot rides along in `recurring` completely unchanged from `currentRecurring`, identical
-  // weekday and start. That's a seat the family already holds, not a new claim on capacity, so it
-  // makes no sense to block the whole submission over its real-world fullness — a family keeping
-  // their existing Friday slot should never be told "Friday just filled up" when they never touched
-  // Friday. Only genuinely new picks (a row that differs from its original) need re-validating here.
+  // times just filled up (Fri 3:15pm) ... when I wasn't changing that day") — every row's picker
+  // shows at once now, but a row identical to its currentRecurring counterpart is still just the
+  // family keeping a seat they already hold, not a new claim on capacity, so it makes no sense to
+  // block the whole submission over its real-world fullness — a family keeping their existing Friday
+  // slot should never be told "Friday just filled up" when they never touched Friday. Only genuinely
+  // new picks (a row that differs from its original) need re-validating here.
   const stillFull=recurring.filter(function(r, idx){
     const orig=f.currentRecurring && f.currentRecurring[idx];
     if(orig && orig.weekday===r.weekday && orig.start===r.start) return false; // unchanged — already their seat, not a new claim
@@ -8089,10 +8100,12 @@ function renderTimeChangeRecurringPickers(slots, currentSlots, duration, year, o
   const allStarts=possibleStarts(duration);
   let html='';
   slots.forEach(function(s, idx){
-    // Restricted to the one slot picked from the "Select the day you wish to cancel" dropdown above
-    // (Sept 2026, per Allie) — a 2-slot child only sees one New day/New time picker at a time, not
-    // both rows editable simultaneously. onlyIdx is null/undefined for a caller that still wants
-    // every row (none currently does, but the parameter stays optional rather than required).
+    // onlyIdx used to restrict this to just the one slot picked from a "Select the day you wish to
+    // cancel" dropdown, showing one New day/New time picker at a time even for a 2-slot child. Per
+    // Allie (Sept 2026): "I need to be able to swap both sessions (if they do 2 sessions) in one
+    // dialogue box as well" — every caller now passes null (or omits it) so every row shows its own
+    // picker at once; the parameter stays around only in case a future caller ever wants the old
+    // single-row behaviour back.
     if(onlyIdx!=null && idx!==onlyIdx) return;
     const openStarts=allStarts.filter(function(t){ return standingSlotHasAvailability(s.weekday, t, duration, year); });
     const starts = openStarts.indexOf(s.start)>=0 ? openStarts : openStarts.concat([s.start]).sort(function(a,b){ return a-b; });
@@ -9316,23 +9329,19 @@ function renderTimeChangeRequestModal(){
   // opened, paired 1:1 with the editable picker below.
   if(!f.currentRecurring.length){
     html+='<p class="small muted">No regular schedule on file yet — pick the day'+(f.recurring.length>1?'s':'')+' and time'+(f.recurring.length>1?'s':'')+' that work best for '+(student.name||'them')+' below.</p>';
-  } else {
-    // "Select the day you wish to cancel" (Sept 2026, per Allie) — a dropdown listing the 1 or 2
-    // days/times the child currently attends, so a parent changes one at a time instead of every
-    // regular slot being editable at once. Picking a different option here just moves which row's
-    // New day/New time picker shows below; nothing is actually cancelled until Confirm is pressed.
-    html+='<label>Select the day you wish to cancel</label><select onchange="setTimeChangeSelectedSlot(this.value)">'
-      +f.currentRecurring.map(function(c, idx){ return '<option value="'+idx+'"'+(idx===f.selectedSlotIdx?' selected':'')+'>'+c.weekday+' '+minToLabel(c.start)+'</option>'; }).join('')
-      +'</select>';
   }
-  // The time dropdown itself is filtered to only genuinely-open times per day (Sept 2026, per
-  // Allie: "Only available session times will be shown") rather than showing every time slot with a
-  // badge after the fact. The one exception: whatever the parent currently has selected always stays
-  // in the list even if it's since gone full, so the dropdown never silently discards their pick out
-  // from under them — that case is instead flagged right below with a "Join waitlist" button.
-  html+=renderTimeChangeRecurringPickers(f.recurring, f.currentRecurring, student.duration, student.year, f.selectedSlotIdx);
+  // Every regular slot gets its own "New day"/"New time" picker, shown at once — a 2x/week family
+  // can change one, both, or neither in the same dialog and submit them together (Sept 2026, per
+  // Allie: "I need to be able to swap both sessions (if they do 2 sessions) in one dialogue box as
+  // well" — replaces the earlier "Select the day you wish to cancel" dropdown that only showed one
+  // row's picker at a time). The time dropdown itself is filtered to only genuinely-open times per
+  // day (Sept 2026, per Allie: "Only available session times will be shown") rather than showing
+  // every time slot with a badge after the fact. The one exception: whatever the parent currently
+  // has selected always stays in the list even if it's since gone full, so the dropdown never
+  // silently discards their pick out from under them — that case is instead flagged right below
+  // with a "Join waitlist" button.
+  html+=renderTimeChangeRecurringPickers(f.recurring, f.currentRecurring, student.duration, student.year, null);
   html+='<div style="margin:-8px 0 14px">'+f.recurring.map(function(slot, idx){
-    if(f.selectedSlotIdx!=null && idx!==f.selectedSlotIdx) return ''; // only the row currently showing its picker gets a "full" flag/waitlist link
     const available=standingSlotHasAvailability(slot.weekday, slot.start, student.duration, student.year);
     return available? '' : '<div class="small" style="margin-bottom:6px">'+slot.weekday+' '+minToLabel(slot.start)+' — '
       +'<span class="badge full">Full right now</span> <button class="btn sm ghost" style="margin-left:6px" onclick="joinWaitlistFromTimeChangeRequest('+idx+')">Join waitlist for this time</button>'
