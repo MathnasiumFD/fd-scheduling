@@ -2802,7 +2802,17 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
       if(deferredSessions){
         deferredSessions.push(recSess);
       } else {
-        dbWrite('pre-booking a standing session', function(){ return supabaseClient.from('sessions').insert({
+        // Staff/offline may always persist a brand-new standing session. A parent may too, but
+        // ONLY for their own child — regenerateAllRecurring() sweeps every student on every
+        // schedule change, so a parent's own submission can incidentally reach this branch for
+        // some other family's unrelated backlog gap; the matching RLS policy
+        // (parent_insert_own_children_standing_session) only allows a parent to write a
+        // standing session for their OWN child, so attempting the write for anyone else's would
+        // just fail with a 403 — skip it here instead, same pattern as the self-heal branch
+        // above. The local sessions.push() above still runs unconditionally so rendering stays
+        // correct regardless of whose session this is.
+        const canPersist = !currentUser || currentUser.role==='staff' || (currentUser.role==='parent' && student.parentId===currentUser.parentId);
+        if(canPersist) dbWrite('pre-booking a standing session', function(){ return supabaseClient.from('sessions').insert({
           id:recSess.id, student_id:recSess.studentId, pod_id:recSess.podId, online:recSess.online, instructor_id:recSess.instructorId,
           instructor_id_2:recSess.instructorId2, handoff_min:recSess.handoff,
           the_date:toKey(recSess.date), start_min:recSess.start, duration:recSess.duration, status:recSess.status,
