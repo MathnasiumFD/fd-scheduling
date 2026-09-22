@@ -516,6 +516,19 @@ var pods=[
 // physical Pod headcount stays capped at the Pod's normal capacity (unchanged), but their COMBINED
 // headcount (physical + online, at any one moment) may run up to this higher ratio.
 var ONLINE_COMBINED_CAP=9;
+// Per-instructor override (Sept 2026, per Allie: "set Allie capacity to be 1:5... code me as an
+// actual instructor with reduced ratio capacity") — almost every instructor uses the standard
+// ONLINE_COMBINED_CAP above, but an individual instructor can carry their own lower personal combined
+// cap instead (e.g. front-desk staff also covering a Pod, with less bandwidth left over to also mind
+// an Online group on the side). Set via instructor.combinedCapOverride (null/undefined = use the
+// standard cap) — editable per-instructor from the Edit Instructor form (see
+// renderEditInstructorModal/saveEditInstructor). This only ever affects the ONLINE+physical COMBINED
+// ratio; a Pod's own physical seat capacity (8) is a completely separate limit and is never touched
+// by this.
+function combinedCapFor(instructorId){
+  const instr=findInstructor(instructorId);
+  return (instr && instr.combinedCapOverride!=null)? instr.combinedCapOverride : ONLINE_COMBINED_CAP;
+}
 
 // Which instructor is assigned to run each Pod, and when — a weekly recurring pattern, just like
 // instructor availability. A Pod can have more than one shift block in a day (staff assign a
@@ -1604,7 +1617,7 @@ function instructorCombinedPeak(instructorId, dateKey, extra, excludeSessionId){
 // over the ratio? This is the one thing that can ever refuse an online assignment — online has no
 // Pod, so there's no separate capacity check the way a physical booking has.
 function instructorOnlineBlocked(instructorId, dateKey, start, duration, excludeSessionId){
-  return instructorCombinedPeak(instructorId, dateKey, {start:start, duration:duration}, excludeSessionId) > ONLINE_COMBINED_CAP;
+  return instructorCombinedPeak(instructorId, dateKey, {start:start, duration:duration}, excludeSessionId) > combinedCapFor(instructorId);
 }
 // Which instructors are actually on shift (covering some Pod, fully, per the same
 // UNATTENDED_TOLERANCE_MIN-tolerant rule as everywhere else) over this exact window — the only pool
@@ -1809,7 +1822,7 @@ function setSessionOnline(sessionId, instructorId){
   const dateKey=toKey(sess.date);
   if(instructorOnlineBlocked(instructorId, dateKey, sess.start, sess.duration, sess.id)){
     const peak=instructorCombinedPeak(instructorId, dateKey, {start:sess.start, duration:sess.duration}, sess.id);
-    return {ok:false, error:'Blocked — this would put '+instr.name+"'s Online group over the combined ratio ("+peak+'/'+ONLINE_COMBINED_CAP+').'};
+    return {ok:false, error:'Blocked — this would put '+instr.name+"'s Online group over the combined ratio ("+peak+'/'+combinedCapFor(instructorId)+').'};
   }
   const oldPod=sess.podId? findPod(sess.podId) : null;
   const wasOnline=sess.online;
@@ -2968,7 +2981,7 @@ function confirmBooking(){
     const instr=findInstructor(onlineInstructorId);
     if(instructorOnlineBlocked(onlineInstructorId, dateKey, f.start, f.duration)){
       const peak=instructorCombinedPeak(onlineInstructorId, dateKey, {start:f.start, duration:f.duration});
-      toast('Blocked — this would put '+instr.name+"'s Online group over the combined ratio ("+peak+'/'+ONLINE_COMBINED_CAP+').');
+      toast('Blocked — this would put '+instr.name+"'s Online group over the combined ratio ("+peak+'/'+combinedCapFor(onlineInstructorId)+').');
       return;
     }
     const newSess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId:null, instructorId:onlineInstructorId, instructorId2:null, handoff:null, online:true, date, start:f.start, duration:f.duration, status:'scheduled', bookedBy:'staff', creditId};
@@ -3525,8 +3538,9 @@ function renderMoveModal(){
     + (onlineChoices.length? ('<optgroup label="Online">'+onlineChoices.map(function(instr){
         const val='online:'+instr.id;
         const peak=instructorCombinedPeak(instr.id, dateKey, {start:sess.start, duration:sess.duration}, sess.id);
-        const full=peak>ONLINE_COMBINED_CAP;
-        return '<option value="'+val+'"'+(val===f.location?' selected':'')+(full?' disabled':'')+'>Online — '+instr.name+(full?' — full':' — '+peak+'/'+ONLINE_COMBINED_CAP+' after move')+'</option>';
+        const instrCap=combinedCapFor(instr.id);
+        const full=peak>instrCap;
+        return '<option value="'+val+'"'+(val===f.location?' selected':'')+(full?' disabled':'')+'>Online — '+instr.name+(full?' — full':' — '+peak+'/'+instrCap+' after move')+'</option>';
       }).join('')+'</optgroup>') : '')
   +'</select>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
@@ -4236,7 +4250,7 @@ function onlineSeatsAt(dateKey, weekday, blockStart, blockLen){
   let seats=0;
   instructorsOnShift(weekday, blockStart, blockLen, date).forEach(function(instr){
     const peak=instructorCombinedPeakInWindow(instr.id, dateKey, blockStart, blockStart+blockLen);
-    seats += Math.max(0, ONLINE_COMBINED_CAP-peak);
+    seats += Math.max(0, combinedCapFor(instr.id)-peak);
   });
   return seats;
 }
@@ -4906,7 +4920,7 @@ function saveNewInstructor(){
 // editing a parent or staff member.
 function openEditInstructorForm(instructorId){
   const instr=findInstructor(instructorId);
-  state.editInstructorForm={instructorId, name:instr.name, email:instr.email, yearMin:instr.yearMin, yearMax:instr.yearMax, packUpCustomColors:!!instr.packUpCustomColors, error:''};
+  state.editInstructorForm={instructorId, name:instr.name, email:instr.email, yearMin:instr.yearMin, yearMax:instr.yearMax, packUpCustomColors:!!instr.packUpCustomColors, combinedCapOverride: instr.combinedCapOverride!=null? String(instr.combinedCapOverride) : '', error:''};
   render();
 }
 function closeEditInstructorForm(){ state.editInstructorForm=null; render(); }
@@ -4919,13 +4933,22 @@ function saveEditInstructor(){
   const clash=instructors.find(function(i){ return i.id!==instr.id && i.email.toLowerCase()===f.email.trim().toLowerCase(); });
   if(clash){ f.error='Another instructor already uses that email.'; render(); return; }
   if(Number(f.yearMax)<Number(f.yearMin)){ f.error='"Best suited to" can\'t be earlier than "Best suited from".'; render(); return; }
+  // Personal combined online+physical ratio override (Sept 2026, per Allie: "set Allie capacity to
+  // be 1:5... code me as an actual instructor with reduced ratio capacity") — blank means "use the
+  // standard cap" (ONLINE_COMBINED_CAP); a value here must be a whole number of at least 1.
+  const capText=String(f.combinedCapOverride==null? '' : f.combinedCapOverride).trim();
+  if(capText!=='' && (!/^\d+$/.test(capText) || Number(capText)<1)){
+    f.error='Combined ratio override must be a whole number of 1 or more, or left blank.'; render(); return;
+  }
   instr.name=f.name.trim();
   instr.email=f.email.trim();
   instr.yearMin=Number(f.yearMin);
   instr.yearMax=Number(f.yearMax);
   instr.packUpCustomColors=!!f.packUpCustomColors;
+  instr.combinedCapOverride = capText===''? null : Number(capText);
   dbWrite('editing instructor details', function(){ return supabaseClient.from('instructors').update({
-    name:instr.name, email:instr.email, year_min:instr.yearMin, year_max:instr.yearMax, pack_up_custom_colors:instr.packUpCustomColors
+    name:instr.name, email:instr.email, year_min:instr.yearMin, year_max:instr.yearMax, pack_up_custom_colors:instr.packUpCustomColors,
+    combined_cap_override:instr.combinedCapOverride
   }).eq('id', instr.id); });
   toast(instr.name+'\'s details updated.');
   state.editInstructorForm=null;
@@ -4956,6 +4979,12 @@ function renderEditInstructorModal(){
   html+='<label style="display:flex;align-items:center;gap:8px;margin-top:10px">'
     +'<input type="checkbox" '+(f.packUpCustomColors?'checked':'')+' onchange="setEditInstructorField(\'packUpCustomColors\', this.checked)"/> '
     +'Custom pack-up countdown colours (orange at 15 min, red at 5 min, purple from 0)</label>';
+  // Personal combined online+physical ratio override (Sept 2026, per Allie) — almost everyone leaves
+  // this blank and uses the standard ratio (ONLINE_COMBINED_CAP); only affects how many kids this
+  // instructor's own Online group can combine with their physical Pod headcount to, never a Pod's
+  // own physical seat capacity.
+  html+='<label style="margin-top:10px">Combined online+physical ratio override <span class="small muted">(blank = standard ratio of 1:'+ONLINE_COMBINED_CAP+')</span></label>'
+    +'<input type="number" min="1" step="1" placeholder="'+ONLINE_COMBINED_CAP+'" value="'+f.combinedCapOverride+'" oninput="setEditInstructorField(\'combinedCapOverride\', this.value)" style="max-width:100px"/>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeEditInstructorForm()">Cancel</button>'
@@ -6180,10 +6209,11 @@ function renderPodSummaryStrip(dayKey, weekday){
   Object.keys(onlineByInstructor).forEach(function(instrId){
     const instr=findInstructor(instrId);
     if(!instr) return;
-    const occupancy=instructorOccupantCount(instrId, dayKey); // combined (physical + online) headcount actually sitting with this instructor — the number the 1:9 ratio caps
+    const occupancy=instructorOccupantCount(instrId, dayKey); // combined (physical + online) headcount actually sitting with this instructor — the number their own combined cap caps (combinedCapFor)
+    const instrCap=combinedCapFor(instrId);
     html+='<div class="card online" style="margin:0"><div class="card-head" style="flex-wrap:wrap;row-gap:6px">'
       +'<h3 style="margin:0">Online — '+instr.name+'</h3>'
-      +'<span class="badge '+(occupancy>=ONLINE_COMBINED_CAP?'full':'available')+'">'+occupancy+'/'+ONLINE_COMBINED_CAP+'</span>'
+      +'<span class="badge '+(occupancy>=instrCap?'full':'available')+'">'+occupancy+'/'+instrCap+'</span>'
     +'</div>'
     +rosterTableHtml(onlineByInstructor[instrId], weekday, dayKey, now)
     +'</div>';
@@ -7125,7 +7155,7 @@ function podOptionLabel(pod, weekday, dateKey, start, duration){
 // keeps an already-online session's own current slot from double-counting against itself.
 function onlineOptionLabel(instr, dateKey, start, duration, excludeSessionId){
   const peak=instructorCombinedPeak(instr.id, dateKey, {start:start, duration:duration}, excludeSessionId);
-  return 'Online — '+instr.name+' — '+peak+'/'+ONLINE_COMBINED_CAP;
+  return 'Online — '+instr.name+' — '+peak+'/'+combinedCapFor(instr.id);
 }
 // A session's current location, encoded as one value for a single Pod/Online <select>: a Pod's own
 // id, '' for unassigned, or 'online:<instructorId>' for an Online group — see setSessionLocation().
@@ -7165,7 +7195,7 @@ function renderBookingModal(){
   const end=f.start!=null? f.start+f.duration : null;
 
   const onlinePeak = (student && f.start!=null && onlineInstr)? instructorCombinedPeak(onlineInstr.id, b.dateKey, {start:f.start, duration:f.duration}) : 0;
-  const onlineOverCapacity = (student && f.start!=null && onlineInstr) && onlinePeak>ONLINE_COMBINED_CAP;
+  const onlineOverCapacity = (student && f.start!=null && onlineInstr) && onlinePeak>combinedCapFor(onlineInstr.id);
 
   let cov=null, instr1=null, suited1=true, totallyUnassigned=false, instr2=null, suited2=true;
   if(student && f.start!=null && pod){
@@ -7259,7 +7289,7 @@ function renderBookingModal(){
     html+='<div class="banner warn">⚠️ This puts '+pod.name+' over capacity ('+wouldBePeak+'/'+cap+') — allowed since it\'s today; you\'re looking at the real room, not a projection.</div>';
   }
   if(student && onlineInstr && onlineOverCapacity){
-    html+='<div class="banner danger">⛔ This would put '+onlineInstr.name+"'s Online group over the combined ratio ("+onlinePeak+'/'+ONLINE_COMBINED_CAP+') — not allowed, no override.</div>';
+    html+='<div class="banner danger">⛔ This would put '+onlineInstr.name+"'s Online group over the combined ratio ("+onlinePeak+'/'+combinedCapFor(onlineInstr.id)+') — not allowed, no override.</div>';
   }
   if(student && !pod && !isOnline){
     html+='<div class="banner info">ℹ️ No Pod chosen — this books '+student.name+' in, unassigned. Pick a Pod for them any time from the Schedule list.</div>';
@@ -9653,7 +9683,7 @@ function fetchTablePaginated(name, sel){
 
 function fetchInstructorsGroup(){
   return Promise.all([
-    fetchTablePaginated('instructors','id,name,email,year_min,year_max,auth_user_id,active,pack_up_custom_colors'),
+    fetchTablePaginated('instructors','id,name,email,year_min,year_max,auth_user_id,active,pack_up_custom_colors,combined_cap_override'),
     fetchTablePaginated('instructor_avail_rules','instructor_id,weekday,effective_from,off,start_min,end_min'),
     fetchTablePaginated('instructor_one_offs','instructor_id,the_date,off,start_min,end_min'),
   ]).then(function(t){
@@ -9661,6 +9691,7 @@ function fetchInstructorsGroup(){
     instructors=instrRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, yearMin:r.year_min, yearMax:r.year_max,
       authUserId:r.auth_user_id, active: r.active!==false, packUpCustomColors: !!r.pack_up_custom_colors,
+      combinedCapOverride: r.combined_cap_override==null? null : r.combined_cap_override,
       availRules: availRows.filter(function(a){ return a.instructor_id===r.id; }).map(function(a){
         return {weekday:a.weekday, effectiveFrom:new Date(a.effective_from), off:a.off, start:a.start_min, end:a.end_min};
       }),
