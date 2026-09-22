@@ -1986,7 +1986,22 @@ function standingSlotHasAvailability(weekday, start, duration, year){
   // coverage itself is a pure weekday+time pattern and never depended on the specific date, so this
   // only ever affected the capacity half of the check.
   const occurrence=nextRegularOccurrence(weekday, simNow());
-  return !!pickBestPod(weekday, toKey(occurrence), start, duration, year);
+  // Was: !!pickBestPod(...) — the same per-Pod check the real booking commit uses to choose ONE
+  // Pod, including its deliberate 1-seat/15-min overflow grace (task #68, for a real booking's tail
+  // overlap at pickup/dropoff). That grace has no business in a "should we tell a parent/front desk
+  // this is open" DECISION — it let this picker (and the "still open"/"(full)" flags, and the
+  // front-desk quick-approve check) disagree with the Availability Lookup table over the exact same
+  // day/time, which is never supposed to happen (Sept 2026, per Allie: "still letting me book in a
+  // kid at any time on any day ... can't it just run a check against availability table? cause i
+  // still don't think its right"). Worse, pickBestPod has NO idea that a currently-unassigned
+  // session (podId null — a kid squeezed in when every Pod was already full, or freed up by hand
+  // afterward, see generateRecurringSessions) is already occupying a real seat somewhere in the
+  // building; only openSeatsAt() reserves room for them (task #190, "unassigned kids must count
+  // towards availability"). Delegating to the exact same aggregate seats-open math the trusted
+  // Availability Lookup already uses — evaluated at this exact start/duration rather than the
+  // Lookup's own 30-min display columns — makes every "is this open" decision in the app agree with
+  // that one table, always.
+  return openSeatsAt(toKey(occurrence), weekday, start, '', duration).seats > 0;
 }
 
 function creditDisplayStatus(c){
