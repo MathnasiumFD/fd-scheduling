@@ -318,6 +318,21 @@ function earliestMonthNoticeDate(){
   while(daysUntil(now, monthStart) < MONTH_NOTICE_DAYS){ monthStart=new Date(monthStart.getFullYear(), monthStart.getMonth()+1, 1); }
   return monthStart;
 }
+// A permanent day/time change is a completely different kind of request from a hold or cancelling
+// enrolment (Sept 2026, per Allie: "the 1 week only applies to holds and cancellations, to change
+// days and times no notice required (other than 10am)") — it has no billing-cycle impact at all, so
+// none of MONTH_NOTICE_DAYS applies here. The only limit is same-day: once it's past this cutoff,
+// front desk and instructors have already planned around today's existing session list, so a change
+// can no longer take effect today — the earliest becomes tomorrow instead. Uses the real wall-clock
+// time of day (not simNow(), which only affects the simulated demo-clock DATE), same convention as
+// every other same-day cutoff in the app (e.g. checkInMaxArrival()).
+var TIME_CHANGE_SAME_DAY_CUTOFF_MIN=600; // 10:00am
+function earliestTimeChangeDate(){
+  return nowMinutesOfDay()<TIME_CHANGE_SAME_DAY_CUTOFF_MIN ? simNow() : addDays(simNow(), 1);
+}
+function timeChangeDateOk(date){
+  return toKey(date) >= toKey(earliestTimeChangeDate());
+}
 function sameDay(a,b){ return toKey(a)===toKey(b); }
 
 // Which "school-year cohort" a date belongs to, for automatic year promotion. Approximates the
@@ -2418,7 +2433,7 @@ function openTimeChangeRequestForm(studentId){
   // scheduled days and times, and allow for a parent to select when they would like to come in
   // instead").
   state.timeChangeRequestForm={
-    studentId, effectiveFrom:toKey(earliestMonthNoticeDate()),
+    studentId, effectiveFrom:toKey(earliestTimeChangeDate()),
     currentRecurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
     recurring: hasCurrent? (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }) : blankRecurring,
     // Which of the child's current regular slots the parent is changing right now (Sept 2026, per
@@ -2478,8 +2493,12 @@ function submitTimeChangeRequest(){
   const f=state.timeChangeRequestForm;
   if(!f.effectiveFrom){ f.error='Choose the date this should take effect from.'; render(); return; }
   const effectiveFrom=new Date(f.effectiveFrom);
-  if(!monthNoticeOk(effectiveFrom)){
-    f.error='Schedule change requests need at least a week\'s notice before the 1st of the month they take effect in — the earliest available date is '+fmtShort(earliestMonthNoticeDate())+'.';
+  // Unlike a hold or cancelling enrolment, a permanent day/time change has no billing-cycle impact,
+  // so MONTH_NOTICE_DAYS never applies here (Sept 2026, per Allie: "the 1 week only applies to holds
+  // and cancellations, to change days and times no notice required (other than 10am)") — just the
+  // same-day cutoff.
+  if(!timeChangeDateOk(effectiveFrom)){
+    f.error='Same-day schedule changes need to be made before 10:00am — the earliest available date is '+fmtShort(earliestTimeChangeDate())+'.';
     render(); return;
   }
   if(!f.recurring || f.recurring.length===0){ f.error='Add at least one day/time.'; render(); return; }
