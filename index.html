@@ -9923,7 +9923,8 @@ function fetchParentOccupancyIfNeeded(){
   if(!supabaseClient || !currentUser || currentUser.role!=='parent') return;
   const known={}; sessions.forEach(function(s){ known[s.id]=true; });
   return supabaseClient.rpc('parent_session_occupancy').then(function(r){
-    if(r.error){ console.error('parent_session_occupancy failed:', r.error); return; }
+    if(r.error){ console.error('[mathq] parent_session_occupancy RPC failed:', r.error); return; }
+    let mergedCount=0;
     (r.data||[]).forEach(function(row){
       if(known[row.id]) return; // already have the real, fully-detailed row for one of their own kids
       sessions.push({
@@ -9932,8 +9933,54 @@ function fetchParentOccupancyIfNeeded(){
         actualStart:null, actualEnd:null, checkInOffset:null, checkedOut:false,
         bookedBy:'staff', recurring:false, creditId:null, online:row.online||false, termBreak:false,
       });
+      mergedCount++;
     });
+    // Temporary diagnostic (Sept 2026, per Allie: "still shows every spot as available" even after
+    // the parent_session_occupancy fix + SQL patch were both confirmed live) — logs plainly, every
+    // time a parent's data loads, exactly how many other-family rows the RPC handed back and how many
+    // were actually new. If this ever prints 0 rows returned, the RPC itself is the gap (empty
+    // result, not a merge bug); if it prints real numbers but availability still looks wrong, the bug
+    // is downstream in the capacity/coverage math instead. Safe to remove once this is resolved.
+    console.log('[mathq] parent_session_occupancy: RPC returned '+((r.data||[]).length)+' other-family session(s), '+mergedCount+' newly merged, sessions array now has '+sessions.length+' total.');
   });
+}
+// Temporary interactive diagnostic (Sept 2026) for "still shows every spot as available" on the
+// parent schedule-change picker — callable from the browser console as, e.g.,
+// mathqDebugAvailability('Mon', '3:30pm', 90) — to see exactly why a given day/time looks open:
+// which Pod(s) are considered staffed there, how many sessions are already booked that day per Pod
+// (including other families', via the same merged data the picker itself uses), and whether that
+// pushes any Pod over capacity. Safe to remove once the underlying bug is found; doesn't affect
+// anything the app itself does.
+function mathqDebugAvailability(weekdayInput, timeLabel, duration){
+  duration = duration || 90;
+  const wd = WEEKDAY_KEYS.find(function(w){ return w.toLowerCase().indexOf(String(weekdayInput).toLowerCase().slice(0,3))===0; });
+  if(!wd){ console.error('[mathq] Unrecognized weekday "'+weekdayInput+'" — use Mon, Tue, Wed, Thu or Fri.'); return; }
+  const m=String(timeLabel).trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i);
+  if(!m){ console.error('[mathq] Unrecognized time "'+timeLabel+'" — use a format like "3:30pm" or "3pm".'); return; }
+  let h=parseInt(m[1],10); const min=m[2]?parseInt(m[2],10):0; const period=m[3].toLowerCase();
+  if(period==='pm' && h!==12) h+=12; if(period==='am' && h===12) h=0;
+  const start=h*60+min;
+  const occurrence=nextRegularOccurrence(wd, simNow());
+  const dateKey=toKey(occurrence);
+  const result={
+    weekday:wd, checkedAgainstDate:dateKey, start:start, startLabel:minToLabel(start), duration:duration,
+    loggedInAs: currentUser? currentUser.role : '(offline/demo mode)',
+    totalSessionsInBrowserMemory: sessions.length,
+    standingSlotHasAvailability_result: standingSlotHasAvailability(wd, start, duration, 6),
+    perPod: pods.map(function(p){
+      const cov=podCoverageDetail(p.id, wd, start, duration, occurrence);
+      const blocked=podCapacityBlocked(p.id, dateKey, {start:start, duration:duration});
+      const dayList=sessionsForDay(p.id, dateKey);
+      return {
+        pod:p.name, capacity:podCapacity(p.id), staffedHere:cov.ok, primaryInstructorId:cov.primaryInstructorId,
+        thisSlotWouldOverflowCapacity:blocked,
+        sessionsAlreadyBookedThisPodThatDay: dayList.length,
+        sessionDetail: dayList.map(function(s){ return {start:minToLabel(s.start), durationMin:s.duration, isOwnChild: s.studentId!=null}; }),
+      };
+    })
+  };
+  console.log('[mathq] availability debug for '+wd+' '+minToLabel(start)+':', result);
+  return result;
 }
 
 function fetchCreditsGroup(){
