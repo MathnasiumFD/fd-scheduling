@@ -2106,6 +2106,16 @@ function studentsStartingToday(){
   return students.filter(function(s){ return !isStudentInactive(s) && isStudentStartingToday(s); })
     .sort(function(a,b){ return a.name.localeCompare(b.name); });
 }
+// A student enrolled with a start date still genuinely ahead of us — on the roster and pre-booked,
+// but hasn't actually had a first session yet (Sept 2026, per Allie: "I need to see students on the
+// list that haven't quite started yet" — the Students panel already flags a hold or a scheduled stop
+// right next to the name, but had nothing at all for a brand-new enrolment still waiting on its
+// first day, so it looked identical to an already-attending student). Strictly AFTER today — a
+// student starting today gets their own "First day!" tag (isStudentStartingToday) and the top-of-tab
+// banner (renderFirstDayPanel) instead, so this never doubles up with those.
+function isStudentNotYetStarted(student){
+  return !!(student && student.startDate && toKey(student.startDate)>toKey(simNow()));
+}
 
 /* ---------- plan changes: stop or change frequency from a future date (5.16b) ---------- */
 function openPlanChangeForm(studentId){
@@ -7464,7 +7474,9 @@ function renderStudentsPanel(){
     // under name finishing date").
     const upcomingStop=currentOrUpcomingPlanChange(s.id);
     const stopping = upcomingStop && upcomingStop.stopped;
+    const notYetStarted = isStudentNotYetStarted(s);
     html+='<tr><td>'+s.name
+        +(notYetStarted? ' <span class="badge firstday">Starting '+fmtShort(s.startDate)+'</span>' : '')
         +(hold? ' <span class="badge hold">'+(holdActive?'On hold':'Hold from '+fmtShort(hold.start))+'</span>' : '')
         +(stopping? ' <span class="badge stopping">Finishing '+fmtShort(new Date(upcomingStop.effectiveFrom))+'</span>' : '')
       +'</td><td>'+yearLabel(s.year)+'</td><td>'+s.sessionsPerWeek+'x/week · '+s.duration+' min</td>'
