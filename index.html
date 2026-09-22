@@ -266,12 +266,27 @@ function newId(){ return (currentUser && typeof crypto!=='undefined' && crypto.r
 // local-only behaviour), this just persists it in the background. A failed write is logged and
 // surfaced with a toast, but — for this first pass — doesn't roll back the local change; if that
 // ever matters in practice (e.g. someone's offline), it's the next thing to harden.
-function dbWrite(label, promiseFn){
+//
+// Retries once, after a short pause, before giving up (Sept 2026, per Allie: "couldn't save to
+// server filling in previously unassigned standing session"). That specific write comes from
+// regenerateAllRecurring()'s self-heal pass (see generateRecurringSessions' "dup.podId==null"
+// branch) — fixing one Pod/rostered-shift gap can make MANY previously-unassigned occurrences
+// across several weeks/students all self-heal at once, each firing its own fire-and-forget write
+// in the same synchronous loop, which can burst past what a transient connection hiccup or a brief
+// rate-limit can absorb. A single retry after a short pause is cheap insurance against exactly that
+// kind of momentary blip, without adding real complexity — genuinely down/broken writes still
+// surface the toast after the second attempt, same as before.
+function dbWrite(label, promiseFn, _isRetry){
   if(!supabaseClient || !currentUser) return; // demo/offline mode — local-only, exactly as before
   promiseFn().then(function(r){
-    if(r && r.error){ console.error('Supabase write failed ('+label+'):', r.error); toast("Couldn't save to the server — "+label+'. Your change is visible here but may not have saved.'); }
+    if(r && r.error){
+      console.error('Supabase write failed ('+label+'):', r.error);
+      if(!_isRetry){ setTimeout(function(){ dbWrite(label, promiseFn, true); }, 1500); return; }
+      toast("Couldn't save to the server — "+label+'. Your change is visible here but may not have saved.');
+    }
   }).catch(function(err){
     console.error('Supabase write failed ('+label+'):', err);
+    if(!_isRetry){ setTimeout(function(){ dbWrite(label, promiseFn, true); }, 1500); return; }
     toast("Couldn't save to the server — "+label+'. Your change is visible here but may not have saved.');
   });
 }
