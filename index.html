@@ -9889,6 +9889,41 @@ function fetchSessionsGroup(){
       actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false,
       bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false, termBreak:r.term_break||false,
     }; });
+    return fetchParentOccupancyIfNeeded();
+  });
+}
+
+// A parent's own read of `sessions` above (parent_read_own_children_sessions) is deliberately
+// scoped to just their own kids — nobody else's family should be visible to them at all. But every
+// capacity/availability check in the app (pickBestPod, podCapacityBlocked, peakConcurrency, the
+// combined online ratio) works by scanning the WHOLE sessions array for a given Pod/date/time —
+// with a parent's own fetch only ever containing their own child(ren)'s handful of rows, every Pod
+// looked almost empty no matter how full it really was, so a parent's own schedule-change/make-up
+// picker could get availability wrong in either direction (Sept 2026, per Allie: "as a parent it's
+// still not showing availability" — the real root cause behind the previously-unresolved "fix
+// parent make-up booking RLS gap" item; the earlier date-math fix to standingSlotHasAvailability
+// couldn't touch this, since the underlying data was never reaching the parent's browser at all).
+//
+// parent_session_occupancy() is a SECURITY DEFINER Postgres function (see supabase_schema.sql) that
+// hands back every OTHER family's session as just {id, pod_id, the_date, start_min, duration,
+// status, online, instructor_id, instructor_id_2} — enough to do real capacity math, but
+// deliberately never student_id, so a parent can never learn WHO occupies another family's seat,
+// only that the seat is occupied. Rows already present from the parent's own direct fetch above are
+// skipped by id, so their own children's sessions are never double-counted.
+function fetchParentOccupancyIfNeeded(){
+  if(!supabaseClient || !currentUser || currentUser.role!=='parent') return;
+  const known={}; sessions.forEach(function(s){ known[s.id]=true; });
+  return supabaseClient.rpc('parent_session_occupancy').then(function(r){
+    if(r.error){ console.error('parent_session_occupancy failed:', r.error); return; }
+    (r.data||[]).forEach(function(row){
+      if(known[row.id]) return; // already have the real, fully-detailed row for one of their own kids
+      sessions.push({
+        id:row.id, studentId:null, podId:row.pod_id, instructorId:row.instructor_id, instructorId2:row.instructor_id_2,
+        handoff:null, date:new Date(row.the_date), start:row.start_min, duration:row.duration, status:row.status,
+        actualStart:null, actualEnd:null, checkInOffset:null, checkedOut:false,
+        bookedBy:'staff', recurring:false, creditId:null, online:row.online||false, termBreak:false,
+      });
+    });
   });
 }
 
