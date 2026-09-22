@@ -9919,13 +9919,33 @@ function fetchSessionsGroup(){
 // deliberately never student_id, so a parent can never learn WHO occupies another family's seat,
 // only that the seat is occupied. Rows already present from the parent's own direct fetch above are
 // skipped by id, so their own children's sessions are never double-counted.
+// Real root cause found Sept 2026 (per Allie: "still letting me book whatever whenever" even after
+// the parent_session_occupancy RPC + SQL patch were confirmed live) — a diagnostic added right here
+// caught it directly: the RPC call was silently capped at exactly 1000 rows, PostgREST's default
+// page size for any query (including a set-returning RPC call, not just plain .from() selects — see
+// fetchTablePaginated()'s own comment for the .from() side of this same class of bug). A real centre
+// easily has more than 1000 upcoming sessions across every family once you project out the full
+// recurring-booking horizon, so the previous single, unpaginated .rpc() call was quietly discarding
+// most of the other-family occupancy data it was supposed to provide — undercounting almost every
+// Pod's real bookings, which is exactly why every day/time still looked wide open to a parent. Fixed
+// by paginating the RPC call exactly like fetchTablePaginated() already does for regular tables —
+// supabase-js supports chaining .range() onto .rpc() for a set-returning function the same way it
+// does for .from().select().
 function fetchParentOccupancyIfNeeded(){
   if(!supabaseClient || !currentUser || currentUser.role!=='parent') return;
   const known={}; sessions.forEach(function(s){ known[s.id]=true; });
-  return supabaseClient.rpc('parent_session_occupancy').then(function(r){
-    if(r.error){ console.error('[mathq] parent_session_occupancy RPC failed:', r.error); return; }
+  const PAGE=1000;
+  return (function fetchPage(from, acc){
+    return supabaseClient.rpc('parent_session_occupancy').range(from, from+PAGE-1).then(function(r){
+      if(r.error) throw r.error;
+      const rows=r.data||[];
+      const all=acc.concat(rows);
+      if(rows.length<PAGE) return all; // last page — fewer than a full page means nothing left
+      return fetchPage(from+PAGE, all);
+    });
+  })(0, []).then(function(allRows){
     let mergedCount=0;
-    (r.data||[]).forEach(function(row){
+    allRows.forEach(function(row){
       if(known[row.id]) return; // already have the real, fully-detailed row for one of their own kids
       sessions.push({
         id:row.id, studentId:null, podId:row.pod_id, instructorId:row.instructor_id, instructorId2:row.instructor_id_2,
@@ -9935,22 +9955,17 @@ function fetchParentOccupancyIfNeeded(){
       });
       mergedCount++;
     });
-    // Temporary diagnostic (Sept 2026, per Allie: "still shows every spot as available" even after
-    // the parent_session_occupancy fix + SQL patch were both confirmed live) — logs plainly, every
-    // time a parent's data loads, exactly how many other-family rows the RPC handed back and how many
-    // were actually new. If this ever prints 0 rows returned, the RPC itself is the gap (empty
-    // result, not a merge bug); if it prints real numbers but availability still looks wrong, the bug
-    // is downstream in the capacity/coverage math instead. Safe to remove once this is resolved.
-    console.log('[mathq] parent_session_occupancy: RPC returned '+((r.data||[]).length)+' other-family session(s), '+mergedCount+' newly merged, sessions array now has '+sessions.length+' total.');
+    console.log('[mathq] parent_session_occupancy: RPC returned '+allRows.length+' other-family session(s) total (paginated), '+mergedCount+' newly merged, sessions array now has '+sessions.length+' total.');
+  }).catch(function(err){
+    console.error('[mathq] parent_session_occupancy RPC failed:', err);
   });
 }
-// Temporary interactive diagnostic (Sept 2026) for "still shows every spot as available" on the
-// parent schedule-change picker — callable from the browser console as, e.g.,
+// Interactive diagnostic (Sept 2026) — callable from the browser console as, e.g.,
 // mathqDebugAvailability('Mon', '3:30pm', 90) — to see exactly why a given day/time looks open:
 // which Pod(s) are considered staffed there, how many sessions are already booked that day per Pod
 // (including other families', via the same merged data the picker itself uses), and whether that
-// pushes any Pod over capacity. Safe to remove once the underlying bug is found; doesn't affect
-// anything the app itself does.
+// pushes any Pod over capacity. Kept permanently (harmless, doesn't run unless called) since it's a
+// handy way to spot-check the live picker against real data going forward.
 function mathqDebugAvailability(weekdayInput, timeLabel, duration){
   duration = duration || 90;
   const wd = WEEKDAY_KEYS.find(function(w){ return w.toLowerCase().indexOf(String(weekdayInput).toLowerCase().slice(0,3))===0; });
