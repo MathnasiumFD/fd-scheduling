@@ -2485,14 +2485,27 @@ function submitTimeChangeRequest(){
   if(!f.recurring || f.recurring.length===0){ f.error='Add at least one day/time.'; render(); return; }
   const student=findStudent(f.studentId);
   const recurring=f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; });
-  // Every row came from a dropdown already filtered to open times (see
-  // renderTimeChangeRecurringPickers), so this is almost always true by construction — it's only
-  // false if a picked time went full in the moments between opening the form and hitting Confirm.
-  // That used to be fine to let through anyway, since front desk would double-check before actually
-  // writing the change (see the "Ready to approve" flag this used to feed). With that safety net
-  // gone now that this applies immediately, re-check right here instead and block on it — each full
-  // row already shows its own "Join waitlist" escape hatch above, so this should be rare.
-  const stillFull=recurring.filter(function(r){ return !standingSlotHasAvailability(r.weekday, r.start, student.duration, student.year); });
+  // Every row a parent actually PICKED came from a dropdown already filtered to open times (see
+  // renderTimeChangeRecurringPickers), so this is almost always true by construction for that row —
+  // it's only false if a picked time went full in the moments between opening the form and hitting
+  // Confirm. That used to be fine to let through anyway, since front desk would double-check before
+  // actually writing the change (see the "Ready to approve" flag this used to feed). With that
+  // safety net gone now that this applies immediately, re-check right here instead and block on it —
+  // each full row already shows its own "Join waitlist" escape hatch above, so this should be rare.
+  //
+  // Only rows the parent actually CHANGED are checked (Sept 2026, per Allie: "One of your picked
+  // times just filled up (Fri 3:15pm) ... when I wasn't changing that day") — a 2-slot family only
+  // ever gets ONE row's picker open at a time (see "Select the day you wish to cancel" above), so the
+  // OTHER slot rides along in `recurring` completely unchanged from `currentRecurring`, identical
+  // weekday and start. That's a seat the family already holds, not a new claim on capacity, so it
+  // makes no sense to block the whole submission over its real-world fullness — a family keeping
+  // their existing Friday slot should never be told "Friday just filled up" when they never touched
+  // Friday. Only genuinely new picks (a row that differs from its original) need re-validating here.
+  const stillFull=recurring.filter(function(r, idx){
+    const orig=f.currentRecurring && f.currentRecurring[idx];
+    if(orig && orig.weekday===r.weekday && orig.start===r.start) return false; // unchanged — already their seat, not a new claim
+    return !standingSlotHasAvailability(r.weekday, r.start, student.duration, student.year);
+  });
   if(stillFull.length){
     f.error='One of your picked times just filled up ('+stillFull.map(function(r){ return r.weekday+' '+minToLabel(r.start); }).join(', ')+') — pick a different time for that row, or use "Join waitlist" instead.';
     render(); return;
@@ -8979,7 +8992,7 @@ function renderParent(){
   html+='<div class="card"><div class="card-head"><h2>Welcome, '+parent.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'parentLogout()')+'">Log out</button></div>'
     +'<p>This is your MATHQ hub for your child’s Mathnasium sessions — see what’s upcoming, request a permanent day/time change, cancel a session, or book a make-up using our live availability calendar.</p>'
     +'<p>You’ll only ever see times that are actually available to book — never other families’ bookings or private centre information.</p>'
-    +'<p>Please make all cancellations, schedule-change requests and make-up bookings here rather than by phone, email or text. Cancellations and make-up bookings update instantly; a permanent day/time change is reviewed by front desk first, same as a hold or cancelling enrolment.</p>'
+    +'<p>Please make all cancellations, schedule-change requests and make-up bookings here rather than by phone, email or text. Cancellations, make-up bookings and permanent day/time changes all update instantly — holds and cancelling enrolment are the only requests our team reviews first.</p>'
     +'<p>Quick, easy, all in one place.</p></div>';
 
   parent.studentIds.forEach(function(sid){
