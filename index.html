@@ -1946,7 +1946,17 @@ function describeUncoveredSlots(slots){
 // for a parent to select when they would like to come in instead"), and to decide whether a "Join
 // waitlist" button belongs there instead (see joinWaitlistFromTimeChangeRequest()).
 function standingSlotHasAvailability(weekday, start, duration, year){
-  return !!pickBestPod(weekday, toKey(simNow()), start, duration, year);
+  // Must check capacity against THIS weekday's own next real occurrence, not always today
+  // (Sept 2026, per Allie: "when selecting new day its showing full availability, when that's not
+  // the case"). podCapacityBlocked (called inside pickBestPod) looks up actual booked `sessions` on
+  // one specific calendar date — passing today's date while asking about, say, a Friday slot meant
+  // checking today's own (usually near-empty, unless today happens to be Friday) session list
+  // instead of the real Friday occurrence's real headcount, so every weekday except today
+  // effectively always came back "available" regardless of how full it actually was. Instructor
+  // coverage itself is a pure weekday+time pattern and never depended on the specific date, so this
+  // only ever affected the capacity half of the check.
+  const occurrence=nextRegularOccurrence(weekday, simNow());
+  return !!pickBestPod(weekday, toKey(occurrence), start, duration, year);
 }
 
 function creditDisplayStatus(c){
@@ -2371,6 +2381,21 @@ function submitCancelRequest(){
 }
 function openTimeChangeRequestForm(studentId){
   const student=findStudent(studentId);
+  const hasCurrent=!!(student.recurring && student.recurring.length);
+  // A student with no regular schedule on file yet — a brand-new join, or one whose standing
+  // schedule was fully cancelled — gets to pick their own day(s)/time(s) from scratch instead of a
+  // dead-end "contact us" message (Sept 2026, per Allie: "if no regular day/time on file then the
+  // parent gets to select what best works for them"). Seeds one blank pickable slot per session per
+  // week, each defaulted to a different weekday (so a 2x/week family doesn't see two identical
+  // rows) and to the first genuinely open time for that day, when there is one — same open-times-
+  // only picker as changing an existing slot (renderTimeChangeRecurringPickers), just with nothing
+  // to frame as "current".
+  const startsForDuration=possibleStarts(student.duration);
+  const blankRecurring=hasCurrent? [] : Array.from({length: student.sessionsPerWeek||1}, function(_, idx){
+    const weekday=WEEKDAY_KEYS[idx % WEEKDAY_KEYS.length];
+    const openStart=startsForDuration.find(function(t){ return standingSlotHasAvailability(weekday, t, student.duration, student.year); });
+    return {weekday:weekday, start: openStart!=null? openStart : startsForDuration[0]};
+  });
   // currentRecurring is a frozen snapshot of the schedule as it stands today, kept alongside the
   // editable `recurring` (which starts as a copy of the same thing, but changes as the parent picks
   // a new day/time) — so the modal can always show "here's what you have now" even after they've
@@ -2380,13 +2405,15 @@ function openTimeChangeRequestForm(studentId){
   state.timeChangeRequestForm={
     studentId, effectiveFrom:toKey(earliestMonthNoticeDate()),
     currentRecurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
-    recurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
+    recurring: hasCurrent? (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }) : blankRecurring,
     // Which of the child's current regular slots the parent is changing right now (Sept 2026, per
     // Allie: "Select the day you wish to cancel" — a dropdown listing the 1 or 2 days the child
     // attends, so a parent picks ONE to change at a time rather than every row being editable at
     // once). Defaults to the first (only) slot; a 2-slot child can switch which one the picker below
-    // targets via setTimeChangeSelectedSlot(). null when there's no regular schedule to pick from.
-    selectedSlotIdx: (student.recurring||[]).length? 0 : null,
+    // targets via setTimeChangeSelectedSlot(). null when there's no CURRENT regular schedule to pick
+    // from — that dropdown wouldn't make sense with nothing to "cancel", so every blank row above
+    // shows its own picker at once instead (see renderTimeChangeRequestModal).
+    selectedSlotIdx: hasCurrent? 0 : null,
     note:'', error:''
   };
   render();
@@ -5547,10 +5574,17 @@ function renderRosteredShiftsGrid(){
     html+='<tr><td><b>'+pod.name+'</b></td>';
     WEEKDAY_KEYS.forEach(function(wd){
       const blocks=podBlocksForDay(pod.id, wd);
+      // Resolve against THIS weekday's own next occurrence, not "today" — a column for a weekday
+      // later in the week than today can have an ongoing reassignment already scheduled (effective
+      // from that weekday's own upcoming date) that hasn't taken effect as of today yet. Evaluating
+      // every column against "today" made those columns show the OLD instructor, out of step with
+      // what the Today tab's coverage grid shows once that date actually arrives (Sept 2026, per
+      // Allie: "regular rostered shifts not speaking well with schedule in today tab").
+      const occurrence=nextRegularOccurrence(wd, today);
       let summary;
       if(blocks.length===0) summary='Unassigned';
       else summary=blocks.map(function(b){
-        const instrId=blockInstructorOngoing(b, today);
+        const instrId=blockInstructorOngoing(b, occurrence);
         return (instrId? findInstructor(instrId).name : 'Unassigned')+' '+rangeLabel(b.start,b.end-b.start);
       }).join(' → ');
       const gap=summary==='Unassigned' || summary.indexOf('Unassigned')>=0;
@@ -7984,6 +8018,10 @@ function renderTimeChangeRecurringPickers(slots, currentSlots, duration, year, o
     const current=currentSlots && currentSlots[idx];
     html+='<div class="recurring-row-group" style="margin-bottom:10px">';
     if(current) html+='<div class="small muted" style="margin-bottom:4px">Change <b>'+current.weekday+' '+minToLabel(current.start)+'</b> to:</div>';
+    // No "current" to frame as a change (a brand-new pick with nothing on file yet, see
+    // openTimeChangeRequestForm) — just label which session this is when there's more than one,
+    // so a 2x/week family can tell the two blank rows apart.
+    else if(slots.length>1) html+='<div class="small muted" style="margin-bottom:4px">Session '+(idx+1)+':</div>';
     html+='<div class="row2 recurring-row"><div><label>New day</label><select onchange="setTimeChangeRecurringSlot('+idx+',\'weekday\',this.value)">'
         +WEEKDAY_KEYS.map(function(d){ return '<option value="'+d+'"'+(d===s.weekday?' selected':'')+'>'+d+'</option>'; }).join('')
       +'</select></div>'
@@ -9196,7 +9234,7 @@ function renderTimeChangeRequestModal(){
   // Allie actually asked for here. currentRecurring is the frozen snapshot taken when the form
   // opened, paired 1:1 with the editable picker below.
   if(!f.currentRecurring.length){
-    html+='<p class="small muted">No regular schedule on file yet — contact us if you\'d like to set one up.</p>';
+    html+='<p class="small muted">No regular schedule on file yet — pick the day'+(f.recurring.length>1?'s':'')+' and time'+(f.recurring.length>1?'s':'')+' that work best for '+(student.name||'them')+' below.</p>';
   } else {
     // "Select the day you wish to cancel" (Sept 2026, per Allie) — a dropdown listing the 1 or 2
     // days/times the child currently attends, so a parent changes one at a time instead of every
@@ -9613,6 +9651,20 @@ function subscribeToLiveUpdates(){
   });
 }
 
+// Guards the one-time-only setup below (the Realtime subscription + the fallback heartbeat) against
+// running more than once per page load (Sept 2026, root cause of "Signed in, but loading your data
+// failed: cannot add postgres_changes callbacks for realtime:live-updates after subscribe()") —
+// afterLogin() itself can legitimately run more than once (doLogin()'s own success callback calls it
+// directly, AND supabaseClient.auth.signInWithPassword() separately fires a SIGNED_IN event through
+// the onAuthStateChange listener further below for that SAME login, which calls it again; same
+// double-call shape for setNewPassword()/updateUser()). Re-running the data load on a second call is
+// harmless — but subscribeToLiveUpdates() calling supabaseClient.channel('live-updates') a second
+// time returns the SAME channel object the first call already subscribed, and Supabase's realtime-js
+// client refuses to add more postgres_changes listeners to an already-subscribed channel, throwing
+// exactly that error and aborting the rest of afterLogin() — which is why data "failed to load" even
+// though sign-in itself succeeded. A real logout always does a full page reload (see logOut()), so
+// this only ever needs to guard one page load's worth of logins, never a genuine later one.
+var liveSyncStarted=false;
 function afterLogin(){
   supabaseClient.auth.getUser().then(function(res){
     if(res.error || !res.data.user){ showLoginScreen('Session expired — sign in again.'); return; }
@@ -9647,11 +9699,17 @@ function afterLogin(){
         // biggest contributors (with the old whole-database live-sync refresh above) to a Supabase
         // Fair Use Policy bandwidth warning. Realtime (subscribeToLiveUpdates below) is now the fast
         // path for real changes; this timer only needs to be frequent enough to catch a missed push.
-        setInterval(function(){
-          loadAllData().then(function(){ applyPromotions(); applyPlanChanges(); autoCheckOutPastClose(); renderUnlessEditing(); })
-            .catch(function(err){ console.error('Heartbeat refresh failed', err); });
-        }, 180000);
-        subscribeToLiveUpdates();
+        // Guarded by liveSyncStarted (see afterLogin() above) — this block sets up long-lived,
+        // page-scoped resources (a repeating timer, a Realtime subscription), so it must only ever
+        // run once per page load even though afterLogin() itself can legitimately run more than once.
+        if(!liveSyncStarted){
+          liveSyncStarted=true;
+          setInterval(function(){
+            loadAllData().then(function(){ applyPromotions(); applyPlanChanges(); autoCheckOutPastClose(); renderUnlessEditing(); })
+              .catch(function(err){ console.error('Heartbeat refresh failed', err); });
+          }, 180000);
+          subscribeToLiveUpdates();
+        }
       }).catch(function(err){
         console.error(err);
         // Surface the actual database error (missing table, RLS permission denial, etc.) instead of a
