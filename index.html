@@ -2381,12 +2381,19 @@ function openTimeChangeRequestForm(studentId){
     studentId, effectiveFrom:toKey(earliestMonthNoticeDate()),
     currentRecurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
     recurring: (student.recurring||[]).map(function(r){ return {weekday:r.weekday, start:r.start}; }),
+    // Which of the child's current regular slots the parent is changing right now (Sept 2026, per
+    // Allie: "Select the day you wish to cancel" — a dropdown listing the 1 or 2 days the child
+    // attends, so a parent picks ONE to change at a time rather than every row being editable at
+    // once). Defaults to the first (only) slot; a 2-slot child can switch which one the picker below
+    // targets via setTimeChangeSelectedSlot(). null when there's no regular schedule to pick from.
+    selectedSlotIdx: (student.recurring||[]).length? 0 : null,
     note:'', error:''
   };
   render();
 }
 function closeTimeChangeRequestForm(){ state.timeChangeRequestForm=null; render(); }
 function setTimeChangeRequestField(field, value){ state.timeChangeRequestForm[field]=value; state.timeChangeRequestForm.error=''; render(); }
+function setTimeChangeSelectedSlot(idx){ state.timeChangeRequestForm.selectedSlotIdx=Number(idx); state.timeChangeRequestForm.error=''; render(); }
 function setTimeChangeRecurringSlot(idx, field, value){
   state.timeChangeRequestForm.recurring[idx][field] = field==='start'? Number(value) : value;
   state.timeChangeRequestForm.error='';
@@ -7963,10 +7970,15 @@ function renderRecurringPickers(slots, starts, setter, podSetter, originals){
 // change from x day to y day") rather than leaving the parent to infer it from a bare day/time
 // picker. currentSlots is the frozen snapshot (f.currentRecurring) paired 1:1 by index with the
 // editable slots being picked here — see openTimeChangeRequestForm().
-function renderTimeChangeRecurringPickers(slots, currentSlots, duration, year){
+function renderTimeChangeRecurringPickers(slots, currentSlots, duration, year, onlyIdx){
   const allStarts=possibleStarts(duration);
   let html='';
   slots.forEach(function(s, idx){
+    // Restricted to the one slot picked from the "Select the day you wish to cancel" dropdown above
+    // (Sept 2026, per Allie) — a 2-slot child only sees one New day/New time picker at a time, not
+    // both rows editable simultaneously. onlyIdx is null/undefined for a caller that still wants
+    // every row (none currently does, but the parameter stays optional rather than required).
+    if(onlyIdx!=null && idx!==onlyIdx) return;
     const openStarts=allStarts.filter(function(t){ return standingSlotHasAvailability(s.weekday, t, duration, year); });
     const starts = openStarts.indexOf(s.start)>=0 ? openStarts : openStarts.concat([s.start]).sort(function(a,b){ return a-b; });
     const current=currentSlots && currentSlots[idx];
@@ -9185,14 +9197,23 @@ function renderTimeChangeRequestModal(){
   // opened, paired 1:1 with the editable picker below.
   if(!f.currentRecurring.length){
     html+='<p class="small muted">No regular schedule on file yet — contact us if you\'d like to set one up.</p>';
+  } else {
+    // "Select the day you wish to cancel" (Sept 2026, per Allie) — a dropdown listing the 1 or 2
+    // days/times the child currently attends, so a parent changes one at a time instead of every
+    // regular slot being editable at once. Picking a different option here just moves which row's
+    // New day/New time picker shows below; nothing is actually cancelled until Confirm is pressed.
+    html+='<label>Select the day you wish to cancel</label><select onchange="setTimeChangeSelectedSlot(this.value)">'
+      +f.currentRecurring.map(function(c, idx){ return '<option value="'+idx+'"'+(idx===f.selectedSlotIdx?' selected':'')+'>'+c.weekday+' '+minToLabel(c.start)+'</option>'; }).join('')
+      +'</select>';
   }
   // The time dropdown itself is filtered to only genuinely-open times per day (Sept 2026, per
   // Allie: "Only available session times will be shown") rather than showing every time slot with a
   // badge after the fact. The one exception: whatever the parent currently has selected always stays
   // in the list even if it's since gone full, so the dropdown never silently discards their pick out
   // from under them — that case is instead flagged right below with a "Join waitlist" button.
-  html+=renderTimeChangeRecurringPickers(f.recurring, f.currentRecurring, student.duration, student.year);
+  html+=renderTimeChangeRecurringPickers(f.recurring, f.currentRecurring, student.duration, student.year, f.selectedSlotIdx);
   html+='<div style="margin:-8px 0 14px">'+f.recurring.map(function(slot, idx){
+    if(f.selectedSlotIdx!=null && idx!==f.selectedSlotIdx) return ''; // only the row currently showing its picker gets a "full" flag/waitlist link
     const available=standingSlotHasAvailability(slot.weekday, slot.start, student.duration, student.year);
     return available? '' : '<div class="small" style="margin-bottom:6px">'+slot.weekday+' '+minToLabel(slot.start)+' — '
       +'<span class="badge full">Full right now</span> <button class="btn sm ghost" style="margin-left:6px" onclick="joinWaitlistFromTimeChangeRequest('+idx+')">Join waitlist for this time</button>'
