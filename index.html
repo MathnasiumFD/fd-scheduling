@@ -354,6 +354,13 @@ function minToLabel(min){
   return h12+(m? ':'+String(m).padStart(2,'0') : '')+period;
 }
 function rangeLabel(start,duration){ return minToLabel(start)+'–'+minToLabel(start+duration); }
+// A Pod shift block's own range label — same as rangeLabel(), but a block flagged closesLate
+// (Sept 2026, per Allie: "add an extra time after 7pm called Close", extended from front-desk staff
+// shifts to Pod shift blocks too) always shows "Close" instead of its numeric end time. closesLate
+// is purely a display flag — the block's own `end` is always forced to CENTER_CLOSE underneath (see
+// setPodBlockTime()), so every capacity/coverage calculation elsewhere is completely unaffected and
+// needs no changes of its own.
+function blockRangeLabel(b){ return b.closesLate? minToLabel(b.start)+'–Close' : rangeLabel(b.start, b.end-b.start); }
 // e.g. 90 -> "1h 30m", 60 -> "1h", 45 -> "45m". Used for the attendance log's per-instructor time
 // summary — total minutes taught rarely lands on a clean hour, so this always reads naturally.
 function hoursMinutesLabel(mins){
@@ -479,16 +486,16 @@ var HORIZON_WEEKS=6; // how far ahead standing (recurring) sessions get pre-book
 var TIME_OPTIONS=(function(){ const arr=[]; for(let t=CENTER_OPEN;t<=CENTER_CLOSE;t+=START_STEP) arr.push(t); return arr; })();
 // Front-desk staff (not instructors, not sessions) can be rostered starting earlier than the centre's
 // own CENTER_OPEN — e.g. to prep before students arrive (Sept 2026, per Allie: "set a shift to start
-// at 2pm"). STAFF_SHIFT_CLOSE is a sentinel end-of-shift value (not a real minute-of-day) meaning
+// at 2pm"). SHIFT_CLOSE is a sentinel end-of-shift value (not a real minute-of-day) meaning
 // "stays until the centre is locked up" rather than a predictable clock time — per Allie, an actual
 // pickable time after 7pm wouldn't fit, since closing duties don't reliably finish at the same minute
 // every day. Stored as a NULL end_min in Supabase (see add_staff_close_shift.sql) and mapped to/from
 // this sentinel at the DB boundary; every other numeric comparison in the app only ever reads a
 // rostered shift's `start` (lateness, "on-site now"), never `end`, so this sentinel needs no special
 // handling anywhere except the shift-editor forms and the one place `end` is rendered for display.
-var STAFF_SHIFT_OPEN=840; // 2:00pm
-var STAFF_SHIFT_CLOSE='close';
-var STAFF_SHIFT_TIME_OPTIONS=(function(){ const arr=[]; for(let t=STAFF_SHIFT_OPEN;t<=CENTER_CLOSE;t+=START_STEP) arr.push(t); return arr; })();
+var EARLY_SHIFT_OPEN=840; // 2:00pm
+var SHIFT_CLOSE='close';
+var EARLY_SHIFT_TIME_OPTIONS=(function(){ const arr=[]; for(let t=EARLY_SHIFT_OPEN;t<=CENTER_CLOSE;t+=START_STEP) arr.push(t); return arr; })();
 var EXIT_STEP=5; // exit time is adjustable in finer 5-minute increments than booking's 15-minute grid
 var EXIT_TIME_OPTIONS=(function(){ const arr=[]; for(let t=CENTER_OPEN;t<=CENTER_CLOSE;t+=EXIT_STEP) arr.push(t); return arr; })();
 var AVAIL_STEP=30; // availability lookup shows seats in half-hour columns
@@ -1308,13 +1315,12 @@ var state={
   // lives on the Staff tab entirely). null until first touched, so it can default to today's own
   // weekday (see renderStaff()) without needing a value baked in here.
   podSeatingWeekday:null,
-  // "From" date for the Expected headcount grid (Sept 2026, per Allie: "in expected headcount, i
-  // need to be able to select a 'from' date") — null until first touched, defaulting to today via
-  // simNow() inside renderExpectedHeadcountGrid/nextRegularOccurrence, same null-until-touched
-  // pattern as podSeatingWeekday above. Lets Allie preview the standing pattern as it'll look
-  // starting from any future (or past) date, e.g. after a batch of schedule changes take effect
-  // next month, rather than only ever seeing each weekday's very next occurrence from today.
-  expectedHeadcountFromDate:null,
+  // Which real calendar week the Expected headcount grid is showing (Sept 2026, per Allie: "i also
+  // want expected headcount to be per week" — she confirmed all 5 weekday rows should anchor to the
+  // SAME real calendar week, not each weekday's own independent next-occurrence date). Mirrors
+  // state.weekOffset's "This week"/"Next week" pattern used by the Today tab's day-by-day Schedule
+  // grid, but kept as its own field so the two week pickers stay independent of each other.
+  expectedHeadcountWeekOffset:0,
   parentLoggedIn:null,
   loginForm:{email:'', error:''},
   instructorLoggedIn:null,
@@ -4248,12 +4254,12 @@ function clearDayOverride(podId, dateKey){
 function addPodShiftBlock(podId, weekday){
   const blocks=podBlocksForDay(podId, weekday);
   const lastEnd = blocks.length? blocks[blocks.length-1].end : CENTER_OPEN;
-  const block={id:newId()||('blk'+(nextBlockId++)), start:Math.min(lastEnd, CENTER_CLOSE-START_STEP), end:Math.min(lastEnd+60, CENTER_CLOSE), assignments:[], oneOffCoverage:[]};
+  const block={id:newId()||('blk'+(nextBlockId++)), start:Math.min(lastEnd, CENTER_CLOSE-START_STEP), end:Math.min(lastEnd+60, CENTER_CLOSE), closesLate:false, assignments:[], oneOffCoverage:[]};
   if(!podSchedule[podId]) podSchedule[podId]={};
   if(!podSchedule[podId][weekday]) podSchedule[podId][weekday]=[];
   podSchedule[podId][weekday].push(block);
   dbWrite('adding a shift block', function(){ return supabaseClient.from('pod_shift_blocks').insert({
-    id:block.id, pod_id:podId, weekday:weekday, start_min:block.start, end_min:block.end
+    id:block.id, pod_id:podId, weekday:weekday, start_min:block.start, end_min:block.end, closes_late:false
   }); });
   state.podAssignForm.drafts[block.id]={instructorId:'', effectiveFrom:toKey(simNow())};
   state.podAssignForm.error='';
@@ -4267,13 +4273,27 @@ function removePodShiftBlock(podId, weekday, blockId){
   regenerateAllRecurring();
   render();
 }
+// Pod shift block start/end times (Sept 2026, per Allie: the earlier 2pm floor and "Close" option
+// added for front-desk staff shifts (#247) apply here too — "it's still not coming up in regular
+// rostered shifts", since THIS is the grid she meant). "Close" (field==='end', value===SHIFT_CLOSE)
+// is deliberately informational only, per Allie: it forces block.end to the real CENTER_CLOSE number
+// underneath (closesLate is a separate display-only flag — see blockRangeLabel()), so every
+// capacity/coverage function that reads a block's `end` (podCoverageDetail, podCoverageBoundary,
+// resolvePodCoverage, the overlap check just below, etc.) needs no changes at all and keeps working
+// exactly as before — nothing about when a session can actually be booked or who's counted as
+// "covering" a window changes.
 function setPodBlockTime(podId, weekday, blockId, field, value){
   const blocks=podBlocksForDay(podId, weekday);
   const block=blocks.find(function(b){ return b.id===blockId; });
-  block[field]=Number(value);
+  if(field==='end' && value===SHIFT_CLOSE){
+    block.end=CENTER_CLOSE; block.closesLate=true;
+  } else {
+    block[field]=Number(value);
+    if(field==='end') block.closesLate=false;
+  }
   if(block.end<=block.start){
-    if(field==='start') block.end=Math.min(CENTER_CLOSE, block.start+START_STEP);
-    else block.start=Math.max(CENTER_OPEN, block.end-START_STEP);
+    if(field==='start'){ block.end=Math.min(CENTER_CLOSE, block.start+START_STEP); block.closesLate=false; }
+    else block.start=Math.max(EARLY_SHIFT_OPEN, block.end-START_STEP);
   }
   const sorted=blocks.slice().sort(function(a,b){ return a.start-b.start; });
   for(let i=1;i<sorted.length;i++){
@@ -4284,7 +4304,7 @@ function setPodBlockTime(podId, weekday, blockId, field, value){
     }
   }
   state.podAssignForm.error='';
-  dbWrite('updating shift block time', function(){ return supabaseClient.from('pod_shift_blocks').update({start_min:block.start, end_min:block.end}).eq('id', blockId); });
+  dbWrite('updating shift block time', function(){ return supabaseClient.from('pod_shift_blocks').update({start_min:block.start, end_min:block.end, closes_late:block.closesLate}).eq('id', blockId); });
   regenerateAllRecurring();
   render();
 }
@@ -4330,7 +4350,7 @@ function saveAssignmentChange(podId, weekday, blockId){
   }); });
   delete f.drafts[blockId];
   regenerateAllRecurring();
-  toast(findInstructor(draft.instructorId).name+' assigned to '+findPod(podId).name+'’s '+weekday+' '+rangeLabel(block.start,block.end-block.start)+' shift, starting '+fmtShort(effDate)+'.');
+  toast(findInstructor(draft.instructorId).name+' assigned to '+findPod(podId).name+'’s '+weekday+' '+blockRangeLabel(block)+' shift, starting '+fmtShort(effDate)+'.');
   render();
 }
 function removeAssignment(podId, weekday, blockId, effectiveFromKey){
@@ -5632,7 +5652,7 @@ function podCoverageSummary(podId, weekday, date){
   if(blocks.length===0) return 'Unassigned';
   return blocks.map(function(b){
     const instrId=blockInstructorOn(b, date);
-    return (instrId? findInstructor(instrId).name : 'Unassigned')+' '+rangeLabel(b.start,b.end-b.start);
+    return (instrId? findInstructor(instrId).name : 'Unassigned')+' '+blockRangeLabel(b);
   }).join(' → ');
 }
 
@@ -5699,7 +5719,7 @@ function renderRosteredShiftsGrid(){
       if(blocks.length===0) summary='Unassigned';
       else summary=blocks.map(function(b){
         const instrId=blockInstructorOngoing(b, occurrence);
-        return (instrId? findInstructor(instrId).name : 'Unassigned')+' '+rangeLabel(b.start,b.end-b.start);
+        return (instrId? findInstructor(instrId).name : 'Unassigned')+' '+blockRangeLabel(b);
       }).join(' → ');
       const gap=summary==='Unassigned' || summary.indexOf('Unassigned')>=0;
       html+='<td style="cursor:pointer'+(gap?';color:var(--danger)':'')+'" onclick="openPodAssignForm(\''+pod.id+'\',\''+wd+'\')" title="Change '+pod.name+'\'s regular '+wd+' shift — an ongoing change, from whichever date you choose">'+summary+'</td>';
@@ -5712,33 +5732,31 @@ function renderRosteredShiftsGrid(){
 
 // Total expected PHYSICAL headcount across the whole centre, bucketed into 15-min intervals across
 // the afternoon (Sept 2026, per Allie: "one more section that shows me the number of kids expected
-// in the centre split into 15 min intervals"). A staffing-planning view, not a live board — like
-// Regular rostered shifts and Pod seating above, each weekday uses its own next upcoming occurrence
-// (nextRegularOccurrence) so it always reflects the CURRENT standing pattern regardless of what day
-// it actually is right now, and every non-cancelled session that weekday overlapping a given 15-min
-// slot counts toward it — Online sessions are deliberately excluded, since this is specifically about
-// who's physically walking in the door (not the day's total enrolment; Online already has its own
-// occupancy badges elsewhere).
+// in the centre split into 15 min intervals"). A staffing-planning view, not a live board — every
+// non-cancelled session overlapping a given 15-min slot counts toward it — Online sessions are
+// deliberately excluded, since this is specifically about who's physically walking in the door (not
+// the day's total enrolment; Online already has its own occupancy badges elsewhere).
 //
-// "From" date (Sept 2026, per Allie: "in expected headcount, i need to be able to select a 'from'
-// date") — state.expectedHeadcountFromDate, set via setExpectedHeadcountFromDate() from the date
-// input in this section's header (see renderStaff()). Each weekday's "next occurrence" is worked
-// out relative to THIS date instead of always today, so Allie can preview the standing pattern as
-// it'll look starting from any date she chooses — e.g. after a batch of schedule changes take
-// effect next month — not just whatever the very next week happens to show. Defaults to today
-// (null → simNow() inside nextRegularOccurrence) until the picker is first touched.
+// Per-week, real calendar dates (Sept 2026, per Allie: "i also want expected headcount to be per
+// week" — confirmed all 5 weekday rows should anchor to the SAME real calendar week, not each
+// weekday's own independent next-occurrence date, which could straddle two different weeks
+// depending on what day "from" happened to be). Mirrors the Today tab's day-by-day Schedule grid's
+// own "This week"/"Next week" mechanism (state.weekOffset/getMonday/setWeek) exactly, but with its
+// own dedicated state.expectedHeadcountWeekOffset field so the two week pickers move independently.
 function renderExpectedHeadcountGrid(){
-  const fromDate = state.expectedHeadcountFromDate? new Date(state.expectedHeadcountFromDate) : simNow();
+  const now=simNow();
+  const monday=addDays(getMonday(now), state.expectedHeadcountWeekOffset*7);
+  const weekDates=[0,1,2,3,4].map(function(i){ return addDays(monday,i); });
   const slots=[];
   for(let t=CENTER_OPEN; t<CENTER_CLOSE; t+=15) slots.push(t);
   let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Day</th>'
     + slots.map(function(t){ return '<th>'+minToLabel(t)+'</th>'; }).join('')
     + '</tr>';
-  WEEKDAY_KEYS.forEach(function(wd){
-    const occurrence=nextRegularOccurrence(wd, fromDate);
-    const dateKey=toKey(occurrence);
+  weekDates.forEach(function(date){
+    const wd=WEEKDAY_KEYS[(date.getDay()+6)%7];
+    const dateKey=toKey(date);
     const dayList=scheduleListForDay(dateKey).filter(function(s){ return !s.online; });
-    html+='<tr><td><b>'+wd+'</b> <span class="small muted">'+occurrence.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></td>';
+    html+='<tr><td><b>'+wd+'</b> <span class="small muted">'+date.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></td>';
     slots.forEach(function(t){
       const count=dayList.filter(function(s){ return s.start<t+15 && t<s.start+s.duration; }).length;
       html+='<td class="'+(count===0?'muted':'')+'" style="text-align:center">'+count+'</td>';
@@ -5748,7 +5766,11 @@ function renderExpectedHeadcountGrid(){
   html+='</table></div>';
   return html;
 }
-function setExpectedHeadcountFromDate(value){ state.expectedHeadcountFromDate=value||null; render(); }
+function setExpectedHeadcountWeek(offset){
+  state.expectedHeadcountWeekOffset=offset;
+  if(state.collapsedSections && state.collapsedSections.expectedHeadcount){ state.collapsedSections.expectedHeadcount=false; }
+  render();
+}
 
 // Suggested shift durations — NOT per Pod (Sept 2026, per Allie: "i dont want it to be matched per
 // pod, the instructors are very able to walk around, the main thing is maintaining the 1:8"). Works
@@ -6223,6 +6245,14 @@ function renderQuickMoveModal(){
 // every active instructor, unrestricted by availability or an existing assignment elsewhere — same
 // "front desk is trusted" philosophy as assignCoverageManually() — since the whole point is
 // overriding a clash on the spot, not hunting through who's technically free.
+// Sentinel "Cover with" value meaning "explicitly no instructor" (Sept 2026, per Allie: "in whos
+// here right now i need the option to select 'no instructor' for a pod") — distinct from the plain
+// '' placeholder value (nothing chosen yet), so the form can tell "hasn't picked" apart from "picked
+// nobody, on purpose." Stored as a real NULL oneOffCoverage.instructorId, exactly the same shape
+// pod_day_overrides already uses for "explicitly Unassigned for this one date" — podCoverageDetail()
+// already treats a block segment with no instructorId as an unattended gap (see its own `segs`
+// filter), so marking a Pod unstaffed this way needs no changes to any capacity/coverage math at all.
+var NO_INSTRUCTOR_VALUE='__no_instructor__';
 function openQuickCoverageForm(podId){
   const today=simNow();
   const weekday=WEEKDAY_KEYS[(today.getDay()+6)%7];
@@ -6233,8 +6263,13 @@ function openQuickCoverageForm(podId){
   // block's hours (e.g. someone lingering past the end of their shift), fall back to the day's last
   // block so there's still something sensible to change.
   const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
+  const todayOverride=(block.oneOffCoverage||[]).find(function(o){ return toKey(o.date)===toKey(today); });
   const currentId=blockInstructorOn(block, today);
-  state.quickCoverageForm={podId:podId, weekday:weekday, blockId:block.id, instructorId:currentId||'', error:''};
+  // An existing "explicitly no instructor" override for today pre-selects "No instructor" itself,
+  // rather than falling through to the plain '' placeholder — currentId alone can't tell an existing
+  // null override apart from no override at all, since both resolve to null/undefined the same way.
+  const preselected = (todayOverride && !todayOverride.instructorId)? NO_INSTRUCTOR_VALUE : (currentId||'');
+  state.quickCoverageForm={podId:podId, weekday:weekday, blockId:block.id, instructorId:preselected, error:''};
   render();
 }
 function closeQuickCoverageForm(){ state.quickCoverageForm=null; render(); }
@@ -6245,20 +6280,24 @@ function setQuickCoverageField(field, value){
 }
 function saveQuickCoverage(){
   const f=state.quickCoverageForm;
-  if(!f.instructorId){ f.error='Choose an instructor.'; render(); return; }
+  if(!f.instructorId){ f.error='Choose an instructor, or "No instructor" to mark this Pod unstaffed for today.'; render(); return; }
   const block=podBlocksForDay(f.podId, f.weekday).find(function(b){ return b.id===f.blockId; });
   const today=simNow();
   const todayKey=toKey(today);
-  const instr=findInstructor(f.instructorId);
+  const isNoInstructor=f.instructorId===NO_INSTRUCTOR_VALUE;
+  const instr=isNoInstructor? null : findInstructor(f.instructorId);
+  const savedInstructorId=isNoInstructor? null : f.instructorId;
   block.oneOffCoverage=(block.oneOffCoverage||[]).filter(function(o){ return toKey(o.date)!==todayKey; });
-  block.oneOffCoverage.push({date:new Date(today), instructorId:f.instructorId});
+  block.oneOffCoverage.push({date:new Date(today), instructorId:savedInstructorId});
   dbWrite('recording a same-day coverage change', function(){
     return supabaseClient.from('pod_shift_one_off_coverage').delete().eq('block_id', block.id).eq('the_date', todayKey).then(function(){
-      return supabaseClient.from('pod_shift_one_off_coverage').insert({block_id:block.id, the_date:todayKey, instructor_id:f.instructorId});
+      return supabaseClient.from('pod_shift_one_off_coverage').insert({block_id:block.id, the_date:todayKey, instructor_id:savedInstructorId});
     });
   });
   regenerateAllRecurring();
-  toast(instr.name+' is covering '+findPod(f.podId).name+' for today only — their regular schedule is unchanged.');
+  toast(isNoInstructor
+    ? findPod(f.podId).name+' is marked unstaffed for today only — its regular schedule is unchanged.'
+    : instr.name+' is covering '+findPod(f.podId).name+' for today only — their regular schedule is unchanged.');
   state.quickCoverageForm=null;
   render();
 }
@@ -6296,6 +6335,7 @@ function renderQuickCoverageModal(){
   html+='<div class="row2" style="align-items:flex-end">'
     +'<div><label>Cover with</label><select onchange="setQuickCoverageField(\'instructorId\',this.value)">'
       +'<option value="">Choose…</option>'
+      +'<option value="'+NO_INSTRUCTOR_VALUE+'"'+(f.instructorId===NO_INSTRUCTOR_VALUE?' selected':'')+'>No instructor</option>'
       +instructors.filter(function(i){ return i.active!==false; }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(i){
         return '<option value="'+i.id+'"'+(i.id===f.instructorId?' selected':'')+'>'+i.name+'</option>';
       }).join('')
@@ -6698,11 +6738,10 @@ function renderStaff(){
 
     html+=sectionOpen('expectedHeadcount','Expected headcount',
         '<div style="display:flex;gap:6px;align-items:center">'
-          +'<label class="small muted" style="margin:0">From</label>'
-          +'<input type="date" class="small" value="'+(state.expectedHeadcountFromDate||toKey(now))+'" onchange="setExpectedHeadcountFromDate(this.value)" title="Preview the standing pattern as it\'ll look starting from this date"/>'
-          +(state.expectedHeadcountFromDate? '<button class="btn sm" onclick="setExpectedHeadcountFromDate(null)">Today</button>' : '')
+          +'<button class="btn sm'+(state.expectedHeadcountWeekOffset===0?' primary':'')+'" onclick="setExpectedHeadcountWeek(0)">This week</button>'
+          +'<button class="btn sm'+(state.expectedHeadcountWeekOffset===1?' primary':'')+'" onclick="setExpectedHeadcountWeek(1)">Next week</button>'
         +'</div>')
-      +'<p class="small muted">How many kids are expected to physically be in the centre, in 15-min slots across the afternoon — the standing weekly pattern, same as Regular rostered shifts above. Online sessions aren\'t counted here.</p>'
+      +'<p class="small muted">How many kids are expected to physically be in the centre, in 15-min slots across the afternoon — real dates for this week or next, all 5 days from the same calendar week. Online sessions aren\'t counted here.</p>'
       +renderExpectedHeadcountGrid()
       +'</div>';
 
@@ -6792,18 +6831,31 @@ function renderPodAssignModal(){
     const upcoming=b.assignments.filter(function(a){ return toKey(a.effectiveFrom)>toKey(now); }).sort(function(a,b2){ return toKey(a.effectiveFrom).localeCompare(toKey(b2.effectiveFrom)); });
     const effDate=draft.effectiveFrom? new Date(draft.effectiveFrom) : now;
     const qualifying=qualifyingInstructorsForBlock(f.weekday, b, effDate);
+    // The Regular rostered shifts grid (renderRosteredShiftsGrid) deliberately reads this SAME block
+    // as of this weekday's own NEXT real occurrence, not today (task #233) — so if a scheduled change
+    // below is already effective by that date, the grid shows the NEW name while "Currently" here
+    // (evaluated as of today) still correctly shows the OLD one, until that date actually arrives.
+    // Spelled out explicitly (Sept 2026, per Allie: "it says Laura, and when i click it it says
+    // Sanvi so im confused") rather than leaving someone to work it out from the "Scheduled changes"
+    // line alone.
+    const nextOccurrence=nextRegularOccurrence(f.weekday, now);
+    const ongoingAtNextOccurrence=blockInstructorOngoing(b, nextOccurrence);
+    const gridShowsDifferentName = ongoingAtNextOccurrence!==currentId;
 
     html+='<div class="pod-card" style="margin-bottom:10px">';
     html+='<div class="block-row">'
       +'<div><label>From</label><select onchange="setPodBlockTime(\''+f.podId+'\',\''+f.weekday+'\',\''+b.id+'\',\'start\',this.value)">'
-        +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===b.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===b.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
       +'</select></div>'
       +'<div><label>To</label><select onchange="setPodBlockTime(\''+f.podId+'\',\''+f.weekday+'\',\''+b.id+'\',\'end\',this.value)">'
-        +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===b.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(!b.closesLate && t===b.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +'<option value="'+SHIFT_CLOSE+'"'+(b.closesLate?' selected':'')+'>Close</option>'
       +'</select></div>'
       +'<button class="btn sm ghost" onclick="removePodShiftBlock(\''+f.podId+'\',\''+f.weekday+'\',\''+b.id+'\')">Remove shift</button>'
     +'</div>';
-    html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+(currentId? findInstructor(currentId).name : 'Unassigned')+'</b></div>';
+    html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+(currentId? findInstructor(currentId).name : 'Unassigned')+'</b>'
+      +(gridShowsDifferentName? ' <span class="small muted">— the grid above already shows <b>'+(ongoingAtNextOccurrence? findInstructor(ongoingAtNextOccurrence).name : 'Unassigned')+'</b> because that\'s who\'s rostered on by '+fmtShort(nextOccurrence)+', this '+f.weekday+'\'s next actual date; today\'s still covered by whoever\'s shown here until then</span>' : '')
+      +'</div>';
     if(upcoming.length>0){
       html+='<div class="small muted" style="margin-bottom:8px">Scheduled changes: '+upcoming.map(function(a){
         return findInstructor(a.instructorId).name+' from '+fmtShort(a.effectiveFrom)+' <a href="#" onclick="removeAssignment(\''+f.podId+'\',\''+f.weekday+'\',\''+b.id+'\',\''+toKey(a.effectiveFrom)+'\');return false;" style="color:var(--danger)">✕</a>';
@@ -7685,13 +7737,13 @@ function setNewStaffField(field, value){ state.newStaffForm[field]=value; state.
 function setNewStaffShift(weekday, field, value){
   const a=state.newStaffForm.shifts[weekday];
   if(field==='off') a.off=value;
-  else if(field==='end' && value===STAFF_SHIFT_CLOSE) a.end=STAFF_SHIFT_CLOSE;
+  else if(field==='end' && value===SHIFT_CLOSE) a.end=SHIFT_CLOSE;
   else a[field]=Number(value);
   // "Close" has no fixed minute value, so it's never "before or equal to" a start time — only clamp
   // when both ends of the shift are real clock times.
-  if(a.end!==STAFF_SHIFT_CLOSE && a.end<=a.start){
+  if(a.end!==SHIFT_CLOSE && a.end<=a.start){
     if(field==='start') a.end=Math.min(CENTER_CLOSE, a.start+START_STEP);
-    else a.start=Math.max(STAFF_SHIFT_OPEN, a.end-START_STEP);
+    else a.start=Math.max(EARLY_SHIFT_OPEN, a.end-START_STEP);
   }
   state.newStaffForm.error='';
   render();
@@ -7715,7 +7767,7 @@ function saveNewStaff(){
   rows.forEach(function(r){ staffRosteredShifts.push({id:newId()||('sshift'+(nextStaffShiftId++)), staffId:newStaff.id, weekday:r.weekday, start:r.start, end:r.end}); });
   dbWrite('adding a new staff member', function(){ return supabaseClient.from('staff_members').insert({id:newStaff.id, name:newStaff.name, email:newStaff.email}).then(function(r){
     if(r.error || !rows.length) return r;
-    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:newStaff.id, weekday:row.weekday, start_min:row.start, end_min: row.end===STAFF_SHIFT_CLOSE? null : row.end}; }));
+    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:newStaff.id, weekday:row.weekday, start_min:row.start, end_min: row.end===SHIFT_CLOSE? null : row.end}; }));
   }); });
   const workingDays=rows.map(function(r){ return r.weekday; });
   toast(newStaff.name+' added to front desk staff'+(workingDays.length? ' — rostered '+workingDays.join(', ') : '')+'.');
@@ -7738,13 +7790,13 @@ function setEditStaffField(field, value){ state.editStaffForm[field]=value; stat
 function setEditStaffShift(weekday, field, value){
   const a=state.editStaffForm.shifts[weekday];
   if(field==='off') a.off=value;
-  else if(field==='end' && value===STAFF_SHIFT_CLOSE) a.end=STAFF_SHIFT_CLOSE;
+  else if(field==='end' && value===SHIFT_CLOSE) a.end=SHIFT_CLOSE;
   else a[field]=Number(value);
   // "Close" has no fixed minute value, so it's never "before or equal to" a start time — only clamp
   // when both ends of the shift are real clock times.
-  if(a.end!==STAFF_SHIFT_CLOSE && a.end<=a.start){
+  if(a.end!==SHIFT_CLOSE && a.end<=a.start){
     if(field==='start') a.end=Math.min(CENTER_CLOSE, a.start+START_STEP);
-    else a.start=Math.max(STAFF_SHIFT_OPEN, a.end-START_STEP);
+    else a.start=Math.max(EARLY_SHIFT_OPEN, a.end-START_STEP);
   }
   state.editStaffForm.error='';
   render();
@@ -7766,7 +7818,7 @@ function saveEditStaff(){
     return supabaseClient.from('staff_rostered_shifts').delete().eq('staff_id', staff.id);
   }).then(function(r){
     if(!r || r.error || !rows.length) return r;
-    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:staff.id, weekday:row.weekday, start_min:row.start, end_min: row.end===STAFF_SHIFT_CLOSE? null : row.end}; }));
+    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:staff.id, weekday:row.weekday, start_min:row.start, end_min: row.end===SHIFT_CLOSE? null : row.end}; }));
   }); });
   toast(staff.name+'\'s details updated.');
   state.editStaffForm=null;
@@ -7783,11 +7835,11 @@ function renderStaffShiftFields(shifts, setterName){
     if(!a.off){
       html+='<div style="display:flex;gap:6px">'
         +'<select onchange="'+setterName+'(\''+day+'\',\'start\',this.value)">'
-          +STAFF_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+          +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select>'
         +'<select onchange="'+setterName+'(\''+day+'\',\'end\',this.value)">'
-          +STAFF_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
-          +'<option value="'+STAFF_SHIFT_CLOSE+'"'+(a.end===STAFF_SHIFT_CLOSE?' selected':'')+'>Close</option>'
+          +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+          +'<option value="'+SHIFT_CLOSE+'"'+(a.end===SHIFT_CLOSE?' selected':'')+'>Close</option>'
         +'</select></div>';
     } else {
       html+='<div class="small muted">Off</div>';
@@ -7879,7 +7931,7 @@ function renderStaffCheckInPanel(){
   roster.forEach(function(p){
     const isInstr=p.kind==='instructor';
     const s=isInstr? instructorCheckinStatusToday(p.id) : staffStatusToday(p.id);
-    const rosteredLabel = s.rostered? (s.rostered.end===STAFF_SHIFT_CLOSE? minToLabel(s.rostered.start)+'–Close' : rangeLabel(s.rostered.start, s.rostered.end-s.rostered.start)) : '<span class="small muted">Off today</span>';
+    const rosteredLabel = s.rostered? (s.rostered.end===SHIFT_CLOSE? minToLabel(s.rostered.start)+'–Close' : rangeLabel(s.rostered.start, s.rostered.end-s.rostered.start)) : '<span class="small muted">Off today</span>';
     let statusCell;
     if(s.state==='on-site'){
       statusCell='<span class="badge available">On site since '+minToLabel(s.records[0].checkIn)+'</span>'+(s.lateMin? ' <span class="small muted">('+s.lateMin+'m late)</span>' : '');
@@ -9927,7 +9979,7 @@ function fetchInstructorsGroup(){
 function fetchPodsGroup(){
   return Promise.all([
     fetchTablePaginated('pods','id,name,capacity'),
-    fetchTablePaginated('pod_shift_blocks','id,pod_id,weekday,start_min,end_min'),
+    fetchTablePaginated('pod_shift_blocks','id,pod_id,weekday,start_min,end_min,closes_late'),
     fetchTablePaginated('pod_shift_assignments','block_id,instructor_id,effective_from'),
     fetchTablePaginated('pod_shift_one_off_coverage','block_id,the_date,instructor_id'),
   ]).then(function(t){
@@ -9943,7 +9995,7 @@ function fetchPodsGroup(){
       const oneOffCoverage=coverRows.filter(function(c){ return c.block_id===b.id; }).map(function(c){
         return {date:new Date(c.the_date), instructorId:c.instructor_id};
       });
-      const block={id:b.id, start:b.start_min, end:b.end_min, assignments, oneOffCoverage};
+      const block={id:b.id, start:b.start_min, end:b.end_min, closesLate:!!b.closes_late, assignments, oneOffCoverage};
       if(!podSchedule[b.pod_id]) podSchedule[b.pod_id]={};
       if(!podSchedule[b.pod_id][b.weekday]) podSchedule[b.pod_id][b.weekday]=[];
       podSchedule[b.pod_id][b.weekday].push(block);
@@ -10211,9 +10263,9 @@ function fetchStaffMembersGroup(){
 function fetchStaffRosteredShiftsGroup(){
   return fetchTablePaginated('staff_rostered_shifts','id,staff_id,weekday,start_min,end_min').then(function(staffShiftRows){
     staffRosteredShifts=staffShiftRows.map(function(r){ return {
-      // A NULL end_min means "Close" (see STAFF_SHIFT_CLOSE's own comment) — mapped back to that
+      // A NULL end_min means "Close" (see SHIFT_CLOSE's own comment) — mapped back to that
       // sentinel here so nothing downstream ever has to know about the raw NULL.
-      id:r.id, staffId:r.staff_id, weekday:r.weekday, start:r.start_min, end: r.end_min==null? STAFF_SHIFT_CLOSE : r.end_min,
+      id:r.id, staffId:r.staff_id, weekday:r.weekday, start:r.start_min, end: r.end_min==null? SHIFT_CLOSE : r.end_min,
     }; });
   });
 }
