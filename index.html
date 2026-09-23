@@ -4333,17 +4333,41 @@ function saveAssignmentChange(podId, weekday, blockId){
   // a PERMANENT weekly-schedule change, so no override is offered here; for a same-day-only fix, see
   // the quick coverage override on the live "who's here right now" board instead (Sept 2026, per
   // Allie: "I dont want it to be a permanent change, just a quick on the day change").
+  //
+  // This checks two things, not just one (Sept 2026, per Allie: "regular rostered shifts still
+  // showing one instructor for the same day different pods" — traced to a real gap here, not just a
+  // display issue): (1) who's covering the other block right now as of effDate, same as before, but
+  // also (2) whether the other block already has a FUTURE-dated change (effectiveFrom on/after
+  // effDate) scheduled to the same instructor. Without (2), saving "X starts at Pod B from today"
+  // would sail through if Pod A already has "X starts at Pod A from two weeks from now" sitting in
+  // its assignment history — no clash today, but a real overlap the moment that future change takes
+  // effect, since assignments never expire on their own. Whichever check trips first is reported.
   for(const otherPodId in podSchedule){
     if(otherPodId===podId) continue;
-    const clash=podBlocksForDay(otherPodId, weekday).find(function(ob){
-      return ob.start<block.end && block.start<ob.end && blockInstructorOn(ob, effDate)===draft.instructorId;
+    const overlappingBlocks=podBlocksForDay(otherPodId, weekday).filter(function(ob){
+      return ob.start<block.end && block.start<ob.end;
     });
-    if(clash){
-      f.error=findInstructor(draft.instructorId).name+' is already assigned to '+findPod(otherPodId).name+' at that time from '+fmtShort(effDate)+'.';
-      render();
-      return;
+    for(const ob of overlappingBlocks){
+      if(blockInstructorOn(ob, effDate)===draft.instructorId){
+        f.error=findInstructor(draft.instructorId).name+' is already assigned to '+findPod(otherPodId).name+' at that time from '+fmtShort(effDate)+'.';
+        render();
+        return;
+      }
+      const futureClash=(ob.assignments||[])
+        .filter(function(a){ return toKey(a.effectiveFrom)>=toKey(effDate) && a.instructorId===draft.instructorId; })
+        .sort(function(a,b){ return toKey(a.effectiveFrom).localeCompare(toKey(b.effectiveFrom)); })[0];
+      if(futureClash){
+        f.error=findInstructor(draft.instructorId).name+' is already scheduled to be assigned to '+findPod(otherPodId).name+' at that time from '+fmtShort(futureClash.effectiveFrom)+' — that would overlap.';
+        render();
+        return;
+      }
     }
   }
+  // Clear any stale error from a previous blocked attempt on this same form — without this, fixing
+  // the underlying clash (e.g. removing the conflicting assignment elsewhere) and retrying still left
+  // the old error message showing even though this save just succeeded (Sept 2026, found while fixing
+  // #252 above).
+  f.error='';
   block.assignments.push({instructorId:draft.instructorId, effectiveFrom:effDate});
   dbWrite('assigning instructor to shift', function(){ return supabaseClient.from('pod_shift_assignments').insert({
     block_id:blockId, instructor_id:draft.instructorId, effective_from:draft.effectiveFrom
