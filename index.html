@@ -477,6 +477,18 @@ function yearLabel(y){ y=Number(y); if(y===0) return 'K'; if(y===-1) return 'Pre
 var HORIZON_WEEKS=6; // how far ahead standing (recurring) sessions get pre-booked
 
 var TIME_OPTIONS=(function(){ const arr=[]; for(let t=CENTER_OPEN;t<=CENTER_CLOSE;t+=START_STEP) arr.push(t); return arr; })();
+// Front-desk staff (not instructors, not sessions) can be rostered starting earlier than the centre's
+// own CENTER_OPEN — e.g. to prep before students arrive (Sept 2026, per Allie: "set a shift to start
+// at 2pm"). STAFF_SHIFT_CLOSE is a sentinel end-of-shift value (not a real minute-of-day) meaning
+// "stays until the centre is locked up" rather than a predictable clock time — per Allie, an actual
+// pickable time after 7pm wouldn't fit, since closing duties don't reliably finish at the same minute
+// every day. Stored as a NULL end_min in Supabase (see add_staff_close_shift.sql) and mapped to/from
+// this sentinel at the DB boundary; every other numeric comparison in the app only ever reads a
+// rostered shift's `start` (lateness, "on-site now"), never `end`, so this sentinel needs no special
+// handling anywhere except the shift-editor forms and the one place `end` is rendered for display.
+var STAFF_SHIFT_OPEN=840; // 2:00pm
+var STAFF_SHIFT_CLOSE='close';
+var STAFF_SHIFT_TIME_OPTIONS=(function(){ const arr=[]; for(let t=STAFF_SHIFT_OPEN;t<=CENTER_CLOSE;t+=START_STEP) arr.push(t); return arr; })();
 var EXIT_STEP=5; // exit time is adjustable in finer 5-minute increments than booking's 15-minute grid
 var EXIT_TIME_OPTIONS=(function(){ const arr=[]; for(let t=CENTER_OPEN;t<=CENTER_CLOSE;t+=EXIT_STEP) arr.push(t); return arr; })();
 var AVAIL_STEP=30; // availability lookup shows seats in half-hour columns
@@ -7672,10 +7684,14 @@ function closeNewStaffForm(){ state.newStaffForm=null; render(); }
 function setNewStaffField(field, value){ state.newStaffForm[field]=value; state.newStaffForm.error=''; render(); }
 function setNewStaffShift(weekday, field, value){
   const a=state.newStaffForm.shifts[weekday];
-  a[field] = field==='off'? value : Number(value);
-  if(a.end<=a.start){
+  if(field==='off') a.off=value;
+  else if(field==='end' && value===STAFF_SHIFT_CLOSE) a.end=STAFF_SHIFT_CLOSE;
+  else a[field]=Number(value);
+  // "Close" has no fixed minute value, so it's never "before or equal to" a start time — only clamp
+  // when both ends of the shift are real clock times.
+  if(a.end!==STAFF_SHIFT_CLOSE && a.end<=a.start){
     if(field==='start') a.end=Math.min(CENTER_CLOSE, a.start+START_STEP);
-    else a.start=Math.max(CENTER_OPEN, a.end-START_STEP);
+    else a.start=Math.max(STAFF_SHIFT_OPEN, a.end-START_STEP);
   }
   state.newStaffForm.error='';
   render();
@@ -7699,7 +7715,7 @@ function saveNewStaff(){
   rows.forEach(function(r){ staffRosteredShifts.push({id:newId()||('sshift'+(nextStaffShiftId++)), staffId:newStaff.id, weekday:r.weekday, start:r.start, end:r.end}); });
   dbWrite('adding a new staff member', function(){ return supabaseClient.from('staff_members').insert({id:newStaff.id, name:newStaff.name, email:newStaff.email}).then(function(r){
     if(r.error || !rows.length) return r;
-    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:newStaff.id, weekday:row.weekday, start_min:row.start, end_min:row.end}; }));
+    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:newStaff.id, weekday:row.weekday, start_min:row.start, end_min: row.end===STAFF_SHIFT_CLOSE? null : row.end}; }));
   }); });
   const workingDays=rows.map(function(r){ return r.weekday; });
   toast(newStaff.name+' added to front desk staff'+(workingDays.length? ' — rostered '+workingDays.join(', ') : '')+'.');
@@ -7721,10 +7737,14 @@ function closeEditStaffForm(){ state.editStaffForm=null; render(); }
 function setEditStaffField(field, value){ state.editStaffForm[field]=value; state.editStaffForm.error=''; render(); }
 function setEditStaffShift(weekday, field, value){
   const a=state.editStaffForm.shifts[weekday];
-  a[field] = field==='off'? value : Number(value);
-  if(a.end<=a.start){
+  if(field==='off') a.off=value;
+  else if(field==='end' && value===STAFF_SHIFT_CLOSE) a.end=STAFF_SHIFT_CLOSE;
+  else a[field]=Number(value);
+  // "Close" has no fixed minute value, so it's never "before or equal to" a start time — only clamp
+  // when both ends of the shift are real clock times.
+  if(a.end!==STAFF_SHIFT_CLOSE && a.end<=a.start){
     if(field==='start') a.end=Math.min(CENTER_CLOSE, a.start+START_STEP);
-    else a.start=Math.max(CENTER_OPEN, a.end-START_STEP);
+    else a.start=Math.max(STAFF_SHIFT_OPEN, a.end-START_STEP);
   }
   state.editStaffForm.error='';
   render();
@@ -7746,7 +7766,7 @@ function saveEditStaff(){
     return supabaseClient.from('staff_rostered_shifts').delete().eq('staff_id', staff.id);
   }).then(function(r){
     if(!r || r.error || !rows.length) return r;
-    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:staff.id, weekday:row.weekday, start_min:row.start, end_min:row.end}; }));
+    return supabaseClient.from('staff_rostered_shifts').insert(rows.map(function(row){ return {staff_id:staff.id, weekday:row.weekday, start_min:row.start, end_min: row.end===STAFF_SHIFT_CLOSE? null : row.end}; }));
   }); });
   toast(staff.name+'\'s details updated.');
   state.editStaffForm=null;
@@ -7763,10 +7783,11 @@ function renderStaffShiftFields(shifts, setterName){
     if(!a.off){
       html+='<div style="display:flex;gap:6px">'
         +'<select onchange="'+setterName+'(\''+day+'\',\'start\',this.value)">'
-          +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+          +STAFF_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select>'
         +'<select onchange="'+setterName+'(\''+day+'\',\'end\',this.value)">'
-          +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+          +STAFF_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+          +'<option value="'+STAFF_SHIFT_CLOSE+'"'+(a.end===STAFF_SHIFT_CLOSE?' selected':'')+'>Close</option>'
         +'</select></div>';
     } else {
       html+='<div class="small muted">Off</div>';
@@ -7858,7 +7879,7 @@ function renderStaffCheckInPanel(){
   roster.forEach(function(p){
     const isInstr=p.kind==='instructor';
     const s=isInstr? instructorCheckinStatusToday(p.id) : staffStatusToday(p.id);
-    const rosteredLabel = s.rostered? rangeLabel(s.rostered.start, s.rostered.end-s.rostered.start) : '<span class="small muted">Off today</span>';
+    const rosteredLabel = s.rostered? (s.rostered.end===STAFF_SHIFT_CLOSE? minToLabel(s.rostered.start)+'–Close' : rangeLabel(s.rostered.start, s.rostered.end-s.rostered.start)) : '<span class="small muted">Off today</span>';
     let statusCell;
     if(s.state==='on-site'){
       statusCell='<span class="badge available">On site since '+minToLabel(s.records[0].checkIn)+'</span>'+(s.lateMin? ' <span class="small muted">('+s.lateMin+'m late)</span>' : '');
@@ -9827,6 +9848,26 @@ function afterLogin(){
   });
 }
 
+// Guards against an OLDER, slower live-sync refresh response overwriting FRESHER, already-applied
+// state for the same group (Sept 2026, per Allie: "student names disappearing sometimes once signed
+// in, but then re-appearing" — traced to the "Who's here right now" board, which silently drops any
+// checked-in session whose findStudent(s.studentId) doesn't resolve). scheduleLiveSync's 500ms
+// debounce only coalesces events for the SAME table arriving within that one window — two refreshes
+// for the same table triggered more than 500ms apart (routine under real traffic, especially now
+// that self-service writes actually succeed and this centre's `sessions` table has grown past
+// several thousand real rows to page through) can genuinely overlap in flight, with nothing
+// guaranteeing the one DISPATCHED earlier also RESOLVES first. If a slower, now-stale response for
+// an earlier moment in time lands after a faster, fresher one already applied, it can silently wipe
+// out a session/student that really does still exist — until the next refresh catches up and it
+// reappears. nextGroupSeq() is called synchronously at the moment a fetch is dispatched (dispatch
+// order, not resolution order); the mutation that applies a group's result checks
+// isLatestGroupSeq() right before writing and simply discards its own answer if a newer fetch for
+// that same group has been dispatched since — the newer one (already resolved, or still in flight)
+// is always the one allowed to win.
+var groupFetchSeq={};
+function nextGroupSeq(groupName){ return (groupFetchSeq[groupName]=(groupFetchSeq[groupName]||0)+1); }
+function isLatestGroupSeq(groupName, seq){ return groupFetchSeq[groupName]===seq; }
+
 // Fetches every table this logged-in user can see (Row Level Security already scopes each query
 // to their role) and reshapes it into the exact in-memory structures the rest of the app already
 // reads/writes — so every existing render/business-logic function keeps working completely
@@ -9919,6 +9960,7 @@ function fetchPodDayOverridesGroup(){
 }
 
 function fetchStudentsGroup(){
+  const mySeq=nextGroupSeq('students');
   return Promise.all([
     fetchTablePaginated('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date'),
     fetchTablePaginated('student_recurring_slots','student_id,weekday,start_min'),
@@ -9927,6 +9969,7 @@ function fetchStudentsGroup(){
     fetchTablePaginated('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     fetchTablePaginated('student_plan_change_recurring','plan_change_id,weekday,start_min'),
   ]).then(function(t){
+    if(!isLatestGroupSeq('students', mySeq)) return; // a newer students refresh was dispatched after this one — this response is now stale, discard it rather than clobber fresher state (task #246)
     const [studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows]=t;
     students=studentRows.map(function(r){ return {
       id:r.id, parentId:r.parent_id, name:r.name, year:r.year, baseYear:r.base_year, yearBaseline:r.year_baseline,
@@ -9969,7 +10012,9 @@ function fetchParentsGroup(){
 }
 
 function fetchSessionsGroup(){
+  const mySeq=nextGroupSeq('sessions');
   return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break').then(function(sessionRows){
+    if(!isLatestGroupSeq('sessions', mySeq)) return; // a newer sessions refresh was dispatched after this one — this response is now stale, discard it rather than clobber fresher state (task #246)
     sessions=sessionRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
@@ -10166,7 +10211,9 @@ function fetchStaffMembersGroup(){
 function fetchStaffRosteredShiftsGroup(){
   return fetchTablePaginated('staff_rostered_shifts','id,staff_id,weekday,start_min,end_min').then(function(staffShiftRows){
     staffRosteredShifts=staffShiftRows.map(function(r){ return {
-      id:r.id, staffId:r.staff_id, weekday:r.weekday, start:r.start_min, end:r.end_min,
+      // A NULL end_min means "Close" (see STAFF_SHIFT_CLOSE's own comment) — mapped back to that
+      // sentinel here so nothing downstream ever has to know about the raw NULL.
+      id:r.id, staffId:r.staff_id, weekday:r.weekday, start:r.start_min, end: r.end_min==null? STAFF_SHIFT_CLOSE : r.end_min,
     }; });
   });
 }
