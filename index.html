@@ -5394,6 +5394,39 @@ function removeHold(studentId, holdId){
   toast('Hold removed'+(made>0? ' — '+made+' standing session(s) re-booked.' : '.'));
   render();
 }
+// Sept 2026, per Allie: "if i delete a hold, i need any make up credits attached to that hold to also
+// disappear with it... so i need the option to remove all credits" — an explicit opt-in alongside the
+// plain Remove button, not the default behaviour, since plain removeHold() is also used for routine
+// cleanup where the credits should stay untouched. There's no direct hold_id link on a credit, so
+// "attached to that hold" means: this student's still-available (not yet redeemed) credits whose
+// issued date falls inside the hold's own date range — the same scoping holdMonthlyBreakdown() uses to
+// decide what this hold caused to be cancelled. A credit already redeemed is left alone either way, so
+// removing a hold can never quietly erase real make-up history.
+function removeHoldAndCredits(studentId, holdId){
+  const student=findStudent(studentId);
+  const hold=(student.holds||[]).find(function(h){ return h.id===holdId; });
+  if(!hold) return;
+  const startKey=toKey(hold.start), endKey=toKey(hold.end);
+  const matching=credits.filter(function(c){
+    return c.studentId===studentId && c.status==='available'
+      && toKey(c.issuedDate)>=startKey && toKey(c.issuedDate)<=endKey;
+  });
+  const countLabel=matching.length+' make-up credit'+(matching.length===1?'':'s');
+  if(!confirm('Remove this hold ('+fmtShort(hold.start)+'–'+fmtShort(hold.end)+') AND '+countLabel+' issued for it?'
+    +(matching.length? '\n\nOnly still-available (not yet redeemed) credits are affected — anything already used is untouched.' : '')
+  )) return;
+  student.holds=(student.holds||[]).filter(function(h){ return h.id!==holdId; });
+  dbWrite('removing a hold', function(){ return supabaseClient.from('student_holds').delete().eq('id', holdId); });
+  matching.forEach(function(c){
+    dbWrite('removing a credit tied to a deleted hold', function(){ return supabaseClient.from('credits').delete().eq('id', c.id); });
+  });
+  const removeIds={};
+  matching.forEach(function(c){ removeIds[c.id]=true; });
+  credits=credits.filter(function(c){ return !removeIds[c.id]; });
+  const made=regenerateAllRecurring();
+  toast('Hold removed'+(matching.length? ' along with '+countLabel : '')+(made>0? ' — '+made+' standing session(s) re-booked.' : '.'));
+  render();
+}
 
 /* ---------- Holds tab (billing support) ---------- */
 // Sept 2026, per Allie: "I need a new tab for holds. In there I need to keep track of which
@@ -5447,17 +5480,39 @@ function holdMonthlyBreakdown(studentId, hold){
   const findMonth=function(sortKey){ return months.find(function(x){ return x.sortKey===sortKey; }); };
   const seenDates={}; // dateKey -> true, so the pattern-based fallback below never double-counts a day that already has a real row
   // Collapse every raw session row down to one verdict per calendar date first. Repeated schedule
-  // edits (saveRecurringForm) cancel old-pattern rows without ever deleting them, so the same date
-  // can accumulate several historical 'cancelled' rows over time — summing rows directly (as this
-  // used to) double- or triple-counts those ghosts. A cancelled-within-this-hold's-range row always
-  // wins for its date; a scheduled/attended row only counts if nothing on that date is cancelled.
-  const byDate={};
+  // edits (saveRecurringForm, before task #87's fix) can leave several rows on file for the same
+  // date — an old 'cancelled' ghost sitting alongside a newer 'attended' or 'scheduled' row, or vice
+  // versa. Summing rows directly, or letting "cancelled" automatically win regardless of which row is
+  // actually current, both over-count: a genuinely-attended date can still carry a stale cancelled row
+  // from before a schedule edit. Real fetched rows carry a createdAt, so when it's available the row
+  // most recently WRITTEN for that date is the one that reflects reality (task #253). Rows with no
+  // createdAt at all for a given date (older data, or a manually-entered one-off) fall back to the
+  // original "cancelled always wins" rule this function used before that fix.
+  const rowsByDate={};
   sessions.forEach(function(s){
     if(s.studentId!==studentId) return;
-    const dk=toKey(s.date);
-    if(s.status==='cancelled' && dk>=startKey && dk<=endKey){
-      byDate[dk]={cancelled:true};
-    } else if((s.status==='scheduled' || s.status==='attended') && !(byDate[dk] && byDate[dk].cancelled)){
+    (rowsByDate[toKey(s.date)]=rowsByDate[toKey(s.date)]||[]).push(s);
+  });
+  const byDate={};
+  Object.keys(rowsByDate).forEach(function(dk){
+    const rows=rowsByDate[dk];
+    const withTimestamp=rows.filter(function(r){ return !!r.createdAt; });
+    const status=withTimestamp.length
+      ? withTimestamp.reduce(function(latest,r){ return r.createdAt.getTime()>latest.createdAt.getTime()? r : latest; }).status
+      : (rows.some(function(r){ return r.status==='cancelled'; })? 'cancelled' : rows[rows.length-1].status);
+    if(status==='cancelled' && dk>=startKey && dk<=endKey){
+      // A schedule that's since been edited (e.g. moved from Mon/Wed to Tue-only) can leave a stale
+      // 'cancelled' row sitting on a weekday the student no longer really attends — that's not a real
+      // session this hold cancelled, so it shouldn't count. Only accept it if the date falls on one of
+      // the student's CURRENT regular weekdays as of that date (task #253).
+      const parts=dk.split('-');
+      const d=new Date(Number(parts[0]), Number(parts[1])-1, Number(parts[2]));
+      const weekday=WEEKDAY_KEYS[(d.getDay()+6)%7];
+      const plan=studentPlanOn(studentId, d);
+      if(weekday && (plan.recurring||[]).some(function(r){ return r.weekday===weekday; })){
+        byDate[dk]={cancelled:true};
+      }
+    } else if(status==='scheduled' || status==='attended'){
       byDate[dk]={cancelled:false};
     }
   });
@@ -5508,7 +5563,8 @@ function holdReportRowHtml(r){
     +'<td class="small">'+(r.hold.note||'—')+'</td>'
     +'<td>'+(r.hold.creditsIssued||0)+'</td>'
     +'<td class="small">'+monthsCell+'</td>'
-    +'<td><button class="btn sm ghost" onclick="removeHold(\''+r.student.id+'\',\''+r.hold.id+'\')">Remove</button></td></tr>';
+    +'<td><button class="btn sm ghost" onclick="removeHold(\''+r.student.id+'\',\''+r.hold.id+'\')">Remove</button>'
+    +' <button class="btn sm ghost" onclick="removeHoldAndCredits(\''+r.student.id+'\',\''+r.hold.id+'\')" title="Also removes any still-available make-up credits issued for this hold">Remove + credits</button></td></tr>';
 }
 function currentHolds(){
   return allHoldsFlat().filter(function(r){ return holdStatus(r.hold)!=='ended'; });
@@ -8147,7 +8203,8 @@ function renderHoldModal(){
     html+='<h3 style="margin-top:18px">Holds on file</h3><table><tr><th>Dates</th><th>Note</th><th></th></tr>'
       +holds.map(function(h){
         return '<tr><td>'+fmtShort(h.start)+'–'+fmtShort(h.end)+'</td><td class="small">'+(h.note||'—')+'</td>'
-          +'<td><button class="btn sm ghost" onclick="removeHold(\''+student.id+'\',\''+h.id+'\')">Remove</button></td></tr>';
+          +'<td><button class="btn sm ghost" onclick="removeHold(\''+student.id+'\',\''+h.id+'\')">Remove</button>'
+          +' <button class="btn sm ghost" onclick="removeHoldAndCredits(\''+student.id+'\',\''+h.id+'\')" title="Also removes any still-available make-up credits issued for this hold">Remove + credits</button></td></tr>';
       }).join('')
       +'</table>';
   }
@@ -10089,13 +10146,17 @@ function fetchParentsGroup(){
 
 function fetchSessionsGroup(){
   const mySeq=nextGroupSeq('sessions');
-  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break').then(function(sessionRows){
+  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break,created_at').then(function(sessionRows){
     if(!isLatestGroupSeq('sessions', mySeq)) return; // a newer sessions refresh was dispatched after this one — this response is now stale, discard it rather than clobber fresher state (task #246)
     sessions=sessionRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
       actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false,
       bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false, termBreak:r.term_break||false,
+      // Task #253: schedule regenerations (saveRecurringForm, before task #87's fix) can leave several
+      // rows on file for the same student+date — createdAt lets holdMonthlyBreakdown() trust only the
+      // most recently written row per date instead of every stale duplicate.
+      createdAt:r.created_at? new Date(r.created_at) : null,
     }; });
     return fetchParentOccupancyIfNeeded();
   });
