@@ -3394,13 +3394,18 @@ function saveAddCredit(){
   state.addCreditForm=null;
   render();
 }
-// Only a manually-entered, still-unredeemed credit can be removed outright — corrects a migration
-// data-entry mistake without giving anyone a way to quietly erase real no-show history.
+// Sept 2026, per Allie: "i want every single credit to have a remove button" — front desk needs full
+// manual control over the credits table, not just migration-entry mistakes on unredeemed manual
+// credits (the previous restriction) — but NOT ones already redeemed against a session ("not the
+// redeemed ones"): those stay locked, so this never has to touch a session's creditId link.
 function removeCredit(id){
   const c=findCredit(id);
-  if(!c || c.source!=='manual' || c.status!=='available') return;
+  if(!c) return;
+  if(c.redeemedSessionId) return;
+  const student=findStudent(c.studentId);
+  if(!confirm('Remove this make-up credit for '+(student?student.name:'this student')+' (issued '+fmtShort(c.issuedDate)+')?')) return;
   credits=credits.filter(function(x){ return x.id!==id; });
-  dbWrite('removing a manual credit', function(){ return supabaseClient.from('credits').delete().eq('id', id); });
+  dbWrite('removing a credit', function(){ return supabaseClient.from('credits').delete().eq('id', id); });
   render();
 }
 
@@ -5394,39 +5399,6 @@ function removeHold(studentId, holdId){
   toast('Hold removed'+(made>0? ' — '+made+' standing session(s) re-booked.' : '.'));
   render();
 }
-// Sept 2026, per Allie: "if i delete a hold, i need any make up credits attached to that hold to also
-// disappear with it... so i need the option to remove all credits" — an explicit opt-in alongside the
-// plain Remove button, not the default behaviour, since plain removeHold() is also used for routine
-// cleanup where the credits should stay untouched. There's no direct hold_id link on a credit, so
-// "attached to that hold" means: this student's still-available (not yet redeemed) credits whose
-// issued date falls inside the hold's own date range — the same scoping holdMonthlyBreakdown() uses to
-// decide what this hold caused to be cancelled. A credit already redeemed is left alone either way, so
-// removing a hold can never quietly erase real make-up history.
-function removeHoldAndCredits(studentId, holdId){
-  const student=findStudent(studentId);
-  const hold=(student.holds||[]).find(function(h){ return h.id===holdId; });
-  if(!hold) return;
-  const startKey=toKey(hold.start), endKey=toKey(hold.end);
-  const matching=credits.filter(function(c){
-    return c.studentId===studentId && c.status==='available'
-      && toKey(c.issuedDate)>=startKey && toKey(c.issuedDate)<=endKey;
-  });
-  const countLabel=matching.length+' make-up credit'+(matching.length===1?'':'s');
-  if(!confirm('Remove this hold ('+fmtShort(hold.start)+'–'+fmtShort(hold.end)+') AND '+countLabel+' issued for it?'
-    +(matching.length? '\n\nOnly still-available (not yet redeemed) credits are affected — anything already used is untouched.' : '')
-  )) return;
-  student.holds=(student.holds||[]).filter(function(h){ return h.id!==holdId; });
-  dbWrite('removing a hold', function(){ return supabaseClient.from('student_holds').delete().eq('id', holdId); });
-  matching.forEach(function(c){
-    dbWrite('removing a credit tied to a deleted hold', function(){ return supabaseClient.from('credits').delete().eq('id', c.id); });
-  });
-  const removeIds={};
-  matching.forEach(function(c){ removeIds[c.id]=true; });
-  credits=credits.filter(function(c){ return !removeIds[c.id]; });
-  const made=regenerateAllRecurring();
-  toast('Hold removed'+(matching.length? ' along with '+countLabel : '')+(made>0? ' — '+made+' standing session(s) re-booked.' : '.'));
-  render();
-}
 
 /* ---------- Holds tab (billing support) ---------- */
 // Sept 2026, per Allie: "I need a new tab for holds. In there I need to keep track of which
@@ -5563,8 +5535,7 @@ function holdReportRowHtml(r){
     +'<td class="small">'+(r.hold.note||'—')+'</td>'
     +'<td>'+(r.hold.creditsIssued||0)+'</td>'
     +'<td class="small">'+monthsCell+'</td>'
-    +'<td><button class="btn sm ghost" onclick="removeHold(\''+r.student.id+'\',\''+r.hold.id+'\')">Remove</button>'
-    +' <button class="btn sm ghost" onclick="removeHoldAndCredits(\''+r.student.id+'\',\''+r.hold.id+'\')" title="Also removes any still-available make-up credits issued for this hold">Remove + credits</button></td></tr>';
+    +'<td><button class="btn sm ghost" onclick="removeHold(\''+r.student.id+'\',\''+r.hold.id+'\')">Remove</button></td></tr>';
 }
 function currentHolds(){
   return allHoldsFlat().filter(function(r){ return holdStatus(r.hold)!=='ended'; });
@@ -8203,8 +8174,7 @@ function renderHoldModal(){
     html+='<h3 style="margin-top:18px">Holds on file</h3><table><tr><th>Dates</th><th>Note</th><th></th></tr>'
       +holds.map(function(h){
         return '<tr><td>'+fmtShort(h.start)+'–'+fmtShort(h.end)+'</td><td class="small">'+(h.note||'—')+'</td>'
-          +'<td><button class="btn sm ghost" onclick="removeHold(\''+student.id+'\',\''+h.id+'\')">Remove</button>'
-          +' <button class="btn sm ghost" onclick="removeHoldAndCredits(\''+student.id+'\',\''+h.id+'\')" title="Also removes any still-available make-up credits issued for this hold">Remove + credits</button></td></tr>';
+          +'<td><button class="btn sm ghost" onclick="removeHold(\''+student.id+'\',\''+h.id+'\')">Remove</button></td></tr>';
       }).join('')
       +'</table>';
   }
@@ -8398,7 +8368,7 @@ function creditReportRowHtml(c){
     : c.source==='parent-cancel'? 'Parent cancel'
     : c.source==='closure'? 'Centre closure'
     : 'No-show';
-  const removable = c.source==='manual' && c.status==='available';
+  // Every credit gets a Remove button now, whatever its source or status (Sept 2026, per Allie).
   // Manually assigning a make-up (Sept 2026, per Allie: "I need a button to manually assign
   // make-up sessions") — offered for any available credit, not just manually-added ones, since a
   // parent might call in about ANY kind of make-up (a no-show credit, an excused absence, etc.)
@@ -8408,6 +8378,10 @@ function creditReportRowHtml(c){
   // to change the date/time) — only for a make-up that's booked but hasn't happened yet; one that's
   // already completed is history, not something to move.
   const rebookable = st==='booked';
+  // Remove button on every credit EXCEPT ones already redeemed against a session (booked or
+  // completed) — those are tied to a real session and shouldn't be deleted out from under it
+  // (Sept 2026, per Allie: "not the redeemed ones").
+  const removable = !c.redeemedSessionId;
   return '<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
     +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')+(rebookable? '<button class="btn sm ghost" onclick="rebookMakeUp(\''+c.id+'\')">Re-book</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
 }
