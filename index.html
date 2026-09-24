@@ -385,8 +385,9 @@ var CENTER_CLOSE=1140; // 7:00pm
 // window is, and an instructor may run over the 1:8 ratio by one kid for up to
 // INSTRUCTOR_OVERLOAD_TOLERANCE_MIN minutes — "an instructor can be overload for about 10 min to
 // help pack up another kid" — so a departing kid overlapping a newly-arriving one for a brief
-// handover doesn't by itself require a second instructor. See suggestedShiftsForWeekday()/
-// renderSuggestedShiftsGrid() below.
+// handover doesn't by itself require a second instructor. (The "Suggested shift durations" section
+// that used to apply these constants was removed Sept 2026, per Allie — these are now unused
+// leftover constants, kept in case a similar staffing-suggestion feature comes back.)
 var SHIFT_WAIT_TOLERANCE=15; // minutes a student may wait for their instructor to arrive
 var MIN_SHIFT_MINUTES=120;   // minimum shift length (2 hours)
 var INSTRUCTOR_OVERLOAD_TOLERANCE_MIN=10; // minutes an instructor may briefly run over the 1:8 ratio by one kid, to help a departing kid pack up while a new one settles in
@@ -1557,9 +1558,7 @@ var STUDENT_OVERLAP_TOLERANCE_MIN = 15;
 // each interval is only ever nudged relative to intervals that were already "in the room" before
 // it arrived — matching the real handover direction (later arrival defers to the almost-finished
 // earlier one), not the other way around. Ends are never adjusted, only starts. `toleranceMin`
-// defaults to STUDENT_OVERLAP_TOLERANCE_MIN (Pod-seat handover forgiveness); suggestedShiftsForWeekday
-// below passes INSTRUCTOR_OVERLOAD_TOLERANCE_MIN instead, for the same shape of forgiveness applied
-// to the 1:8 staffing ratio rather than Pod seats.
+// defaults to STUDENT_OVERLAP_TOLERANCE_MIN (Pod-seat handover forgiveness).
 function tolerantOccupancyIntervals(list, toleranceMin){
   const tol = toleranceMin==null? STUDENT_OVERLAP_TOLERANCE_MIN : toleranceMin;
   const sorted=list.slice().sort(function(a,b){ return a.start-b.start; });
@@ -2101,6 +2100,15 @@ function applyPlanChanges(){
     student.recurring = latest.stopped? [] : latest.recurring;
     student.stoppedFrom = latest.stopped? latest.effectiveFrom : null;
     student.planChanges = (student.planChanges||[]).filter(function(pc){ return toKey(pc.effectiveFrom) > toKey(simNow()); });
+    // Delete every DUE plan change from the DB once it's been promoted into student.recurring —
+    // found Sept 2026 (Poppy: edited to Tue 5pm via "Edit regular schedule", reverted back to Wed
+    // 5pm on its own every time the page reloaded). This only ever updated the in-memory copy, so
+    // the old plan-change row sat in student_plan_changes forever; every reload/live refresh re-ran
+    // applyPlanChanges() against the freshly reloaded (still-there) row and stomped whatever
+    // student_recurring_slots had just been edited to, straight back to that old pattern.
+    due.forEach(function(pc){
+      dbWrite('clearing an applied plan change', function(){ return supabaseClient.from('student_plan_changes').delete().eq('id', pc.id); });
+    });
     appliedCount++;
   });
   return appliedCount;
@@ -5823,146 +5831,6 @@ function setExpectedHeadcountWeek(offset){
   render();
 }
 
-// Suggested shift durations — NOT per Pod (Sept 2026, per Allie: "i dont want it to be matched per
-// pod, the instructors are very able to walk around, the main thing is maintaining the 1:8"). Works
-// off the whole centre's total expected headcount instead — the exact same 15-min-slot curve as
-// Expected headcount above, using the same "next occurrence of this weekday" standing pattern —
-// since instructors move freely between Pods and the only real constraint is that enough of them
-// are on shift at any moment to keep the 1:8 ratio, not which specific Pod each one is tied to.
-//
-// For each 15-min slot this works out how many instructors are actually needed
-// (ceil(headcount/RATIO_PER_INSTRUCTOR)), then "peels" that requirement curve into however many
-// overlapping shifts are needed to cover it: the 1st shift spans every slot where at least 1
-// instructor is needed, the 2nd spans every slot where at least 2 are needed, and so on — splitting
-// into separate shifts wherever a layer's own coverage isn't one continuous run (e.g. a midday lull
-// that drops back below that layer and later climbs past it again). Summed across every layer, this
-// always adds up to exactly the same total instructor-minutes as the raw headcount curve itself —
-// the minimum possible, since at every instant at least ceil(headcount/8) instructors must be
-// present regardless of how shifts are arranged — before SHIFT_WAIT_TOLERANCE/MIN_SHIFT_MINUTES (the
-// same two rules as before) pad each individual shift out where the business rules require it.
-//
-// One more hard rule, given directly (Sept 2026, per Allie): "I also must have an instructor in the
-// centre by 3pm" — regardless of whether any booking actually starts right at open, so the required-
-// instructor curve treats CENTER_OPEN as always needing at least 1, and that opening run's start
-// skips the usual arrival grace entirely (it's capped at CENTER_OPEN itself, not CENTER_OPEN+10) —
-// every OTHER run, at every other level, still gets the normal grace. ("Usually somebody will start
-// at 2 and help with phone calls, but not a necessity" — that earlier start is real practice, not a
-// rule this tool should bake in, so it isn't modelled here.)
-//
-// Padding a run out to MIN_SHIFT_MINUTES (or anchoring it to CENTER_OPEN) can occasionally stretch
-// it far enough to butt up against, or overlap, another run at that same level — e.g. a mandatory
-// "someone open at 3pm" shift padded out past a gap in bookings, right into a separate afternoon
-// run that starts on its own shortly after. mergeOverlapping() below collapses same-level runs like
-// that back into one, so the grid never shows two overlapping shifts for the same staffing level.
-var RATIO_PER_INSTRUCTOR=8; // the 1:8 ratio itself
-function mergeOverlapping(intervals){
-  const sorted=intervals.slice().sort(function(a,b){ return a.start-b.start; });
-  const out=[];
-  sorted.forEach(function(iv){
-    const last=out.length? out[out.length-1] : null;
-    if(last && iv.start<=last.end) last.end=Math.max(last.end, iv.end);
-    else out.push({start:iv.start, end:iv.end});
-  });
-  return out;
-}
-function suggestedShiftsForWeekday(wd){
-  const dateKey=toKey(nextRegularOccurrence(wd));
-  const dayList=scheduleListForDay(dateKey).filter(function(s){ return !s.online; });
-  // A departing kid overlapping a newly-arriving one for a brief handover doesn't need a second
-  // instructor just for that overlap (INSTRUCTOR_OVERLOAD_TOLERANCE_MIN) — same mechanism as the
-  // Pod-seat handover forgiveness above, applied to the ratio instead of a seat.
-  const tolerant=tolerantOccupancyIntervals(
-    dayList.map(function(s){ return {start:s.start, end:s.start+s.duration}; }),
-    INSTRUCTOR_OVERLOAD_TOLERANCE_MIN
-  );
-  const slots=[];
-  for(let t=CENTER_OPEN; t<CENTER_CLOSE; t+=15) slots.push(t);
-  const required=slots.map(function(t){
-    const headcount=tolerant.filter(function(iv){ return iv.start<t+15 && t<iv.end; }).length;
-    return Math.ceil(headcount/RATIO_PER_INSTRUCTOR);
-  });
-  required[0]=Math.max(required[0], 1); // someone must be in the centre right from CENTER_OPEN, bookings or not
-  const peak=Math.max.apply(null, required.concat([0]));
-  const shifts=[];
-  for(let level=1; level<=peak; level++){
-    // First pass: every maximal raw (unpadded) run of slots at this level — this run covers slot
-    // indices [i, j-1], i.e. minutes slots[i] through slots[j-1]+15.
-    const runs=[];
-    let i=0;
-    while(i<slots.length){
-      if(required[i]<level){ i++; continue; }
-      let j=i;
-      while(j<slots.length && required[j]>=level) j++;
-      runs.push({rawStart:slots[i], rawEnd:slots[j-1]+15});
-      i=j;
-    }
-    // Bridge short gaps between consecutive raw runs BEFORE padding (see SHORT_GAP_MERGE_MINUTES) —
-    // otherwise two nearby short bursts can each get padded toward each other and merge into one
-    // shift spanning the whole gap plus both paddings, stretching much further than either needed.
-    const bridged=[];
-    runs.forEach(function(r){
-      const last=bridged.length? bridged[bridged.length-1] : null;
-      if(last && r.rawStart-last.rawEnd<=SHORT_GAP_MERGE_MINUTES) last.rawEnd=r.rawEnd;
-      else bridged.push({rawStart:r.rawStart, rawEnd:r.rawEnd});
-    });
-    const raw=bridged.map(function(r){
-      const openingRun = level===1 && r.rawStart===CENTER_OPEN;
-      let start=openingRun? CENTER_OPEN : r.rawStart+SHIFT_WAIT_TOLERANCE;
-      let end=r.rawEnd;
-      if(end-start<MIN_SHIFT_MINUTES){
-        end=start+MIN_SHIFT_MINUTES;
-        if(end>CENTER_CLOSE){ end=CENTER_CLOSE; start=end-MIN_SHIFT_MINUTES; }
-      }
-      return {start:start, end:end};
-    });
-    mergeOverlapping(raw).forEach(function(m){ shifts.push({level:level, start:m.start, end:m.end}); });
-  }
-  shifts.sort(function(a,b){ return a.start-b.start || a.end-b.end; });
-  return {peak:peak, shifts:shifts, totalMinutes:shifts.reduce(function(sum,s){ return sum+(s.end-s.start); }, 0)};
-}
-// Total instructor-minutes CURRENTLY rostered across every Pod for a weekday — the comparison point
-// for the suggested total (Sept 2026, per Allie: "can you add a column to compare to current
-// totals?"). Summed across all Pods rather than any one, since the suggestion itself no longer is.
-function currentRosteredMinutesForWeekday(wd){
-  const today=simNow();
-  let total=0;
-  pods.forEach(function(pod){
-    podBlocksForDay(pod.id, wd).forEach(function(b){
-      if(blockInstructorOngoing(b, today)) total += (b.end-b.start);
-    });
-  });
-  return total;
-}
-// The read-only grid itself — one row per weekday rather than per Pod (Sept 2026, per Allie: "can we
-// build this as a section" — after weighing click-to-apply against a plain read-only display, she
-// went with read-only; since a suggested shift here isn't tied to any one Pod, there's no single
-// "Rostered shifts" cell to apply it to directly — it's a staffing target to roster instructors
-// against, however she splits them across Pods that day).
-function renderSuggestedShiftsGrid(){
-  let totalSuggestedAll=0, totalCurrentAll=0;
-  let html='<div style="overflow-x:auto"><table style="margin-bottom:12px"><tr><th>Day</th><th>Instructors needed at peak</th><th>Suggested shifts</th><th>Suggested total</th><th>Currently rostered</th></tr>';
-  WEEKDAY_KEYS.forEach(function(wd){
-    const result=suggestedShiftsForWeekday(wd);
-    const currentMin=currentRosteredMinutesForWeekday(wd);
-    const diff=currentMin-result.totalMinutes;
-    totalSuggestedAll+=result.totalMinutes;
-    totalCurrentAll+=currentMin;
-    const shiftsHtml=result.shifts.length
-      ? result.shifts.map(function(s){ return rangeLabel(s.start, s.end-s.start); }).join('<br>')
-      : '<span class="small muted">No instructors needed</span>';
-    html+='<tr><td><b>'+wd+'</b></td><td style="text-align:center">'+result.peak+'</td><td>'+shiftsHtml+'</td>'
-      +'<td style="text-align:center">'+hoursMinutesLabel(result.totalMinutes)+'</td>'
-      +'<td style="text-align:center">'+hoursMinutesLabel(currentMin)
-      +(diff!==0? '<br><span class="small muted">('+(diff>0?'–':'+')+hoursMinutesLabel(Math.abs(diff))+')</span>' : '')
-      +'</td></tr>';
-  });
-  html+='</table></div>';
-  const totalDiff=totalCurrentAll-totalSuggestedAll;
-  html+='<p class="small muted">Total across the week: '+hoursMinutesLabel(totalSuggestedAll)+' suggested vs '+hoursMinutesLabel(totalCurrentAll)+' currently rostered'
-    +(totalDiff!==0? ' — a potential '+(totalDiff>0?'saving':'increase')+' of '+hoursMinutesLabel(Math.abs(totalDiff))+'.' : ' — already matched.')
-    +'</p>';
-  return html;
-}
 
 // Per-Pod cards for the day the Schedule section is showing — capacity, who's covering it, and the
 // actual seated roster, all together (brought back Sept 2026, per Allie: "we need to bring back
@@ -6794,11 +6662,6 @@ function renderStaff(){
         +'</div>')
       +'<p class="small muted">How many kids are expected to physically be in the centre, in 15-min slots across the afternoon — real dates for this week or next, all 5 days from the same calendar week. Online sessions aren\'t counted here.</p>'
       +renderExpectedHeadcountGrid()
-      +'</div>';
-
-    html+=sectionOpen('suggestedShifts','Suggested shift durations')
-      +'<p class="small muted">How many instructors are needed to keep 1:8 covered across the whole centre, and for how long — not tied to any one Pod, since instructors move between Pods freely. Someone must be in the centre from 3pm regardless of bookings; after that, a student may wait up to 15 minutes for their instructor, an instructor may briefly run over the ratio by one kid for up to 10 minutes to help a departing kid pack up, every shift stays at least 2 hours, and a lull of an hour or less doesn\'t split a shift in two.</p>'
-      +renderSuggestedShiftsGrid()
       +'</div>';
 
     html+=renderWaitlistPanel();
