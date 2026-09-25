@@ -7979,10 +7979,10 @@ function renderNewInstructorModal(){
     if(!a.off){
       html+='<div style="display:flex;gap:6px">'
         +'<select onchange="setNIFAvailability(\''+day+'\',\'start\',this.value)">'
-          +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+          +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select>'
         +'<select onchange="setNIFAvailability(\''+day+'\',\'end\',this.value)">'
-          +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+          +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===a.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select></div>';
     } else {
       html+='<div class="small muted">Off</div>';
@@ -8981,10 +8981,10 @@ function renderAvailRuleModal(){
   html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400"><input type="checkbox" style="width:auto;margin:0" '+(f.off?'checked':'')+' onchange="setAvailRuleField(\'off\',this.checked)"/> Not working this day from that date</label>';
   if(!f.off){
     html+='<div class="row2"><div><label>From</label><select onchange="setAvailRuleField(\'start\',this.value)">'
-        +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
       +'</select></div>'
       +'<div><label>To</label><select onchange="setAvailRuleField(\'end\',this.value)">'
-        +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
       +'</select></div></div>';
   }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
@@ -9006,10 +9006,10 @@ function renderOneOffModal(){
   html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400"><input type="checkbox" style="width:auto;margin:0" '+(f.off?'checked':'')+' onchange="setOneOffField(\'off\',this.checked)"/> Not working that day</label>';
   if(!f.off){
     html+='<div class="row2"><div><label>From</label><select onchange="setOneOffField(\'start\',this.value)">'
-        +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
       +'</select></div>'
       +'<div><label>To</label><select onchange="setOneOffField(\'end\',this.value)">'
-        +TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
       +'</select></div></div>';
   }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
