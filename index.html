@@ -1316,6 +1316,13 @@ var state={
   // lives on the Staff tab entirely). null until first touched, so it can default to today's own
   // weekday (see renderStaff()) without needing a value baked in here.
   podSeatingWeekday:null,
+  // Which real calendar week "Pod seating — permanent changes" is showing (Sept 2026, per Allie:
+  // "can you let me select the next week as well?" — the weekday picker alone always resolved to the
+  // SOONEST upcoming occurrence of that weekday, so there was no way to line up a change for next
+  // week specifically while this week's occurrence hasn't happened yet). Same "This week"/"Next week"
+  // pattern as state.expectedHeadcountWeekOffset, kept as its own field so the two week pickers move
+  // independently — picking a pod seating change one week out shouldn't also flip the headcount grid.
+  podSeatingWeekOffset:0,
   // Which real calendar week the Expected headcount grid is showing (Sept 2026, per Allie: "i also
   // want expected headcount to be per week" — she confirmed all 5 weekday rows should anchor to the
   // SAME real calendar week, not each weekday's own independent next-occurrence date). Mirrors
@@ -4478,6 +4485,8 @@ function nextRegularOccurrence(weekday, fromDate){
 // no-op when the target weekday is already today), so the live checked-in view still works exactly
 // as before for that one case — every other weekday shows its next real, non-closed occurrence.
 function setPodSeatingWeekday(weekday){ state.podSeatingWeekday=weekday; render(); }
+// Sept 2026, per Allie: "can you let me select the next week as well?" — mirrors setExpectedHeadcountWeek.
+function setPodSeatingWeek(offset){ state.podSeatingWeekOffset=offset; render(); }
 // Same shape as peakInWindow, but returns which students are actually occupying the window instead
 // of just the peak count — used only to work out whose seat a "opening soon" slot belongs to, never
 // for capacity math itself (openSeatsAt/peakInWindow, above, are untouched).
@@ -6016,6 +6025,11 @@ function liveOccupancyGroups(dayKey){
 // shift covers the current wall-clock time, falling back to the day's last block — then reads
 // blockInstructorOn() for that calendar date, so a one-off coverage swap or a dated permanent change
 // both show up correctly, on any day, not just today.
+//
+// Also returns that block's own end time (Sept 2026, per Allie: "in whos in today, can the
+// instructors have their shift end time as well") — "until 5:00pm", or "until Close" for a block
+// flagged closesLate, same end-time display rule blockRangeLabel() already uses for the shift-block
+// editors themselves. Returns null if this Pod has no shift at all covering the moment in question.
 function podInstructorLabel(podId, dayKey){
   const date=new Date(dayKey);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
@@ -6024,7 +6038,8 @@ function podInstructorLabel(podId, dayKey){
   const nowMin=nowMinutesOfDay();
   const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
   const instrId=blockInstructorOn(block, date);
-  return instrId? findInstructor(instrId).name : null;
+  if(!instrId) return null;
+  return {name: findInstructor(instrId).name, until: block.closesLate? 'Close' : minToLabel(block.end)};
 }
 function renderLiveOccupancyBoard(dayKey){
   // No extra filtering needed here — liveOccupancyGroups() already only returns a group when it's
@@ -6061,9 +6076,9 @@ function renderLiveOccupancyBoard(dayKey){
       // there's nothing "quick" left to change (Sept 2026, per Allie: "maybe by clicking on th epod
       // number under whos here right now").
       const headAttrs = live? ' style="cursor:pointer" onclick="openQuickCoverageForm(\''+g.podId+'\')" title="Quick same-day coverage change"' : '';
-      const instrName=podInstructorLabel(g.podId, dayKey);
+      const instr=podInstructorLabel(g.podId, dayKey);
       return '<div class="cal-head"'+headAttrs+'>'+g.label+' <span class="badge '+(occupancy>=cap?'full':'available')+'" style="margin-left:4px">'+occupancy+'/'+cap+'</span>'
-        +(instrName? '<br><span class="small muted">'+instrName+'</span>' : '')
+        +(instr? '<br><span class="small muted">'+instr.name+' · until '+instr.until+'</span>' : '')
       +'</div>';
     }).join('');
     for(let seat=0; seat<maxCap; seat++){
@@ -6677,11 +6692,19 @@ function renderStaff(){
     // know to expand the section first; the header is exempt from the collapse-hide CSS, so the day
     // picker stays usable, and visible, whether the section is open or not).
     const seatingWeekday = state.podSeatingWeekday || (WEEKDAY_KEYS.indexOf(weekday)>=0? weekday : 'Mon');
-    const seatingDate = nextRegularOccurrence(seatingWeekday);
+    // "This week"/"Next week" (Sept 2026, per Allie: "can you let me select the next week as well?")
+    // — nextRegularOccurrence's own fromDate param already exists for exactly this, so a week ahead
+    // is just handing it a start-of-search date 7 days out instead of today.
+    const seatingWeekFrom = addDays(simNow(), state.podSeatingWeekOffset*7);
+    const seatingDate = nextRegularOccurrence(seatingWeekday, seatingWeekFrom);
     const seatingDateKey = toKey(seatingDate);
     const seatingDaypickerHtml = '<div class="daypicker" style="margin-bottom:0">'+WEEKDAY_KEYS.map(function(wd){
-      return '<button class="daybtn'+(wd===seatingWeekday?' active':'')+'" onclick="setPodSeatingWeekday(\''+wd+'\')">'+wd+'<span class="d2">'+nextRegularOccurrence(wd).toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
-    }).join('')+'</div>';
+      return '<button class="daybtn'+(wd===seatingWeekday?' active':'')+'" onclick="setPodSeatingWeekday(\''+wd+'\')">'+wd+'<span class="d2">'+nextRegularOccurrence(wd, seatingWeekFrom).toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
+    }).join('')+'</div>'
+      +'<div style="display:flex;gap:6px;align-items:center;margin-top:6px">'
+        +'<button class="btn sm'+(state.podSeatingWeekOffset===0?' primary':'')+'" onclick="setPodSeatingWeek(0)">This week</button>'
+        +'<button class="btn sm'+(state.podSeatingWeekOffset===1?' primary':'')+'" onclick="setPodSeatingWeek(1)">Next week</button>'
+      +'</div>';
     html+=sectionOpen('podSeating','Pod seating — permanent changes', seatingDaypickerHtml)
       +'<p class="small muted">Move a student here and it sticks — every '+seatingWeekday+' from '+fmtShort(seatingDate)+' onward, not just '+fmtShort(seatingDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead. Every regularly-scheduled ("· regular") session below should end up with a Pod of its own here — the only kids who should ever show up Unassigned on a normal day are a make-up or an extra one-off session, not a standing one.</p>'
       +renderPodSummaryStrip(seatingDateKey, seatingWeekday)
