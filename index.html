@@ -276,17 +276,32 @@ function newId(){ return (currentUser && typeof crypto!=='undefined' && crypto.r
 // rate-limit can absorb. A single retry after a short pause is cheap insurance against exactly that
 // kind of momentary blip, without adding real complexity — genuinely down/broken writes still
 // surface the toast after the second attempt, same as before.
-function dbWrite(label, promiseFn, _isRetry){
+// onDuplicateConflict (optional 4th param) — Sept 2026, per Allie: "i just assigned a closed day for
+// public holiday, and every kid got 2 make up for the same day". Root cause: two staff tabs open at
+// once (the app explicitly supports this — see subscribeToLiveUpdates()) can each independently run
+// regenerateAllRecurring() around the same moment; each tab only checks ITS OWN in-memory `sessions`
+// array for an existing occurrence before inserting a new one, so if neither tab has yet heard about
+// the other's brand-new insert (live sync is debounced ~500ms plus network time), both insert a real
+// standing session for the exact same student/date/slot — a true duplicate that a closure two ticks
+// later then dutifully cancels and credits twice. A new partial unique index on `sessions` (see
+// add_sessions_dup_guard.sql) now makes the database itself refuse the LOSING tab's insert with a
+// Postgres unique-violation (code 23505) instead of silently accepting a second row. That's not a
+// real failure — the winning tab's row already covers this occurrence — so a caller can pass
+// onDuplicateConflict to handle it quietly (clean up its own optimistic local state) instead of
+// retrying (which would just fail again forever) or showing the generic "couldn't save" toast.
+function dbWrite(label, promiseFn, _isRetry, onDuplicateConflict){
   if(!supabaseClient || !currentUser) return; // demo/offline mode — local-only, exactly as before
   promiseFn().then(function(r){
     if(r && r.error){
+      if(onDuplicateConflict && r.error.code==='23505'){ console.log('Benign duplicate-write conflict ('+label+') — another tab already created this.'); onDuplicateConflict(); return; }
       console.error('Supabase write failed ('+label+'):', r.error);
-      if(!_isRetry){ setTimeout(function(){ dbWrite(label, promiseFn, true); }, 1500); return; }
+      if(!_isRetry){ setTimeout(function(){ dbWrite(label, promiseFn, true, onDuplicateConflict); }, 1500); return; }
       toast("Couldn't save to the server — "+label+'. Your change is visible here but may not have saved.');
     }
   }).catch(function(err){
+    if(onDuplicateConflict && err && err.code==='23505'){ console.log('Benign duplicate-write conflict ('+label+') — another tab already created this.'); onDuplicateConflict(); return; }
     console.error('Supabase write failed ('+label+'):', err);
-    if(!_isRetry){ setTimeout(function(){ dbWrite(label, promiseFn, true); }, 1500); return; }
+    if(!_isRetry){ setTimeout(function(){ dbWrite(label, promiseFn, true, onDuplicateConflict); }, 1500); return; }
     toast("Couldn't save to the server — "+label+'. Your change is visible here but may not have saved.');
   });
 }
@@ -2881,12 +2896,23 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
         // above. The local sessions.push() above still runs unconditionally so rendering stays
         // correct regardless of whose session this is.
         const canPersist = !currentUser || currentUser.role==='staff' || (currentUser.role==='parent' && student.parentId===currentUser.parentId);
+        // onDuplicateConflict — see dbWrite's own comment (Sept 2026, per Allie: "every kid got 2
+        // make up for the same day"). A unique-violation here means another tab's own
+        // regenerateAllRecurring() already inserted the real row for this exact student/date/slot a
+        // moment before this one landed — that other row is the authoritative occurrence, so this
+        // tab's own optimistic local copy (pushed above, before we knew the write would lose the
+        // race) needs to come back out rather than sit there as a session this tab thinks exists but
+        // the database rejected. The next live-sync refresh would eventually correct this anyway, but
+        // there's no reason to wait out that window when we already know for certain right now.
         if(canPersist) dbWrite('pre-booking a standing session', function(){ return supabaseClient.from('sessions').insert({
           id:recSess.id, student_id:recSess.studentId, pod_id:recSess.podId, online:recSess.online, instructor_id:recSess.instructorId,
           instructor_id_2:recSess.instructorId2, handoff_min:recSess.handoff,
           the_date:toKey(recSess.date), start_min:recSess.start, duration:recSess.duration, status:recSess.status,
           booked_by:recSess.bookedBy, credit_id:recSess.creditId, is_recurring:true
-        }); });
+        }); }, false, function(){
+          sessions=sessions.filter(function(s){ return s.id!==recSess.id; });
+          render();
+        });
       }
       created++;
     });
@@ -8289,8 +8315,22 @@ function bookedCredits(){
 function settledCredits(){
   return credits.filter(function(c){ const st=creditDisplayStatus(c); return st!=='available' && st!=='soon' && st!=='booked'; });
 }
+// Sept 2026, per Allie: "beside ordering them by date missed, within each day, can they be ordered
+// alphabetically" — "date missed" is the Issued column (the date the missed session actually fell
+// on), not the Expires column these lists were previously keyed off. Sorts by issuedDate first
+// (ascending, or descending for the settled/history section, same convention as before), then breaks
+// ties on the same day alphabetically by student name so a busy closure/absence day doesn't just
+// land in whatever order credits happened to be created.
+function sortCreditsByDateMissed(list, descending){
+  return list.slice().sort(function(a,b){
+    const diff = descending? (b.issuedDate-a.issuedDate) : (a.issuedDate-b.issuedDate);
+    if(diff!==0) return diff;
+    const an=(findStudent(a.studentId)||{}).name||'', bn=(findStudent(b.studentId)||{}).name||'';
+    return an.localeCompare(bn);
+  });
+}
 function renderCreditsReport(){
-  const list=activeCredits().sort(function(a,b){ return a.expiryDate-b.expiryDate; });
+  const list=sortCreditsByDateMissed(activeCredits());
   let html=sectionOpen('credits','Make-up credits ('+list.length+')','<button class="btn sm primary" onclick="openAddCreditForm(\'\')">+ Add credit</button>');
   html+='<p>Issued automatically for an excused absence (notified in advance), a parent self-cancel, or a centre closure — never for a plain no-show, which gets no credit — or added by hand for a make-up owed from before this system (e.g. carried over from the old manual log), or any other credit front desk needs to grant directly. All expire automatically 3 months after the date entered — no manual cleanup. Once a credit is booked into a make-up it moves to the "Booked" section below; once that make-up happens (or the credit expires unused) it moves on again to "Completed & expired".</p>';
   if(list.length===0){ html+='<div class="empty-note">No make-up credits currently need action.</div>'; }
@@ -8306,7 +8346,7 @@ function renderCreditsReport(){
 // Booked credits — a make-up session is on the calendar but hasn't happened yet. The one settled
 // section that still gets a row action: Re-book, for when the family needs a different date/time.
 function renderBookedCreditsPanel(){
-  const list=bookedCredits().sort(function(a,b){ return a.expiryDate-b.expiryDate; });
+  const list=sortCreditsByDateMissed(bookedCredits());
   let html=sectionOpen('creditsBooked','Booked credits ('+list.length+')','');
   html+='<p>A make-up session has been booked against these and hasn\'t happened yet. Use Re-book if the date or time needs to change.</p>';
   if(list.length===0){ html+='<div class="empty-note">No make-up sessions currently booked and pending.</div>'; }
@@ -8322,7 +8362,7 @@ function renderBookedCreditsPanel(){
 // around (never deleted) as a record, but tucked into its own collapsed-by-default section, same
 // convention as Inactive Students/Parents below, so it doesn't bury the still-actionable ones.
 function renderSettledCreditsPanel(){
-  const list=settledCredits().sort(function(a,b){ return b.expiryDate-a.expiryDate; });
+  const list=sortCreditsByDateMissed(settledCredits(), true);
   let html=sectionOpen('creditsSettled','Completed & expired credits ('+list.length+')','');
   html+='<p>Make-ups already completed, or credits that expired unused — no action needed, kept here as a record.</p>';
   if(list.length===0){ html+='<div class="empty-note">No completed or expired credits yet.</div>'; }
