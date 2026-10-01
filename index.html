@@ -1508,10 +1508,18 @@ function findParent(id){ return parents.find(p=>p.id===id); }
 function findStaffMember(id){ return staffMembers.find(s=>s.id===id); }
 
 /* ---------- pod scheduling & capacity ---------- */
-// Sessions booked into a Pod that day (any status but cancelled) — capacity belongs to the Pod
-// as a whole, not to whichever instructor happens to be covering it at a given moment.
+// Whether a session actually puts a child in a seat that day (Oct 2026, per Allie: "why is the
+// expected headcount not taking into consideration cancelled sessions" — then "yes" to also
+// applying it to Pod capacity). Not just 'cancelled': 'excused' ("Issue Make-up Credit" — the family
+// rang ahead, they're away) and 'no-show' ("Not in Today") mean nobody's coming either, but used to
+// keep holding the seat and the headcount. Only for counting seats/heads — deliberately NOT used
+// where the session's mere existence matters (standing-session generation's duplicate check,
+// studentOverlapClash, history), so an away day is never re-booked or double-booked.
+function sessionTakesSeat(s){ return s.status!=='cancelled' && s.status!=='excused' && s.status!=='no-show'; }
+// Sessions occupying a Pod that day (see sessionTakesSeat) — capacity belongs to the Pod as a whole,
+// not to whichever instructor happens to be covering it at a given moment.
 function sessionsForDay(podId, dateKey){
-  return sessions.filter(s=> s.podId===podId && toKey(s.date)===dateKey && s.status!=='cancelled');
+  return sessions.filter(s=> s.podId===podId && toKey(s.date)===dateKey && sessionTakesSeat(s));
 }
 // Sessions a given INSTRUCTOR is personally involved in that day, across any Pod — used for their
 // own "my schedule" view, not for capacity math.
@@ -1666,7 +1674,7 @@ function podCapacityBlocked(podId, dateKey, extra){
 // counts toward whichever Pod(s) they're covering, just keyed by instructor instead of Pod.
 function instructorPhysicalSessionsForDay(instructorId, dateKey){
   return sessions.filter(function(s){
-    return (s.instructorId===instructorId || s.instructorId2===instructorId) && toKey(s.date)===dateKey && s.status!=='cancelled' && !s.online;
+    return (s.instructorId===instructorId || s.instructorId2===instructorId) && toKey(s.date)===dateKey && sessionTakesSeat(s) && !s.online;
   });
 }
 // An instructor's own Online-group sessions that day. Online sessions are never split across a
@@ -1674,7 +1682,7 @@ function instructorPhysicalSessionsForDay(instructorId, dateKey){
 // session, same as every other online student sitting in their group at that moment.
 function instructorOnlineSessionsForDay(instructorId, dateKey){
   return sessions.filter(function(s){
-    return s.instructorId===instructorId && toKey(s.date)===dateKey && s.status!=='cancelled' && !!s.online;
+    return s.instructorId===instructorId && toKey(s.date)===dateKey && sessionTakesSeat(s) && !!s.online;
   });
 }
 // Peak simultaneous COMBINED (physical + online) headcount instructor X is personally minding at
@@ -3699,6 +3707,58 @@ function confirmCheckIn(){
   render();
 }
 
+// Puts a cancelled / away ("Issue Make-up Credit") / "Not in Today" session back to booked, same
+// Pod and time (Oct 2026, per Allie: "i still need to be able to book kids in for today, even if i
+// cancelled a session for today, maybe a parent changed their mind"). Booking them fresh instead was
+// blocked for away/not-in (that session still counts as theirs — studentOverlapClash) and would have
+// left the family holding the make-up credit the cancellation issued. So this also takes back that
+// credit — the one dated to this session (every advance-notice credit is issued dated to the missed
+// session, see markStatus/parentCancelSession) — if it hasn't been used yet. A closure credit is
+// never taken back: a closure isn't something a parent changes their mind about.
+function restoreSession(sessionId){
+  const sess=findSession(sessionId);
+  if(!sess || sess.status==='scheduled' || sess.status==='attended') return;
+  const student=findStudent(sess.studentId);
+  const dateKey=toKey(sess.date);
+  if(studentOverlapClash(sess.studentId, dateKey, sess.start, sess.duration, sess.id)){
+    toast('Can\'t restore — '+student.name+' already has another session booked at that time.');
+    return;
+  }
+  if(sess.podId && dateKey!==toKey(simNow()) && podCapacityBlocked(sess.podId, dateKey, {start:sess.start, duration:sess.duration})){
+    toast('Can\'t restore — '+findPod(sess.podId).name+' is now full at that time. Book them into another Pod instead.');
+    return;
+  }
+  // A restored MAKE-UP has to use its credit again — cancelling it handed the credit back.
+  const ownCredit=sess.creditId? findCredit(sess.creditId) : null;
+  if(ownCredit && ownCredit.status!=='available' && ownCredit.redeemedSessionId!==sess.id){
+    toast('Can\'t restore — this was a make-up and its credit has since been used or expired. Book them in with a new make-up credit instead.');
+    return;
+  }
+  const dayCredits=credits.filter(function(c){
+    return c.studentId===sess.studentId && toKey(c.issuedDate)===dateKey && (c.source==='parent-cancel' || c.source==='excused-absence');
+  });
+  const unused=dayCredits.find(function(c){ return c.status==='available'; });
+  const prevStatus=sess.status;
+  if(!confirm('Restore '+student.name+'\'s session on '+fmtShort(sess.date)+' at '+minToLabel(sess.start)+'?'
+    +(unused? '\n\nThe make-up credit issued for it will be removed.' : ''))) return;
+  sess.status='scheduled';
+  dbWrite('restoring a session', function(){ return supabaseClient.from('sessions').update({status:'scheduled'}).eq('id', sess.id); });
+  if(ownCredit && ownCredit.status==='available'){
+    ownCredit.status='redeemed'; ownCredit.redeemedSessionId=sess.id;
+    dbWrite('re-using the make-up credit for a restored session', function(){ return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sess.id}).eq('id', ownCredit.id); });
+  }
+  let note='';
+  if(unused){
+    credits=credits.filter(function(c){ return c.id!==unused.id; });
+    dbWrite('removing the make-up credit for a restored session', function(){ return supabaseClient.from('credits').delete().eq('id', unused.id); });
+    note=' The make-up credit for it was removed.';
+  } else if(dayCredits.length && (prevStatus==='cancelled' || prevStatus==='excused')){
+    note=' Their make-up credit for it was already used, so it\'s been left as is.';
+  }
+  toast(student.name+' is back on for '+fmtShort(sess.date)+' at '+minToLabel(sess.start)+'.'+note, 6000);
+  render();
+}
+
 // Reverts an accidental check-in — front desk checked in the wrong student, or the right student
 // against the wrong session. Puts the session back to exactly 'scheduled' and clears every
 // check-in-specific field, so it's as if the check-in never happened: it drops back into the
@@ -4552,7 +4612,7 @@ function removeAssignment(podId, weekday, blockId, effectiveFromKey){
 // aggregate total, wherever those seats really are.
 function unassignedPeakInWindow(dateKey, winStart, winEnd){
   const list = sessions.filter(function(s){
-    return !s.podId && !s.online && toKey(s.date)===dateKey && s.status!=='cancelled'
+    return !s.podId && !s.online && toKey(s.date)===dateKey && sessionTakesSeat(s)
       && s.start<winEnd && winStart<s.start+s.duration;
   }).map(function(s){ return {start:Math.max(s.start,winStart), end:Math.min(s.start+s.duration,winEnd)}; });
   return peakConcurrencyOf(list);
@@ -5948,7 +6008,7 @@ function renderExpectedHeadcountGrid(){
   weekDates.forEach(function(date){
     const wd=WEEKDAY_KEYS[(date.getDay()+6)%7];
     const dateKey=toKey(date);
-    const dayList=scheduleListForDay(dateKey).filter(function(s){ return !s.online; });
+    const dayList=scheduleListForDay(dateKey).filter(function(s){ return !s.online && sessionTakesSeat(s); });
     html+='<tr><td><b>'+wd+'</b> <span class="small muted">'+date.toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></td>';
     slots.forEach(function(t){
       const count=dayList.filter(function(s){ return s.start<t+15 && t<s.start+s.duration; }).length;
@@ -6608,7 +6668,7 @@ function renderRegularSeating(weekday){
 function renderPodSummaryStrip(dayKey, weekday){
   const now=simNow();
   const selectedDate=new Date(dayKey);
-  const dayList=scheduleListForDay(dayKey);
+  const dayList=scheduleListForDay(dayKey).filter(sessionTakesSeat); // away / not-in kids aren't sitting anywhere (Oct 2026)
   const checkedInByPod=checkedInNamesByPod(dayKey);
   let html='<div style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px">';
   pods.forEach(function(pod){
@@ -6658,8 +6718,45 @@ function renderPodSummaryStrip(dayKey, weekday){
       +rosterTableHtml(unassigned, weekday, dayKey, now)
     +'</div>';
   }
+  html+=notComingCardHtml(dayKey);
   html+='</div>';
   return html;
+}
+// Who's off this day — cancelled, away or not in — each with a Restore (Oct 2026, see
+// restoreSession). Today/future only. Only genuine one-day absences: a standing session cancelled
+// because the regular schedule itself changed (old time/day, a stop) or by a hold isn't one, so
+// it's left out, as is anything the student has since been re-booked over.
+function notComingSessionsForDay(dayKey){
+  if(dayKey<toKey(simNow())) return [];
+  const date=new Date(dayKey);
+  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+  return sessions.filter(function(s){
+    if(toKey(s.date)!==dayKey || sessionTakesSeat(s)) return false;
+    const student=findStudent(s.studentId);
+    if(!student || isStudentInactive(student) || isStudentOnHold(s.studentId, date)) return false;
+    if(studentOverlapClash(s.studentId, dayKey, s.start, s.duration, s.id)) return false;
+    if(s.recurring){
+      const plan=studentPlanOn(s.studentId, date);
+      if(!(plan.recurring||[]).some(function(r){ return r.weekday===weekday && r.start===s.start; })) return false;
+    }
+    return true;
+  }).sort(function(a,b){ return a.start-b.start; });
+}
+function notComingCardHtml(dayKey){
+  const list=notComingSessionsForDay(dayKey);
+  if(!list.length) return '';
+  const statusLabel={cancelled:'Cancelled', excused:'Away · make-up credit', 'no-show':'Not in'};
+  return '<div class="card" style="margin:0"><div class="card-head"><h3 style="margin:0">Not coming</h3>'
+      +'<span class="small muted">Parent changed their mind? Restore puts them back in their seat.</span></div>'
+    +'<table><tr><th>Student</th><th>Time</th><th>Was in</th><th>Status</th><th></th></tr>'
+    +list.map(function(s){
+      const student=findStudent(s.studentId);
+      const where = s.online? 'Online' : (s.podId && findPod(s.podId)? findPod(s.podId).name : 'Unassigned');
+      return '<tr><td><b>'+student.name+'</b></td><td>'+rangeLabel(s.start, s.duration)+'</td><td>'+where+'</td>'
+        +'<td><span class="badge soon">'+(statusLabel[s.status]||s.status)+'</span>'+(s.creditId? ' <span class="badge firstday">Make-up</span>' : '')+'</td>'
+        +'<td><button class="btn sm ghost" onclick="restoreSession(\''+s.id+'\')">Restore</button></td></tr>';
+    }).join('')
+    +'</table></div>';
 }
 
 // Every student expected on a given day, across every Pod (and Unassigned) at once — replaces the
@@ -10726,4 +10823,3 @@ if(supabaseClient){
 </script>
 </body>
 </html>
-  
