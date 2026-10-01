@@ -2144,9 +2144,40 @@ function applyPlanChanges(){
     // the old plan-change row sat in student_plan_changes forever; every reload/live refresh re-ran
     // applyPlanChanges() against the freshly reloaded (still-there) row and stomped whatever
     // student_recurring_slots had just been edited to, straight back to that old pattern.
-    due.forEach(function(pc){
-      dbWrite('clearing an applied plan change', function(){ return supabaseClient.from('student_plan_changes').delete().eq('id', pc.id); });
-    });
+    //
+    // Oct 2026: ...but deleting the row was all it did — the promoted plan itself was never written
+    // anywhere. students.stopped_from / sessions_per_week and student_recurring_slots stayed as they
+    // were, so on the next reload the change had simply vanished: a student "Finishing today" came
+    // straight back as active (per Allie: "it will say finishing today, and when i refresh theyre
+    // back to being active"), and a dated time change reverted to the OLD time — which the app then
+    // re-booked, one source of the Sept 2026 old-time/new-time session pairs (see
+    // cleanup_stale_time_sessions.sql). Now the promoted plan is persisted FIRST, and the plan-change
+    // rows are only deleted once that's succeeded — if any step fails, the rows stay and the whole
+    // (idempotent) chain simply runs again on the next load. Staff/offline only, same rule as the
+    // standing-session self-heal: a parent or instructor login has no RLS write access to any of
+    // these tables, so they just apply it locally and leave the persisting to front desk.
+    const canPersist = !currentUser || currentUser.role==='staff';
+    if(canPersist){
+      const dueIds=due.map(function(pc){ return pc.id; });
+      const newRecurring=student.recurring;
+      dbWrite('saving a plan change that has taken effect', function(){
+        return supabaseClient.from('students').update({
+          sessions_per_week:student.sessionsPerWeek,
+          stopped_from: student.stoppedFrom? toKey(student.stoppedFrom) : null
+        }).eq('id', student.id).then(function(r){
+          if(r.error) return r;
+          return supabaseClient.from('student_recurring_slots').delete().eq('student_id', student.id);
+        }).then(function(r){
+          if(r.error || !newRecurring.length) return r;
+          return supabaseClient.from('student_recurring_slots').insert(newRecurring.map(function(rec){
+            return {student_id:student.id, weekday:rec.weekday, start_min:rec.start};
+          }));
+        }).then(function(r){
+          if(r.error) return r;
+          return supabaseClient.from('student_plan_changes').delete().in('id', dueIds);
+        });
+      });
+    }
     appliedCount++;
   });
   return appliedCount;
@@ -10154,7 +10185,7 @@ function fetchPodDayOverridesGroup(){
 function fetchStudentsGroup(){
   const mySeq=nextGroupSeq('students');
   return Promise.all([
-    fetchTablePaginated('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date'),
+    fetchTablePaginated('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date,stopped_from'),
     fetchTablePaginated('student_recurring_slots','student_id,weekday,start_min'),
     fetchTablePaginated('student_holds','id,student_id,start_date,end_date,note,credits_issued'),
     fetchTablePaginated('student_pod_assignments','id,student_id,pod_id,effective_from,weekday,online,instructor_id'),
@@ -10166,6 +10197,10 @@ function fetchStudentsGroup(){
     students=studentRows.map(function(r){ return {
       id:r.id, parentId:r.parent_id, name:r.name, year:r.year, baseYear:r.base_year, yearBaseline:r.year_baseline,
       duration:r.duration, sessionsPerWeek:r.sessions_per_week, startDate: r.start_date? new Date(r.start_date) : null,
+      // Read back in Oct 2026 — applyPlanChanges() now persists a stop once it takes effect, but this
+      // was never loaded at all, so isStudentInactive() only ever held for the one tab that happened to
+      // apply the stop, and only until its next refresh.
+      stoppedFrom: r.stopped_from? new Date(r.stopped_from) : null,
       recurring: slotRows.filter(function(s){ return s.student_id===r.id; }).map(function(s){ return {weekday:s.weekday, start:s.start_min}; }),
       holds: holdRows.filter(function(h){ return h.student_id===r.id; }).map(function(h){ return {id:h.id, start:new Date(h.start_date), end:new Date(h.end_date), note:h.note||'', creditsIssued:h.credits_issued||0}; }),
       podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from), weekday:a.weekday||null, online:a.online||false, instructorId:a.instructor_id||null}; }),
