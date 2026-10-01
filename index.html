@@ -1341,13 +1341,6 @@ var state={
   // lives on the Staff tab entirely). null until first touched, so it can default to today's own
   // weekday (see renderStaff()) without needing a value baked in here.
   podSeatingWeekday:null,
-  // Which real calendar week "Pod seating — permanent changes" is showing (Sept 2026, per Allie:
-  // "can you let me select the next week as well?" — the weekday picker alone always resolved to the
-  // SOONEST upcoming occurrence of that weekday, so there was no way to line up a change for next
-  // week specifically while this week's occurrence hasn't happened yet). Same "This week"/"Next week"
-  // pattern as state.expectedHeadcountWeekOffset, kept as its own field so the two week pickers move
-  // independently — picking a pod seating change one week out shouldn't also flip the headcount grid.
-  podSeatingWeekOffset:0,
   // Which real calendar week the Expected headcount grid is showing (Sept 2026, per Allie: "i also
   // want expected headcount to be per week" — she confirmed all 5 weekday rows should anchor to the
   // SAME real calendar week, not each weekday's own independent next-occurrence date). Mirrors
@@ -4619,8 +4612,6 @@ function nextRegularOccurrence(weekday, fromDate){
 // no-op when the target weekday is already today), so the live checked-in view still works exactly
 // as before for that one case — every other weekday shows its next real, non-closed occurrence.
 function setPodSeatingWeekday(weekday){ state.podSeatingWeekday=weekday; render(); }
-// Sept 2026, per Allie: "can you let me select the next week as well?" — mirrors setExpectedHeadcountWeek.
-function setPodSeatingWeek(offset){ state.podSeatingWeekOffset=offset; render(); }
 // Same shape as peakInWindow, but returns which students are actually occupying the window instead
 // of just the peak count — used only to work out whose seat a "opening soon" slot belongs to, never
 // for capacity math itself (openSeatsAt/peakInWindow, above, are untouched).
@@ -6048,14 +6039,17 @@ function sessionRowHtml(sess, weekday, dayKey, now){
     handoffNote = ' · with '+findInstructor(sess.instructorId).name+(sess.online? ' (online)' : '');
   }
   let html='<tr><td><b>'+student.name+'</b></td><td>'+yearLabel(student.year)+'</td><td>'+rangeLabel(sess.start,sess.duration)+'</td>';
-  // This "Move to" picker lives only in the Pod seating section (see renderPodSummaryStrip) — a
-  // PERMANENT standing change from this weekday forward (setPermanentSessionLocation), not the
-  // one-off single-session move every other Pod/Online picker in the app uses (setSessionLocation).
-  html+='<td><select onchange="setPermanentSessionLocation(\''+sess.id+'\',\''+weekday+'\',\''+dayKey+'\',this.value)">'
+  // Oct 2026: this table now lives on the Today tab's day-by-day "Pod seating" (renderPodSummaryStrip,
+  // per Allie: "show me all the kids expected to show up today... so we can organise where everyone
+  // will be sitting in advance"), so its picker is a ONE-OFF move for this session only
+  // (setSessionLocation). Permanent weekly moves are made on the Schedule tab's standing roster
+  // instead (renderRegularSeating / setPermanentStudentLocation).
+  html+='<td><select onchange="setSessionLocation(\''+sess.id+'\',this.value)">'
     +'<option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
     +locationOptionsHtml(weekday, dayKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
   +'</select></td>';
-  html+='<td class="small muted">'+sess.status+(sess.bookedBy==='parent'?' · 👪 parent':'')+(sess.recurring?' · regular':'')+handoffNote+actualNote+'</td>';
+  const kindNote = sess.creditId? ' · <span class="badge firstday">Make-up</span>' : sess.recurring? ' · regular' : ' · <span class="badge firstday">One-off</span>';
+  html+='<td class="small muted">'+sess.status+(sess.bookedBy==='parent'?' · 👪 parent':'')+kindNote+handoffNote+actualNote+'</td>';
   let actions='';
   if(sess.status==='scheduled' && toKey(sess.date)<=toKey(now)){
     actions+='<button class="btn sm success" onclick="openCheckIn(\''+sess.id+'\')">✓ Check in</button>'
@@ -6463,6 +6457,130 @@ function podSeatingsBreakdown(roster){
     return {label:(ORDINALS[idx]||(idx+1)+'th')+' seating', time:minToLabel(start), count:byStart[start].length};
   });
 }
+// "Pod seating — permanent changes" standing roster (Oct 2026, per Allie: "I dont want it to let me
+// pick by week. I want it to always show from today, and include the kids that are on hold or the
+// one-off sessions that were cancelled, next to them written cancelled or make up credit etc...
+// if theres a kid scheduled to start next week, place them in in gray - saying starting x date").
+// Built from each student's REGULAR plan for the weekday rather than from one date's sessions, so a
+// regular kid who isn't coming on the next occurrence (hold, one-off cancel, away) keeps their seat
+// on the roster — and can still be moved — instead of vanishing from it. One-off/make-up bookings
+// are deliberately left out (her call): they aren't part of the weekly seating, and the Today tab's
+// own day-by-day seating covers them. Each row describes the student's NEXT regular occurrence of
+// this weekday from today (or, for someone not started yet, their first one).
+var SEATING_CREDIT_SOURCES=['parent-cancel','excused-absence','closure'];
+function regularSeatingRows(weekday){
+  const anchor=nextRegularOccurrence(weekday, simNow());
+  const anchorKey=toKey(anchor);
+  const rows=[];
+  students.forEach(function(student){
+    if(isStudentInactive(student)) return;
+    const starting = !!(student.startDate && toKey(student.startDate)>anchorKey);
+    const date = starting? nextRegularOccurrence(weekday, student.startDate) : anchor;
+    const dayKey=toKey(date);
+    const plan=studentPlanOn(student.id, date);
+    const slot=(plan.recurring||[]).find(function(r){ return r.weekday===weekday; });
+    if(!slot) return;
+    const sameSlot=sessions.filter(function(s){ return s.studentId===student.id && toKey(s.date)===dayKey && s.start===slot.start; });
+    const live=sameSlot.find(function(s){ return s.status!=='cancelled'; }) || null;
+    const cancelled=live? null : (sameSlot[0]||null);
+    // Where they sit: the real session if there is one, otherwise their standing pin (what the next
+    // generated session will use), otherwise wherever the cancelled session had them.
+    const pin=latestStudentPodAssignment(student.id, date);
+    let location;
+    if(live) location=sessionLocationValue(live);
+    else if(pin) location=pin.online? ('online:'+pin.instructorId) : (pin.podId||'');
+    else location=cancelled? sessionLocationValue(cancelled) : '';
+    let label='', kind='';
+    if(starting){ label='Starting '+fmtShort(date); kind='starting'; }
+    else if(live){
+      if(live.status==='attended') label='Checked in';
+      else if(live.status==='excused'){ label='Away · make-up credit'; kind='away'; }
+      else if(live.status==='no-show'){ label='Not in · no credit'; kind='away'; }
+    }
+    else if(isStudentOnHold(student.id, date)){
+      const hold=(student.holds||[]).find(function(h){ return toKey(h.start)<=dayKey && dayKey<=toKey(h.end); });
+      label='On hold until '+fmtShort(hold.end); kind='hold';
+    }
+    else if(cancelled){
+      // Credits don't link back to the session they replace, but every advance-notice credit is
+      // issued dated to the missed session itself (see markStatus/parentCancelSession/closures).
+      const credited=credits.some(function(c){ return c.studentId===student.id && toKey(c.issuedDate)===dayKey && SEATING_CREDIT_SOURCES.indexOf(c.source)>=0; });
+      label = credited? 'Cancelled · make-up credit' : 'Cancelled'; kind='cancelled';
+    }
+    else if(termBreakOn(date)){ label='Summer hours — no regular session'; kind='cancelled'; }
+    else { label='Not booked yet'; kind='cancelled'; }
+    const stop=currentOrUpcomingPlanChange(student.id);
+    rows.push({student:student, start:slot.start, duration:student.duration, dayKey:dayKey, sessionId: live? live.id : null,
+      location:location, label:label, kind:kind, finishing:(stop && stop.stopped)? stop.effectiveFrom : null});
+  });
+  rows.sort(function(a,b){ return a.start-b.start || a.student.name.localeCompare(b.student.name, undefined, {sensitivity:'base'}); });
+  return {anchor:anchor, rows:rows};
+}
+// Most regular kids sitting in one group at the same moment — the number that actually has to fit
+// under the Pod's capacity. Counts everyone on the roster (on hold / starting soon included), since
+// this section is about the standing weekly seat each of them holds.
+function seatingPeak(list){
+  let peak=0;
+  list.forEach(function(r){
+    const n=list.filter(function(o){ return o.start<=r.start && r.start<o.start+o.duration; }).length;
+    if(n>peak) peak=n;
+  });
+  return peak;
+}
+function regularSeatingRowHtml(r, weekday){
+  const badgeCls={hold:'hold', cancelled:'soon', away:'soon'}[r.kind];
+  return '<tr'+(r.kind==='starting'?' style="opacity:.5"':'')+'><td><b>'+r.student.name+'</b>'
+      +(r.finishing? ' <span class="badge stopping">Finishing '+fmtShort(new Date(r.finishing))+'</span>' : '')
+    +'</td><td>'+yearLabel(r.student.year)+'</td><td>'+rangeLabel(r.start, r.duration)+'</td>'
+    +'<td><select onchange="setPermanentStudentLocation(\''+r.student.id+'\',\''+weekday+'\',\''+r.dayKey+'\','+r.start+',this.value)">'
+      +'<option value=""'+(r.location===''?' selected':'')+'>Unassigned</option>'
+      +locationOptionsHtml(weekday, r.dayKey, r.start, r.duration, r.location, r.sessionId)
+    +'</select></td>'
+    +'<td>'+(!r.label? '' : badgeCls? '<span class="badge '+badgeCls+'">'+r.label+'</span>' : '<span class="small muted">'+r.label+'</span>')+'</td></tr>';
+}
+function regularSeatingTableHtml(list, weekday){
+  return '<table><tr><th>Student</th><th>Year</th><th>Time</th><th>Move to (every '+weekday+')</th><th>Next '+weekday+'</th></tr>'
+    +list.map(function(r){ return regularSeatingRowHtml(r, weekday); }).join('')+'</table>';
+}
+function renderRegularSeating(weekday){
+  const data=regularSeatingRows(weekday);
+  const rows=data.rows;
+  let html='<div style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px">';
+  pods.forEach(function(pod){
+    const list=rows.filter(function(r){ return r.location===pod.id; });
+    const cap=podCapacity(pod.id);
+    const peak=seatingPeak(list);
+    html+='<div class="card" style="margin:0"><div class="card-head" style="flex-wrap:wrap;row-gap:6px">'
+      +'<h3 style="margin:0">'+pod.name+'</h3>'
+      +'<span class="small muted">'+podCoverageSummary(pod.id, weekday, data.anchor)+'</span>'
+      +'<span class="badge '+(peak>cap?'full':peak===cap?'soon':'available')+'" title="Most regular kids here at the same time">'+peak+'/'+cap+' at peak</span>'
+      +'<button class="btn sm ghost" style="margin-left:auto" onclick="openPodAssignForm(\''+pod.id+'\',\''+weekday+'\')">Assign</button>'
+    +'</div>'
+    +(list.length? regularSeatingTableHtml(list, weekday) : '<div class="empty-note">Nobody seated here on '+weekday+'s.</div>')
+    +'</div>';
+  });
+  const onlineByInstructor={};
+  rows.forEach(function(r){ if(String(r.location).indexOf('online:')===0){ const id=r.location.slice(7); (onlineByInstructor[id]=onlineByInstructor[id]||[]).push(r); } });
+  Object.keys(onlineByInstructor).forEach(function(instrId){
+    const instr=findInstructor(instrId);
+    if(!instr) return;
+    html+='<div class="card online" style="margin:0"><div class="card-head"><h3 style="margin:0">Online — '+instr.name+'</h3>'
+      +'<span class="badge available">'+onlineByInstructor[instrId].length+' regular</span></div>'
+      +regularSeatingTableHtml(onlineByInstructor[instrId], weekday)+'</div>';
+  });
+  // Unassigned — also catches a location pointing at a Pod or instructor that no longer exists.
+  const unassigned=rows.filter(function(r){
+    if(String(r.location).indexOf('online:')===0) return !findInstructor(r.location.slice(7));
+    return !r.location || !findPod(r.location);
+  });
+  if(unassigned.length){
+    html+='<div class="card" style="margin:0"><div class="card-head"><h3 style="margin:0;color:var(--danger)">Unassigned</h3></div>'
+      +regularSeatingTableHtml(unassigned, weekday)+'</div>';
+  }
+  html+='</div>';
+  return html;
+}
+
 function renderPodSummaryStrip(dayKey, weekday){
   const now=simNow();
   const selectedDate=new Date(dayKey);
@@ -6602,6 +6720,33 @@ function setPermanentSessionLocation(sessionId, weekday, dayKey, value){
     }).eq('id', sess.id); });
   }
 
+  const movedCount=pinStandingLocation(student, weekday, dayKey, podId, isOnline, instructorId, sessionId);
+  permanentMoveToast(student, weekday, dayKey, podId, isOnline, instructorId, movedCount);
+  render();
+}
+// The same permanent move for a regular student who has NO live session on that date to move
+// directly — on hold, cancelled just that once, or not started yet (Oct 2026, the standing roster in
+// regularSeatingRows shows them too). If they do have one, it's the session-based move above.
+function setPermanentStudentLocation(studentId, weekday, dayKey, start, value){
+  const live=sessions.find(function(s){ return s.studentId===studentId && toKey(s.date)===dayKey && s.start===start && s.status!=='cancelled'; });
+  if(live){ setPermanentSessionLocation(live.id, weekday, dayKey, value); return; }
+  const student=findStudent(studentId);
+  const isOnline=String(value).indexOf('online:')===0;
+  const podId=isOnline? null : (value||null);
+  const instructorId=isOnline? value.slice(7) : null;
+  const movedCount=pinStandingLocation(student, weekday, dayKey, podId, isOnline, instructorId, null);
+  permanentMoveToast(student, weekday, dayKey, podId, isOnline, instructorId, movedCount);
+  render();
+}
+function permanentMoveToast(student, weekday, dayKey, podId, isOnline, instructorId, movedCount){
+  const destLabel = isOnline? ('Online — '+findInstructor(instructorId).name) : (podId? findPod(podId).name : 'Unassigned');
+  toast(student.name+' permanently moved to '+destLabel+' on '+weekday+'s, from '+fmtShort(new Date(dayKey))+' onward'+(movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match' : '')+'.');
+}
+// Pins the student's standing location on one weekday from dayKey forward, then cancels and
+// regenerates their already-generated future standing sessions on that weekday so they pick it up.
+// Returns how many were regenerated. excludeSessionId: a session the caller already moved itself.
+function pinStandingLocation(student, weekday, dayKey, podId, isOnline, instructorId, excludeSessionId){
+  const sessionId=excludeSessionId;
   // Then pin it as a standing change from this weekday forward — identity for "replacing" a prior
   // pin is (effectiveFrom, weekday) together, same convention saveStudentPodAssignment() uses.
   student.podAssignments=(student.podAssignments||[]).filter(function(a){
@@ -6636,10 +6781,7 @@ function setPermanentSessionLocation(sessionId, weekday, dayKey, value){
     }
   });
   regenerateAllRecurring();
-
-  const destLabel = isOnline? ('Online — '+findInstructor(instructorId).name) : (podId? findPod(podId).name : 'Unassigned');
-  toast(student.name+' permanently moved to '+destLabel+' on '+weekday+'s, from '+fmtShort(new Date(dayKey))+' onward'+(movedCount? ' — '+movedCount+' upcoming standing session'+(movedCount===1?'':'s')+' regenerated to match' : '')+'.');
-  render();
+  return movedCount;
 }
 
 // Collapse state for front-desk sections lives on `state` (so it survives the full-page
@@ -6818,6 +6960,21 @@ function renderStaff(){
     html+=renderCoverageGrid(weekDates);
 
     html+='</div>'; // closes the Schedule card opened by sectionOpen('schedule', ...) above.
+
+    // Day-by-day Pod seating (Oct 2026, per Allie: "a similar set up (This time very much day by day)
+    // in the Today tab. Its purpose will be to show me all the kids expected to show up today - any
+    // cancelled sessions gone, any make ups shown, so we can organise where everyone will be sitting
+    // in advance"). Follows the Schedule section's own day picker above (today by default), lists
+    // every live session that day — make-ups and one-offs included, cancellations left out — and
+    // every move made here is for that one session only. The standing weekly version is on the
+    // Schedule tab.
+    if(!closure){
+      const seatingWeekdayToday=WEEKDAY_KEYS[(new Date(dayKey).getDay()+6)%7];
+      html+=sectionOpen('daySeating','Pod seating — '+fmtLong(new Date(dayKey)))
+        +'<p class="small muted">Everyone expected on this day, including make-ups. Cancelled sessions aren\'t shown. Moving someone here changes this day only; to change where they sit every week, use Pod seating on the Schedule tab.</p>'
+        +(WEEKDAY_KEYS.indexOf(seatingWeekdayToday)>=0? renderPodSummaryStrip(dayKey, seatingWeekdayToday) : '<div class="empty-note">No sessions on weekends.</div>')
+        +'</div>';
+    }
   } else if(tab==='schedule'){
     // Availability lookup sits at the top of Schedule (Sept 2026, per Allie: "move availability
     // lookup to the top of the schedule tab"). The day-by-day coverage grid that used to sit directly
@@ -6853,22 +7010,15 @@ function renderStaff(){
     // know to expand the section first; the header is exempt from the collapse-hide CSS, so the day
     // picker stays usable, and visible, whether the section is open or not).
     const seatingWeekday = state.podSeatingWeekday || (WEEKDAY_KEYS.indexOf(weekday)>=0? weekday : 'Mon');
-    // "This week"/"Next week" (Sept 2026, per Allie: "can you let me select the next week as well?")
-    // — nextRegularOccurrence's own fromDate param already exists for exactly this, so a week ahead
-    // is just handing it a start-of-search date 7 days out instead of today.
-    const seatingWeekFrom = addDays(simNow(), state.podSeatingWeekOffset*7);
-    const seatingDate = nextRegularOccurrence(seatingWeekday, seatingWeekFrom);
-    const seatingDateKey = toKey(seatingDate);
+    // No week picker any more (Oct 2026, per Allie: "I dont want it to let me pick by week. I want it
+    // to always show from today") — each weekday is its standing roster from today onward; see
+    // regularSeatingRows(). The date under each button is just the next occurrence, for reference.
     const seatingDaypickerHtml = '<div class="daypicker" style="margin-bottom:0">'+WEEKDAY_KEYS.map(function(wd){
-      return '<button class="daybtn'+(wd===seatingWeekday?' active':'')+'" onclick="setPodSeatingWeekday(\''+wd+'\')">'+wd+'<span class="d2">'+nextRegularOccurrence(wd, seatingWeekFrom).toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
-    }).join('')+'</div>'
-      +'<div style="display:flex;gap:6px;align-items:center;margin-top:6px">'
-        +'<button class="btn sm'+(state.podSeatingWeekOffset===0?' primary':'')+'" onclick="setPodSeatingWeek(0)">This week</button>'
-        +'<button class="btn sm'+(state.podSeatingWeekOffset===1?' primary':'')+'" onclick="setPodSeatingWeek(1)">Next week</button>'
-      +'</div>';
+      return '<button class="daybtn'+(wd===seatingWeekday?' active':'')+'" onclick="setPodSeatingWeekday(\''+wd+'\')">'+wd+'<span class="d2">'+nextRegularOccurrence(wd, simNow()).toLocaleDateString('en-AU',{month:'short',day:'numeric'})+'</span></button>';
+    }).join('')+'</div>';
     html+=sectionOpen('podSeating','Pod seating — permanent changes', seatingDaypickerHtml)
-      +'<p class="small muted">Move a student here and it sticks — every '+seatingWeekday+' from '+fmtShort(seatingDate)+' onward, not just '+fmtShort(seatingDate)+' itself. For a one-off swap just for a single session, use "Move pod" wherever that session appears instead. Every regularly-scheduled ("· regular") session below should end up with a Pod of its own here — the only kids who should ever show up Unassigned on a normal day are a make-up or an extra one-off session, not a standing one.</p>'
-      +renderPodSummaryStrip(seatingDateKey, seatingWeekday)
+      +'<p class="small muted">Every regular '+seatingWeekday+' student and where they sit, from today onward. Move someone here and it sticks for every '+seatingWeekday+' from now on. Kids who are on hold, away or cancelled for the next one are still listed (with a note) because they keep their seat, and kids who haven\'t started yet are greyed out with their start date. Make-ups and one-off extra sessions aren\'t listed — sort those on the Today tab.</p>'
+      +renderRegularSeating(seatingWeekday)
       +'</div>';
   } else if(tab==='students'){
     html+=renderStudentsPanel();
