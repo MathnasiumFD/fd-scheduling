@@ -6178,9 +6178,33 @@ function podInstructorLabel(podId, dayKey){
   const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
   const instrId=blockInstructorOn(block, date);
   if(!instrId) return null;
+  // Oct 2026, per Allie ("whos here right now instructor times are weird" — right instructor, wrong
+  // end time): availability is when someone COULD work, not their shift, so an instructor available
+  // until 7pm but rostered until 5:30 showed "until 7:00pm". Now: the end of the last shift block
+  // they're actually covering that day across ALL Pods (still the instructor's own time, not this
+  // Pod's — moving to a second Pod later on counts), capped by their availability if that ends
+  // sooner (a one-off "leaving at 5 today"). Availability alone is only the fallback for someone
+  // with no block of their own, then the Pod block, same as before.
+  const shift=instructorShiftEndOn(instrId, date);
   const avail=instructorAvailabilityOn(instrId, date);
-  const until = avail? minToLabel(avail.end) : (block.closesLate? 'Close' : minToLabel(block.end));
+  let until;
+  if(shift) until = (avail && avail.end<shift.end)? minToLabel(avail.end) : (shift.closesLate? 'Close' : minToLabel(shift.end));
+  else until = avail? minToLabel(avail.end) : (block.closesLate? 'Close' : minToLabel(block.end));
   return {name: findInstructor(instrId).name, until: until};
+}
+// When an instructor's rostered day actually ends: the latest-ending shift block they're covering
+// on this date in any Pod (one-off coverage swaps included, via blockInstructorOn). null if they
+// aren't on any block that day.
+function instructorShiftEndOn(instructorId, date){
+  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+  let latest=null;
+  pods.forEach(function(pod){
+    podBlocksForDay(pod.id, weekday).forEach(function(b){
+      if(blockInstructorOn(b, date)!==instructorId) return;
+      if(!latest || b.end>latest.end || (b.end===latest.end && b.closesLate)) latest={end:b.end, closesLate:!!b.closesLate};
+    });
+  });
+  return latest;
 }
 function renderLiveOccupancyBoard(dayKey){
   // No extra filtering needed here — liveOccupancyGroups() already only returns a group when it's
@@ -10702,3 +10726,4 @@ if(supabaseClient){
 </script>
 </body>
 </html>
+  
