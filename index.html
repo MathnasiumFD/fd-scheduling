@@ -289,17 +289,27 @@ function newId(){ return (currentUser && typeof crypto!=='undefined' && crypto.r
 // real failure — the winning tab's row already covers this occurrence — so a caller can pass
 // onDuplicateConflict to handle it quietly (clean up its own optimistic local state) instead of
 // retrying (which would just fail again forever) or showing the generic "couldn't save" toast.
+// Oct 2026: also 23P01 — the sessions_no_student_overlap exclusion constraint
+// (add_sessions_no_overlap_guard.sql) refusing a session that overlaps one the student already has
+// that day. Typically a device that hadn't yet picked up a regular-time change re-booking the OLD
+// time (Noelle Sukkar 15:15 alongside her new 15:35, and ~58 others). Unlike 23505 it's retried once
+// first: within this same tab, a time change fires its "cancel old session" and "insert new session"
+// writes concurrently, so the insert can briefly land before its own cancel has committed. Only if
+// the retry is refused too is it treated as the benign, stale-copy case.
+function isBenignConflict(err, isRetry){
+  return !!err && (err.code==='23505' || (err.code==='23P01' && isRetry));
+}
 function dbWrite(label, promiseFn, _isRetry, onDuplicateConflict){
   if(!supabaseClient || !currentUser) return; // demo/offline mode — local-only, exactly as before
   promiseFn().then(function(r){
     if(r && r.error){
-      if(onDuplicateConflict && r.error.code==='23505'){ console.log('Benign duplicate-write conflict ('+label+') — another tab already created this.'); onDuplicateConflict(); return; }
+      if(onDuplicateConflict && isBenignConflict(r.error, _isRetry)){ console.log('Benign duplicate-write conflict ('+label+') — another tab already created this.'); onDuplicateConflict(); return; }
       console.error('Supabase write failed ('+label+'):', r.error);
       if(!_isRetry){ setTimeout(function(){ dbWrite(label, promiseFn, true, onDuplicateConflict); }, 1500); return; }
       toast("Couldn't save to the server — "+label+'. Your change is visible here but may not have saved.');
     }
   }).catch(function(err){
-    if(onDuplicateConflict && err && err.code==='23505'){ console.log('Benign duplicate-write conflict ('+label+') — another tab already created this.'); onDuplicateConflict(); return; }
+    if(onDuplicateConflict && isBenignConflict(err, _isRetry)){ console.log('Benign duplicate-write conflict ('+label+') — another tab already created this.'); onDuplicateConflict(); return; }
     console.error('Supabase write failed ('+label+'):', err);
     if(!_isRetry){ setTimeout(function(){ dbWrite(label, promiseFn, true, onDuplicateConflict); }, 1500); return; }
     toast("Couldn't save to the server — "+label+'. Your change is visible here but may not have saved.');
@@ -1362,6 +1372,12 @@ var state={
   availSessionLen:AVAIL_MIN_SESSION_LEN, // Sept 2026: front desk can match this to the actual family's session length (see setAvailSessionLen) — see the "no open slots" bug writeup near openSlotsForCredit for why this defaulting-to-90-regardless-of-duration was misleading
   availRuleForm:null,
   oneOffForm:null,
+  // Sept 2026, per Allie: "front desk can set shifts to staff or cancell single shifts if theres
+  // low attendance on a day" — a front-desk staff member's own equivalent of an instructor's
+  // one-off availability change (see oneOffForm above), scoped to a single date, on top of their
+  // standing weekly pattern from staff_rostered_shifts.
+  staffOneOffManagerFor:null,
+  staffOneOffForm:null,
   moveForm:null,
   coverageRequestForm:null,
   addCreditForm:null,
@@ -3859,6 +3875,21 @@ function staffWeeklyPattern(staffId){
 function staffRosteredOn(staffId, weekday){
   return staffShiftsFor(staffId).find(function(s){ return s.weekday===weekday; }) || null;
 }
+// What a front-desk staff member is actually rostered for on a specific calendar date — same
+// one-off-beats-standing-pattern resolution order as instructorAvailabilityOn (Sept 2026, per
+// Allie: "front desk can set shifts to staff or cancell single shifts if theres low attendance on
+// a day"). A staffOneOffs entry for this exact date always wins, whether that's cancelling an
+// otherwise-rostered day (off:true) or giving them a one-off shift/changed time (off:false,
+// start/end) — including calling someone in on a day they're not normally rostered at all. With no
+// one-off on file for the date, falls back to the plain weekly pattern.
+function staffShiftOn(staffId, date){
+  const staff=findStaffMember(staffId);
+  const dateKey=toKey(date);
+  const oneOff=(staff&&staff.oneOffs||[]).find(function(o){ return toKey(o.date)===dateKey; });
+  if(oneOff) return oneOff.off? null : {start:oneOff.start, end:oneOff.end};
+  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+  return staffRosteredOn(staffId, weekday);
+}
 function staffAttendanceRecordsFor(staffId, dateKey){
   return staffAttendance.filter(function(a){ return a.staffId===staffId && toKey(a.date)===dateKey; })
     .sort(function(a,b){ return a.checkIn-b.checkIn; });
@@ -3881,8 +3912,7 @@ function staffHoursLabel(mins){ return mins==null? '—' : (mins/60).toFixed(1)+
 function staffStatusToday(staffId){
   const today=simNow();
   const todayKey=toKey(today);
-  const weekday=WEEKDAY_KEYS[(today.getDay()+6)%7];
-  const rostered=staffRosteredOn(staffId, weekday);
+  const rostered=staffShiftOn(staffId, today);
   const records=staffAttendanceRecordsFor(staffId, todayKey);
   const openRec=staffOpenRecord(staffId, todayKey);
   let lateMin=null;
@@ -3923,8 +3953,7 @@ function staffNoShowsSince(days){
     for(let i=1;i<=days;i++){
       const d=addDays(today, -i);
       const dKey=toKey(d);
-      const weekday=WEEKDAY_KEYS[(d.getDay()+6)%7];
-      const rostered=staffRosteredOn(st.id, weekday);
+      const rostered=staffShiftOn(st.id, d);
       if(!rostered) continue;
       if(staffAttendanceRecordsFor(st.id, dKey).length===0) list.push({staffId:st.id, date:d, rostered:rostered});
     }
@@ -4216,6 +4245,54 @@ function removeOneOff(instrId, idx){
   if(oo){
     dbWrite('removing one-off change', function(){ return supabaseClient.from('instructor_one_offs').delete()
       .eq('instructor_id', instr.id).eq('the_date', toKey(oo.date)); });
+  }
+  render();
+}
+
+/* ---------- front-desk staff one-off shift changes ---------- */
+// Sept 2026, per Allie: "front desk can set shifts to staff or cancell single shifts if theres low
+// attendance on a day" — the front-desk-staff equivalent of an instructor's one-off availability
+// change above (openOneOffForm/saveOneOff/removeOneOff). Deliberately no "ongoing change" editor
+// here to mirror — a staff member's standing weekly pattern is already edited directly from "Edit
+// details" (renderStaffShiftFields); this only ever touches a single exact date, resolved by
+// staffShiftOn() ahead of the regular pattern.
+function openStaffOneOffManager(staffId){ state.staffOneOffManagerFor=staffId; render(); }
+function closeStaffOneOffManager(){ state.staffOneOffManagerFor=null; render(); }
+function openStaffOneOffForm(staffId){
+  state.staffOneOffForm={staffId:staffId, date:toKey(simNow()), off:true, start:CENTER_OPEN, end:CENTER_CLOSE};
+  render();
+}
+function closeStaffOneOffForm(){ state.staffOneOffForm=null; render(); }
+function setStaffOneOffField(field, value){
+  const f=state.staffOneOffForm;
+  if(field==='off') f.off=value;
+  else if(field==='date') f.date=value;
+  else if(field==='end' && value===SHIFT_CLOSE) f.end=SHIFT_CLOSE;
+  else f[field]=Number(value);
+  render();
+}
+function saveStaffOneOff(){
+  const f=state.staffOneOffForm;
+  const staff=findStaffMember(f.staffId);
+  if(!f.date) return;
+  staff.oneOffs=(staff.oneOffs||[]).filter(function(o){ return toKey(o.date)!==f.date; }); // one override per date
+  staff.oneOffs.push({date:new Date(f.date), start:f.start, end:f.end, off:f.off});
+  dbWrite('saving one-off staff shift change', function(){
+    return supabaseClient.from('staff_one_offs').delete().eq('staff_id', staff.id).eq('the_date', f.date).then(function(){
+      return supabaseClient.from('staff_one_offs').insert({staff_id:staff.id, the_date:f.date, off:f.off, start_min:f.start, end_min: f.end===SHIFT_CLOSE? null : f.end});
+    });
+  });
+  toast('Saved — one-off shift change for '+staff.name+' on '+fmtShort(new Date(f.date))+' ('+(f.off?'not working — shift cancelled':minToLabel(f.start)+'–'+(f.end===SHIFT_CLOSE?'Close':minToLabel(f.end)))+').');
+  state.staffOneOffForm=null;
+  render();
+}
+function removeStaffOneOff(staffId, idx){
+  const staff=findStaffMember(staffId);
+  const oo=staff.oneOffs[idx];
+  staff.oneOffs.splice(idx,1);
+  if(oo){
+    dbWrite('removing one-off staff shift change', function(){ return supabaseClient.from('staff_one_offs').delete()
+      .eq('staff_id', staff.id).eq('the_date', toKey(oo.date)); });
   }
   render();
 }
@@ -6052,10 +6129,21 @@ function liveOccupancyGroups(dayKey){
 // blockInstructorOn() for that calendar date, so a one-off coverage swap or a dated permanent change
 // both show up correctly, on any day, not just today.
 //
-// Also returns that block's own end time (Sept 2026, per Allie: "in whos in today, can the
-// instructors have their shift end time as well") — "until 5:00pm", or "until Close" for a block
-// flagged closesLate, same end-time display rule blockRangeLabel() already uses for the shift-block
-// editors themselves. Returns null if this Pod has no shift at all covering the moment in question.
+// Also returns an end time (Sept 2026, per Allie: "in whos in today, can the instructors have their
+// shift end time as well") — "until 5:00pm".
+//
+// Sept 2026 fix, per Allie: "when i change the bit that says instructor until x time, i dont want
+// their time to change. The time is attached to the instructor, not to the pod" — this used to read
+// the POD's own shift block end time (block.end/closesLate — when the Pod itself is covered until),
+// which is a front-desk-editable property of the Pod's coverage grid, not of the instructor. That
+// meant editing the Pod's shift block end time silently changed what looked like the instructor's own
+// hours here, AND (her second report) editing an instructor's actual weekly availability had NO
+// effect on this board at all, since it was never consulted. Now reads the instructor's own
+// standing/one-off availability (instructorAvailabilityOn — the same source their own login, the
+// "Adjust availability" editor, and instructorCurrentWeeklyPattern() all use) for its end time, and
+// only falls back to the Pod block's end time in the edge case where an instructor is covering a Pod
+// with no availability record of their own for this date (e.g. a manually arranged f2f cover).
+// Returns null if this Pod has no shift at all covering the moment in question.
 function podInstructorLabel(podId, dayKey){
   const date=new Date(dayKey);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
@@ -6065,7 +6153,9 @@ function podInstructorLabel(podId, dayKey){
   const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
   const instrId=blockInstructorOn(block, date);
   if(!instrId) return null;
-  return {name: findInstructor(instrId).name, until: block.closesLate? 'Close' : minToLabel(block.end)};
+  const avail=instructorAvailabilityOn(instrId, date);
+  const until = avail? minToLabel(avail.end) : (block.closesLate? 'Close' : minToLabel(block.end));
+  return {name: findInstructor(instrId).name, until: until};
 }
 function renderLiveOccupancyBoard(dayKey){
   // No extra filtering needed here — liveOccupancyGroups() already only returns a group when it's
@@ -6255,6 +6345,15 @@ function saveQuickCoverage(){
     });
   });
   regenerateAllRecurring();
+  // Sept 2026, root cause of "sometimes my instructors can't move a kid to a different pod": this
+  // quick same-day swap changes who the LIVE board says covers the Pod right now, but any session
+  // already checked in (or otherwise already booked) before the swap still has the OLD instructor's
+  // id sitting on its own row — nothing used to touch it. The sessions RLS write policy gates an
+  // instructor's UPDATE on that session's own stored instructor_id/instructor_id_2, not on live
+  // coverage, so the new covering instructor was silently refused trying to move or check out a kid
+  // whose session was still tagged with whoever covered it before this swap. Same single-date
+  // resync saveDayOverride()/fillCoverageRequest() already rely on for exactly this reason.
+  reassignSessionsForCoverageChange(f.podId, f.weekday, todayKey);
   toast(isNoInstructor
     ? findPod(f.podId).name+' is marked unstaffed for today only — its regular schedule is unchanged.'
     : instr.name+' is covering '+findPod(f.podId).name+' for today only — their regular schedule is unchanged.');
@@ -6275,6 +6374,11 @@ function clearQuickCoverage(){
     return supabaseClient.from('pod_shift_one_off_coverage').delete().eq('block_id', block.id).eq('the_date', todayKey);
   });
   regenerateAllRecurring();
+  // Same resync on the way back to normal, for the same reason as saveQuickCoverage() above —
+  // reverting the override is itself a coverage change and can just as easily leave an
+  // already-booked session's stored instructor_id pointing at whoever covered it during the
+  // override instead of the regular instructor now back in charge.
+  reassignSessionsForCoverageChange(f.podId, f.weekday, todayKey);
   toast(findPod(f.podId).name+'’s regular schedule is back in effect for today.');
   state.quickCoverageForm=null;
   render();
@@ -7724,7 +7828,7 @@ function saveNewStaff(){
   if(staffMembers.some(function(s){ return s.email.toLowerCase()===f.email.trim().toLowerCase(); })){
     f.error='A staff member with that email already exists.'; render(); return;
   }
-  const newStaff={id:newId()||('staff'+(nextStaffMemberId++)), name:f.name.trim(), email:f.email.trim(), authUserId:null};
+  const newStaff={id:newId()||('staff'+(nextStaffMemberId++)), name:f.name.trim(), email:f.email.trim(), authUserId:null, oneOffs:[]};
   staffMembers.push(newStaff);
   const rows=shiftFormToRows(f.shifts);
   rows.forEach(function(r){ staffRosteredShifts.push({id:newId()||('sshift'+(nextStaffShiftId++)), staffId:newStaff.id, weekday:r.weekday, start:r.start, end:r.end}); });
@@ -7832,6 +7936,61 @@ function renderEditStaffModal(){
   return html;
 }
 
+// One-off shift changes for a front-desk staff member (Sept 2026, per Allie: "front desk can set
+// shifts to staff or cancell single shifts if theres low attendance on a day") — lists what's on
+// file and opens the small date/time form below to add another. Deliberately a separate modal from
+// "Edit details": that one is the standing weekly pattern, this one only ever touches a single date.
+function renderStaffOneOffManagerModal(){
+  const staffId=state.staffOneOffManagerFor;
+  if(!staffId) return '';
+  const staff=findStaffMember(staffId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeStaffOneOffManager()"><div class="modal" style="max-width:560px">';
+  html+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><h3 style="margin:0">One-off shift changes — '+staff.name+'</h3><button class="btn sm ghost" onclick="closeStaffOneOffManager()">Close</button></div>';
+  html+='<p>A change to a single date only — '+staff.name+'\'s regular rostered shift (set from "Edit details") resumes automatically from the next occurrence. Use this to call someone in for an extra shift on a busy day, or cancel a single shift on a quiet one, without touching their standing weekly pattern.</p>';
+  html+='<button class="btn sm primary" onclick="openStaffOneOffForm(\''+staff.id+'\')">+ One-off change</button>';
+  const oneOffs=(staff.oneOffs||[]).slice().sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)); });
+  html+='<h3 style="margin-top:16px">On file</h3>';
+  if(oneOffs.length===0) html+='<div class="empty-note">None on file.</div>';
+  else{
+    html+='<table><tr><th>Date</th><th>Shift</th><th></th></tr>'
+      +oneOffs.map(function(o){
+        const idx=staff.oneOffs.indexOf(o);
+        const shiftLabel = o.off? 'Cancelled — not working' : (o.end===SHIFT_CLOSE? minToLabel(o.start)+'–Close' : rangeLabel(o.start, o.end-o.start));
+        return '<tr><td>'+fmtShort(o.date)+'</td><td>'+shiftLabel+'</td>'
+          +'<td><button class="btn sm ghost" onclick="removeStaffOneOff(\''+staff.id+'\','+idx+')">Remove</button></td></tr>';
+      }).join('')
+      +'</table>';
+  }
+  html+='</div></div>';
+  html+=renderStaffOneOffFormModal();
+  return html;
+}
+function renderStaffOneOffFormModal(){
+  const f=state.staffOneOffForm;
+  if(!f) return '';
+  const staff=findStaffMember(f.staffId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeStaffOneOffForm()"><div class="modal">';
+  html+='<h3>One-off shift change — '+staff.name+'</h3>';
+  html+='<p>Affects this single date only — the regular rostered shift resumes automatically from the next occurrence.</p>';
+  html+='<label>Date</label><input type="date" value="'+f.date+'" onchange="setStaffOneOffField(\'date\',this.value)"/>';
+  html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400"><input type="checkbox" style="width:auto;margin:0" '+(f.off?'checked':'')+' onchange="setStaffOneOffField(\'off\',this.checked)"/> Cancel this shift — not working that day</label>';
+  if(!f.off){
+    html+='<div class="row2"><div><label>From</label><select onchange="setStaffOneOffField(\'start\',this.value)">'
+        +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.start?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+      +'</select></div>'
+      +'<div><label>To</label><select onchange="setStaffOneOffField(\'end\',this.value)">'
+        +EARLY_SHIFT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===f.end?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+        +'<option value="'+SHIFT_CLOSE+'"'+(f.end===SHIFT_CLOSE?' selected':'')+'>Close</option>'
+      +'</select></div></div>';
+  }
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+    +'<button class="btn ghost" onclick="closeStaffOneOffForm()">Cancel</button>'
+    +'<button class="btn primary" onclick="saveStaffOneOff()">Save</button>'
+  +'</div>';
+  html+='</div></div>';
+  return html;
+}
+
 function renderNewStaffModal(){
   const f=state.newStaffForm;
   if(!f) return '';
@@ -7861,12 +8020,13 @@ function renderFrontStaffPanel(){
       : s.authUserId==='pending'? '<span class="badge soon">Invited</span>'
       : s.authUserId? '<span class="badge available">Active</span>'
       : '<button class="btn sm ghost" onclick="inviteLogin(\''+s.email+'\',\'staff\',\''+s.id+'\',\''+s.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
-    html+='<tr><td>'+s.name+'</td><td class="small">'+s.email+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditStaffForm(\''+s.id+'\')">Edit details</button></td></tr>';
+    html+='<tr><td>'+s.name+'</td><td class="small">'+s.email+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditStaffForm(\''+s.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openStaffOneOffManager(\''+s.id+'\')">One-off shift change</button></td></tr>';
   });
   if(staffMembers.length===0) html+='<tr><td colspan="4" class="small muted">No named staff yet — everyone currently signs in with a shared front-desk login.</td></tr>';
   html+='</table></div>';
   html+=renderNewStaffModal();
   html+=renderEditStaffModal();
+  html+=renderStaffOneOffManagerModal();
   return html;
 }
 
@@ -7989,8 +8149,7 @@ function renderStaffTimesheetPanel(){
       +recent.map(function(r){
         const isInstr=r.instructorId!=null;
         const person = isInstr? findInstructor(r.instructorId) : findStaffMember(r.staffId);
-        const weekday=WEEKDAY_KEYS[(new Date(r.date).getDay()+6)%7];
-        const rostered = isInstr? instructorAvailabilityOn(r.instructorId, r.date) : staffRosteredOn(r.staffId, weekday);
+        const rostered = isInstr? instructorAvailabilityOn(r.instructorId, r.date) : staffShiftOn(r.staffId, r.date);
         let vsRoster='<span class="small muted">Not rostered</span>';
         if(rostered){
           vsRoster = r.checkIn>rostered.start? '<span class="badge full">'+(r.checkIn-rostered.start)+'m late</span>' : '<span class="badge available">On time</span>';
@@ -9766,7 +9925,7 @@ var DATA_GROUP_TABLES={
   waitlist:['waitlist_entries'],
   closedDays:['closed_days'],
   enrollmentRequests:['enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring'],
-  staffMembers:['staff_members'],
+  staffMembers:['staff_members','staff_one_offs'],
   staffRosteredShifts:['staff_rostered_shifts'],
   staffAttendance:['staff_attendance'],
   termBreaks:['term_breaks','term_break_coverage'],
@@ -10238,9 +10397,18 @@ function fetchEnrollmentRequestsGroup(){
 }
 
 function fetchStaffMembersGroup(){
-  return fetchTablePaginated('staff_members','id,name,email,auth_user_id').then(function(staffMemberRows){
+  return Promise.all([
+    fetchTablePaginated('staff_members','id,name,email,auth_user_id'),
+    fetchTablePaginated('staff_one_offs','staff_id,the_date,off,start_min,end_min'),
+  ]).then(function(t){
+    const [staffMemberRows,oneOffRows]=t;
     staffMembers=staffMemberRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, authUserId:r.auth_user_id,
+      // A NULL end_min one-off means "Close" — same SHIFT_CLOSE sentinel mapping as
+      // staff_rostered_shifts (see fetchStaffRosteredShiftsGroup's own comment).
+      oneOffs: oneOffRows.filter(function(o){ return o.staff_id===r.id; }).map(function(o){
+        return {date:new Date(o.the_date), off:o.off, start:o.start_min, end: o.end_min==null? SHIFT_CLOSE : o.end_min};
+      }),
     }; });
   });
 }
