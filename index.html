@@ -524,7 +524,11 @@ var SHIFT_CLOSE='close';
 var EARLY_SHIFT_TIME_OPTIONS=(function(){ const arr=[]; for(let t=EARLY_SHIFT_OPEN;t<=CENTER_CLOSE;t+=START_STEP) arr.push(t); return arr; })();
 var EXIT_STEP=5; // exit time is adjustable in finer 5-minute increments than booking's 15-minute grid
 var EXIT_TIME_OPTIONS=(function(){ const arr=[]; for(let t=CENTER_OPEN;t<=CENTER_CLOSE;t+=EXIT_STEP) arr.push(t); return arr; })();
-var AVAIL_STEP=30; // availability lookup shows seats in half-hour columns
+// Availability lookup shows seats in quarter-hour columns (Oct 2026, per Allie: "can you make the
+// availability lookup be split into 15 min intervals, not 30" — was half-hour). Also drives the
+// waitlist forms' start-time pickers, so a waitlist opened from a 3:15 cell can actually hold 3:15;
+// both now match the booking grid's own START_STEP.
+var AVAIL_STEP=15;
 var AVAIL_DISPLAY_END=1080; // ...and stops at 6:00pm, even though the center is open until 7pm
 var AVAIL_BLOCKS=(function(){ const arr=[]; for(let t=CENTER_OPEN;t<AVAIL_DISPLAY_END;t+=AVAIL_STEP) arr.push(t); return arr; })();
 // A seat only counts as genuinely "open" at a given column if it stays open for a real session's
@@ -849,7 +853,7 @@ function termBreakDateForWeekday(termBreak, weekday){
   }
   return d;
 }
-var TERM_BREAK_AVAIL_STEP=30; // matches AVAIL_STEP — half-hour columns across the break's own morning window
+var TERM_BREAK_AVAIL_STEP=30; // half-hour columns across the break's own morning window (deliberately left at 30 when the term-time lookup went to 15, Oct 2026 — only that one was asked for)
 function setTermBreakAvailLen(v){ state.termBreakAvailLen=Number(v); render(); }
 // The Summer tab's own availability table — same aggregate open-seats-by-weekday/time-of-day idea
 // as renderAvailabilityLookup() on the Schedule tab, just scoped to one term break's own morning
@@ -7425,7 +7429,9 @@ function renderAvailabilityLookup(){
   // weekday now has exactly one reference date (the next real occurrence of it, see
   // nextRegularOccurrence), not a This-week/Next-week toggle that could show two different numbers
   // for the same weekday depending which one you happened to click.
-  html+='<div class="avail-grid" style="grid-template-columns:90px repeat('+AVAIL_BLOCKS.length+',1fr)">';
+  // Twice as many columns at 15-min steps (Oct 2026) — each keeps a minimum width so "2 open from
+  // 14 Oct" stays readable, and the grid scrolls sideways on a narrow screen instead of squashing.
+  html+='<div style="overflow-x:auto"><div class="avail-grid" style="grid-template-columns:90px repeat('+AVAIL_BLOCKS.length+',minmax(64px,1fr))">';
   html+='<div></div>'+AVAIL_BLOCKS.map(function(hb){ return '<div class="cal-head">'+minToLabel(hb)+'</div>'; }).join('');
   WEEKDAY_KEYS.forEach(function(weekday){
     const d=nextRegularOccurrence(weekday);
@@ -7461,7 +7467,7 @@ function renderAvailabilityLookup(){
       html+='<div class="'+cls+'">'+(seats===0?'Full':seats+' open')+'</div>';
     });
   });
-  html+='</div></div>';
+  html+='</div></div></div>';
   return html;
 }
 
