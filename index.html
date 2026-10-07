@@ -650,6 +650,22 @@ var nextDayOverrideId=1;
 function dayOverrideFor(podId, dateKey){
   return podDayOverrides.find(function(o){ return o.podId===podId && toKey(o.date)===dateKey; }) || null;
 }
+// A Pod's actual shifts on one specific date, with who's covering each: the one-off day override if
+// there is one (a single shift — instructorId null means explicitly Unassigned that day), otherwise
+// the regular weekly blocks resolved for that date (one-off coverage swaps included, via
+// blockInstructorOn). Oct 2026, per Allie: "i need the changes made in the schedule section of the
+// today tab to be reflected in the whos in today table" — that board read podBlocksForDay() (the
+// weekly pattern only), so a change made in the Today tab's Schedule grid (which saves a day
+// override) never showed up on it. Anything that needs "who is actually on, on this date" for
+// display should go through here, same as podCoverageDetail() already does for booking.
+function podShiftsOn(podId, date){
+  const ov=dayOverrideFor(podId, toKey(date));
+  if(ov) return [{start:ov.start, end:ov.end, closesLate:false, instructorId:ov.instructorId||null, oneOff:true}];
+  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+  return podBlocksForDay(podId, weekday).map(function(b){
+    return {start:b.start, end:b.end, closesLate:!!b.closesLate, instructorId:blockInstructorOn(b, date), oneOff:false};
+  });
+}
 
 // Shift coverage requests — an instructor flagging they can't work one specific dated occurrence
 // of their own shift (not an ongoing change, see 5.3/5.2 for that). Front desk sees it flagged and
@@ -6192,7 +6208,9 @@ function liveOccupancyGroups(dayKey){
   pods.forEach(function(pod){
     const list=byPod[pod.id];
     if(list && list.length){ groups.push({label:pod.name, podId:pod.id, entries:sortEntries(list)}); }
-    else if(live && podBlocksForDay(pod.id, weekday).length){ groups.push({label:pod.name, podId:pod.id, entries:[]}); }
+    // podShiftsOn (Oct 2026): a Pod staffed only by a one-off day override shows up too, and one
+    // whose day override marks it Unassigned doesn't.
+    else if(live && podShiftsOn(pod.id, new Date(dayKey)).some(function(s){ return !s.oneOff || s.instructorId; })){ groups.push({label:pod.name, podId:pod.id, entries:[]}); }
   });
   Object.keys(byOnlineInstr).forEach(function(instrId){
     const instr=findInstructor(instrId);
@@ -6235,12 +6253,12 @@ function liveOccupancyGroups(dayKey){
 // Returns null if this Pod has no shift at all covering the moment in question.
 function podInstructorLabel(podId, dayKey){
   const date=new Date(dayKey);
-  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
-  const blocks=podBlocksForDay(podId, weekday);
+  // podShiftsOn (Oct 2026) — includes a one-off day override from the Today tab's Schedule grid.
+  const blocks=podShiftsOn(podId, date);
   if(!blocks.length) return null;
   const nowMin=nowMinutesOfDay();
   const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
-  const instrId=blockInstructorOn(block, date);
+  const instrId=block.instructorId;
   if(!instrId) return null;
   // Oct 2026, per Allie ("whos here right now instructor times are weird" — right instructor, wrong
   // end time): availability is when someone COULD work, not their shift, so an instructor available
@@ -6260,11 +6278,10 @@ function podInstructorLabel(podId, dayKey){
 // on this date in any Pod (one-off coverage swaps included, via blockInstructorOn). null if they
 // aren't on any block that day.
 function instructorShiftEndOn(instructorId, date){
-  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
   let latest=null;
   pods.forEach(function(pod){
-    podBlocksForDay(pod.id, weekday).forEach(function(b){
-      if(blockInstructorOn(b, date)!==instructorId) return;
+    podShiftsOn(pod.id, date).forEach(function(b){ // day overrides included (Oct 2026)
+      if(b.instructorId!==instructorId) return;
       if(!latest || b.end>latest.end || (b.end===latest.end && b.closesLate)) latest={end:b.end, closesLate:!!b.closesLate};
     });
   });
@@ -6418,6 +6435,11 @@ function renderQuickMoveModal(){
 var NO_INSTRUCTOR_VALUE='__no_instructor__';
 function openQuickCoverageForm(podId){
   const today=simNow();
+  // A one-off day override set from the Today tab's Schedule grid replaces this Pod's weekly blocks
+  // entirely for today (see podCoverageDetail), so a quick swap written into a block underneath it
+  // would silently do nothing. Edit the override itself instead — same editor that grid opens
+  // (Oct 2026, alongside making this board read podShiftsOn).
+  if(dayOverrideFor(podId, toKey(today))){ openDayOverrideForm(podId, toKey(today)); return; }
   const weekday=WEEKDAY_KEYS[(today.getDay()+6)%7];
   const blocks=podBlocksForDay(podId, weekday);
   if(!blocks.length){ toast('No shift is scheduled for '+findPod(podId).name+' today.'); render(); return; }
@@ -9033,6 +9055,13 @@ function instructorRosteredShifts(instructorId){
 // another instructor, i need the one-off shift to come up on the instructors page so they're
 // reminded of whats coming"). Same oneOffCoverage mechanism blockInstructorOn() already resolves
 // from, just listed out directly here instead of collapsed into a single "who's on today" answer.
+//
+// Oct 2026, per Allie ("fix the instructor pages too"): also covers one-off day overrides made from
+// the Today tab's Schedule grid (podDayOverrides), which this used to ignore entirely. Each entry has
+// a `kind`: 'cover' — an extra one-off shift (either mechanism); 'changed' — their own regular shift
+// that day, with different times; 'off' — their regular shift that day has been given to someone
+// else / left unassigned, so they're not needed. A block-level swap on a date that also has a day
+// override is skipped, since the override replaces that Pod's whole day (see podCoverageDetail).
 function instructorUpcomingCoverShifts(instructorId){
   const todayKey=toKey(simNow());
   const out=[];
@@ -9040,12 +9069,26 @@ function instructorUpcomingCoverShifts(instructorId){
     WEEKDAY_KEYS.forEach(function(day){
       podBlocksForDay(pod.id, day).forEach(function(b){
         (b.oneOffCoverage||[]).forEach(function(o){
-          if(o.instructorId===instructorId && toKey(o.date)>=todayKey){
-            out.push({date:o.date, day, start:b.start, end:b.end, podId:pod.id});
+          if(o.instructorId===instructorId && toKey(o.date)>=todayKey && !dayOverrideFor(pod.id, toKey(o.date))){
+            out.push({date:o.date, day, start:b.start, end:b.end, podId:pod.id, kind:'cover'});
           }
         });
       });
     });
+  });
+  podDayOverrides.forEach(function(ov){
+    const dk=toKey(ov.date);
+    if(dk<todayKey) return;
+    const date=new Date(dk);
+    const day=WEEKDAY_KEYS[(date.getDay()+6)%7];
+    // Their regular shift(s) in this Pod that day, as they'd have been without the override.
+    const mine=podBlocksForDay(ov.podId, day).filter(function(b){ return blockInstructorOn(b, date)===instructorId; });
+    if(ov.instructorId===instructorId){
+      const same = mine.length && mine[0].start===ov.start && mine[mine.length-1].end===ov.end;
+      if(!same) out.push({date:date, day, start:ov.start, end:ov.end, podId:ov.podId, kind: mine.length? 'changed' : 'cover'});
+    } else if(mine.length){
+      out.push({date:date, day, start:mine[0].start, end:mine[mine.length-1].end, podId:ov.podId, kind:'off'});
+    }
   });
   return out.sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)) || a.start-b.start; });
 }
@@ -9056,9 +9099,10 @@ function instructorUpcomingCoverShifts(instructorId){
 // checked in (not the full day's bookings).
 function instructorPodIdsToday(instructorId){
   const today=simNow();
-  const todayWeekday=WEEKDAY_KEYS[(today.getDay()+6)%7];
+  // podShiftsOn (Oct 2026) — a one-off day change from the Today tab's Schedule grid counts too, both
+  // ways: putting them on a Pod for today, or taking them off one.
   return pods.filter(function(p){
-    return podBlocksForDay(p.id, todayWeekday).some(function(b){ return blockInstructorOn(b, today)===instructorId; });
+    return podShiftsOn(p.id, today).some(function(s){ return s.instructorId===instructorId; });
   }).map(function(p){ return p.id; });
 }
 // Includes both flavours of "checked in with me today": physically seated at one of my Pods, and
@@ -9362,9 +9406,12 @@ function renderInstructor(){
   // shift to come up on the instructors page so they're reminded of whats coming").
   const upcomingCoverShifts=instructorUpcomingCoverShifts(instr.id);
   if(upcomingCoverShifts.length>0){
-    html+='<div class="card"><h2>Upcoming cover shifts</h2><p>One-off shifts you\'ve taken on to cover for another instructor — these are one-time only and won\'t show here again once the date passes.</p>';
-    html+='<table><tr><th>Date</th><th>Day</th><th>Time</th><th>Pod</th></tr>'
-      +upcomingCoverShifts.map(function(c){ return '<tr><td>'+fmtShort(c.date)+'</td><td>'+c.day+'</td><td>'+rangeLabel(c.start,c.end-c.start)+'</td><td>'+findPod(c.podId).name+'</td></tr>'; }).join('')
+    // Retitled from "Upcoming cover shifts" (Oct 2026) — it now also lists one-day changes front desk
+    // made to their own shifts (different times, or not needed that day), not only extra cover shifts.
+    const kindLabel={cover:'<span class="badge available">Extra shift</span>', changed:'<span class="badge soon">Times changed</span>', off:'<span class="badge full">Not needed</span>'};
+    html+='<div class="card"><h2>Upcoming one-off changes</h2><p>One-time changes front desk has made to your shifts — extra shifts, different times, or a shift you\'re not needed for. Your regular roster is unchanged, and each one disappears from here once its date passes.</p>';
+    html+='<table><tr><th>Date</th><th>Day</th><th>Time</th><th>Pod</th><th></th></tr>'
+      +upcomingCoverShifts.map(function(c){ return '<tr><td>'+fmtShort(c.date)+'</td><td>'+c.day+'</td><td>'+(c.kind==='off'? '<s>'+rangeLabel(c.start,c.end-c.start)+'</s>' : rangeLabel(c.start,c.end-c.start))+'</td><td>'+findPod(c.podId).name+'</td><td>'+(kindLabel[c.kind]||'')+'</td></tr>'; }).join('')
       +'</table></div>';
   }
 
