@@ -9312,6 +9312,72 @@ function markCoverageUncovered(requestId){
   render();
 }
 
+/* ---------- instructor shifts calendar (Oct 2026) ---------- */
+// Per Allie: "the instructors want to know if we can create a calendar sync function for them" —
+// "just one way, so that their shifts appear on their calendar (and disappear when cancelled)".
+// Each instructor gets a private subscription link to the instructor-calendar Edge Function
+// (instructor-calendar.ts), which rebuilds their shifts from the live roster on every fetch. The
+// link's token lives in instructor_calendar_links (add_instructor_calendar_sync.sql), readable only
+// by that instructor and staff. Loaded lazily the first time the card renders, not in loadAllData().
+function calendarFeedUrl(token){ return SUPABASE_URL+'/functions/v1/instructor-calendar?token='+token; }
+function randomFeedToken(){
+  const bytes=new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(function(b){ return b.toString(16).padStart(2,'0'); }).join('');
+}
+function loadCalendarLink(instructorId){
+  state.calendarLink={loading:true};
+  supabaseClient.from('instructor_calendar_links').select('feed_token').eq('instructor_id', instructorId).maybeSingle().then(function(r){
+    state.calendarLink = r.error? {error:r.error.message} : (r.data? {token:r.data.feed_token} : {none:true});
+    renderUnlessEditing();
+  });
+}
+function createCalendarLink(instructorId){
+  state.calendarLink={loading:true}; render();
+  supabaseClient.from('instructor_calendar_links').insert({instructor_id:instructorId, feed_token:randomFeedToken()}).select('feed_token').single().then(function(r){
+    state.calendarLink = r.error? {error:r.error.message} : {token:r.data.feed_token};
+    render();
+  });
+}
+function resetCalendarLink(instructorId){
+  if(!confirm('Reset your calendar link?\n\nYour current link stops working straight away, so you\'ll need to remove the old calendar from your phone/computer and add the new link instead. Only do this if your link has been shared with someone it shouldn\'t have.')) return;
+  const token=randomFeedToken();
+  state.calendarLink={loading:true}; render();
+  supabaseClient.from('instructor_calendar_links').update({feed_token:token, updated_at:new Date().toISOString()}).eq('instructor_id', instructorId).then(function(r){
+    state.calendarLink = r.error? {error:r.error.message} : {token:token};
+    if(!r.error) toast('New calendar link created — the old one no longer works.');
+    render();
+  });
+}
+function copyCalendarLink(){
+  const url=calendarFeedUrl(state.calendarLink.token);
+  (navigator.clipboard? navigator.clipboard.writeText(url) : Promise.reject()).then(function(){ toast('Calendar link copied.'); })
+    .catch(function(){ prompt('Copy your calendar link:', url); });
+}
+function renderCalendarSyncCard(instr){
+  let html='<div class="card"><h2>Add my shifts to my calendar</h2>'
+    +'<p>Subscribe once and your Mathnasium shifts show up in your own calendar app — including extra and changed shifts. If a shift is cancelled or given to someone else, it disappears by itself.</p>';
+  if(!supabaseClient){ return html+'<div class="empty-note">Available in the live app only.</div></div>'; }
+  const c=state.calendarLink;
+  if(!c){ loadCalendarLink(instr.id); return html+'<div class="empty-note">Loading…</div></div>'; }
+  if(c.loading) return html+'<div class="empty-note">Loading…</div></div>';
+  if(c.error) return html+'<div class="banner danger">Couldn\'t load your calendar link: '+c.error+'</div><button class="btn sm" onclick="loadCalendarLink(\''+instr.id+'\')">Try again</button></div>';
+  if(c.none) return html+'<button class="btn primary" onclick="createCalendarLink(\''+instr.id+'\')">Get my calendar link</button></div>';
+  const url=calendarFeedUrl(c.token);
+  const webcal=url.replace(/^https:/,'webcal:');
+  html+='<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px">'
+      +'<input type="text" readonly value="'+url+'" onclick="this.select()" style="flex:1;min-width:220px;font-size:.8rem"/>'
+      +'<button class="btn sm primary" onclick="copyCalendarLink()">Copy link</button>'
+      +'<a class="btn sm" href="'+webcal+'">Subscribe on iPhone / Mac</a>'
+    +'</div>'
+    +'<p class="small"><b>iPhone / Mac:</b> tap "Subscribe on iPhone / Mac" above, then Subscribe.<br>'
+    +'<b>Google Calendar:</b> on a computer, open calendar.google.com → next to "Other calendars" click <b>+</b> → <b>From URL</b> → paste the link → Add calendar. It then shows on your phone too.<br>'
+    +'<b>Outlook:</b> Add calendar → <b>Subscribe from web</b> → paste the link.</p>'
+    +'<p class="small muted">Your calendar app checks for changes on its own schedule — usually within an hour on iPhone and Outlook, but Google can take several hours. Front desk will still let you know about same-day changes. Keep this link to yourself: anyone with it can see your shifts.</p>'
+    +'<button class="btn sm ghost" onclick="resetCalendarLink(\''+instr.id+'\')">Reset link</button>';
+  return html+'</div>';
+}
+
 function renderInstructor(){
   // Live mode (supabaseClient set) is already gated by real Supabase sign-in before rendering ever
   // reaches here — currentUser.instructorId is the real identity. state.instructorLoggedIn is the
@@ -9399,6 +9465,8 @@ function renderInstructor(){
       +'</table>';
   }
   html+='</div>';
+
+  html+=renderCalendarSyncCard(instr);
 
   // A confirmed one-off cover shift for another instructor — shown as its own reminder, separate from
   // "Rostered shifts" above, since it's a one-time swap rather than part of the regular pattern (Sept
