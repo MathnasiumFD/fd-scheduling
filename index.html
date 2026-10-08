@@ -2484,6 +2484,11 @@ function openHoldRequestForm(studentId){
   render();
 }
 function closeHoldRequestForm(){ state.holdRequestForm=null; render(); }
+// Parents can't request a hold that starts more than 3 months out (Oct 2026, per Allie: "parents
+// can't place a hold on a period further than 3 months away"). Front desk's own hold form
+// (openHoldForm) is unaffected — they can still line up anything further ahead themselves.
+var HOLD_REQUEST_MAX_MONTHS_AHEAD=3;
+function latestHoldRequestStart(){ return addMonths(simNow(), HOLD_REQUEST_MAX_MONTHS_AHEAD); }
 // As with the cancellation form, a start date inside the 7-day notice window is no longer a hard
 // stop — the banner below just lights up live so it's never a surprise (Sept 2026, per Allie).
 function setHoldRequestField(field, value){
@@ -2496,6 +2501,10 @@ function submitHoldRequest(){
   const f=state.holdRequestForm;
   if(!f.start || !f.end){ f.error='Choose a start and end date.'; render(); return; }
   if(f.end<f.start){ f.error='End date must be on or after the start date.'; render(); return; }
+  if(f.start>toKey(latestHoldRequestStart())){
+    f.error='Holds can only be requested up to '+HOLD_REQUEST_MAX_MONTHS_AHEAD+' months ahead — please choose a start date on or before '+fmtShort(latestHoldRequestStart())+', or contact the centre.';
+    render(); return;
+  }
   const start=new Date(f.start);
   // A hold requested inside the 7-day billing-notice window still goes through — front desk just
   // can't get a billing credit applied to this cycle in time, so make-up sessions are granted
@@ -9959,7 +9968,8 @@ function renderHoldRequestModal(){
     +'<p>Hold requests must be submitted at least 7 days before your next monthly payment cycle. All monthly payment cycles are processed on the 1st of each month.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   if(f.lateNotice) html+='<div class="banner warn">Your hold can still be placed for these dates, however a credit cannot be applied as the request was made less than 7 days before the 1st of the month. Make-up sessions will be added for eligible sessions missed during the hold.</div>';
-  html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.start+'" onchange="setHoldRequestField(\'start\',this.value)"/></div>'
+  html+='<p class="small muted">Holds can be requested up to '+HOLD_REQUEST_MAX_MONTHS_AHEAD+' months ahead.</p>';
+  html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.start+'" max="'+toKey(latestHoldRequestStart())+'" onchange="setHoldRequestField(\'start\',this.value)"/></div>'
     +'<div><label>End date</label><input type="date" value="'+f.end+'" onchange="setHoldRequestField(\'end\',this.value)"/></div></div>';
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. family vacation" value="'+f.note+'" oninput="setHoldRequestField(\'note\',this.value)"/>';
   html+='<div style="display:flex;gap:8px;margin-top:6px;justify-content:flex-end">'
