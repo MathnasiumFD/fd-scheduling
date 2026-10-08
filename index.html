@@ -481,9 +481,39 @@ function inviteLogin(email, role, linkedId, personName){
     if(errMsg){ toast('Could not invite '+personName+' — '+errMsg); return; }
     if(role==='instructor'){ const i=findInstructor(linkedId); if(i) i.authUserId='pending'; }
     if(role==='parent'){ const p=parents.find(function(x){ return x.id===linkedId; }); if(p) p.authUserId='pending'; }
+    if(role==='staff'){ const s=staffMembers.find(function(x){ return x.id===linkedId; }); if(s) s.authUserId='pending'; }
     toast('Invite sent to '+email+' — they\'ll get an email to set their own password.');
     render();
+    loadLoginStatuses().then(renderUnlessEditing);
   }).catch(function(err){ toast('Could not invite '+personName+' — '+(err&&err.message?err.message:'unknown error')); });
+}
+// Invite status for the Login column on the Parents / Instructors / Front desk staff lists (Oct 2026,
+// per Allie: "when sending invite out to parents, can it say sent or something until the parents set
+// a password and access the site?"). An invite links the record to a new login immediately, so
+// authUserId alone can't tell "invited" from "actually using it" — that comes from the staff-only
+// login_statuses() database function (add_login_statuses.sql), keyed by auth user id.
+var loginStatusByAuthId=null; // null = not loaded (or not staff) — the Login column then falls back to "Active"
+function loadLoginStatuses(){
+  if(!supabaseClient || !currentUser || currentUser.role!=='staff') return Promise.resolve();
+  return supabaseClient.rpc('login_statuses').then(function(r){
+    if(r.error){ console.error('Could not load login statuses', r.error); return; }
+    const m={};
+    (r.data||[]).forEach(function(row){
+      m[row.auth_user_id]={invitedAt: row.invited_at? new Date(row.invited_at) : null, lastSignInAt: row.last_sign_in_at? new Date(row.last_sign_in_at) : null};
+    });
+    loginStatusByAuthId=m;
+  });
+}
+function loginStatusCellHtml(authUserId, inviteButtonHtml){
+  if(!supabaseClient) return '<span class="small muted">—</span>';
+  if(!authUserId) return inviteButtonHtml;
+  const sent='<span class="badge soon" title="They haven\'t set a password and signed in yet">Invite sent</span>';
+  if(authUserId==='pending') return sent+' <span class="small muted">just now</span>';
+  if(!loginStatusByAuthId) return '<span class="badge available">Active</span>';
+  const st=loginStatusByAuthId[authUserId];
+  if(!st) return sent; // linked but not in the last status load — almost always a brand-new invite
+  if(st.lastSignInAt) return '<span class="badge available" title="Last signed in '+fmtShort(st.lastSignInAt)+'">Active</span>';
+  return sent+(st.invitedAt? ' <span class="small muted">'+fmtShort(st.invitedAt)+'</span>' : '');
 }
 function deactivateInstructor(instrId){
   const instr=findInstructor(instrId);
@@ -8027,10 +8057,8 @@ function renderInstructorsPanel(){
           .map(function(a){ return a.day+' '+minToLabel(a.start)+'–'+minToLabel(a.end)+' ('+findPod(a.podId).name+')'; }).join(', ')
       : 'Not rostered';
     const inactive = instr.active===false;
-    const loginCell = !supabaseClient? '<span class="small muted">—</span>'
-      : instr.authUserId==='pending'? '<span class="badge soon">Invited</span>'
-      : instr.authUserId? '<span class="badge available">Active</span>'
-      : '<button class="btn sm ghost" onclick="inviteLogin(\''+instr.email+'\',\'instructor\',\''+instr.id+'\',\''+instr.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
+    const loginCell = loginStatusCellHtml(instr.authUserId,
+      '<button class="btn sm ghost" onclick="inviteLogin(\''+instr.email+'\',\'instructor\',\''+instr.id+'\',\''+instr.name.replace(/'/g,"\\'")+'\')">Invite login</button>');
     html+='<tr'+(inactive?' style="opacity:.55"':'')+'><td>'+instr.name+(inactive?' <span class="small muted">(inactive)</span>':'')+'</td><td class="small">'+instr.email+'</td><td>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</td><td class="small">'+availSummary+'</td><td class="small">'+shiftSummary+'</td>'
       +'<td>'+loginCell+'</td>'
       +'<td><button class="btn sm ghost" onclick="openEditInstructorForm(\''+instr.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openStaffAvailManager(\''+instr.id+'\')">Adjust availability</button> '
@@ -8147,10 +8175,8 @@ function renderParentsPanel(){
   html+='<table><tr><th>Parent</th><th>Email</th><th>Children</th><th>Login</th><th></th></tr>';
   parents.filter(function(p){ return !isParentInactive(p); }).sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(p){
     const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); return s? s.name : null; }).filter(Boolean);
-    const loginCell = !supabaseClient? '<span class="small muted">—</span>'
-      : p.authUserId==='pending'? '<span class="badge soon">Invited</span>'
-      : p.authUserId? '<span class="badge available">Active</span>'
-      : '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
+    const loginCell = loginStatusCellHtml(p.authUserId,
+      '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>');
     html+='<tr><td>'+p.name+'</td><td class="small">'+p.email+'</td><td class="small">'+(kids.length? kids.join(', ') : '—')+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditParentForm(\''+p.id+'\')">Edit details</button></td></tr>';
   });
   html+='</table></div>';
@@ -8390,10 +8416,8 @@ function renderFrontStaffPanel(){
   html+='<p>Everyone here gets the same full front-desk access as you — this is just a named list (rather than one shared, anonymous login) so it\'s clear who\'s who, e.g. yourself and "Five Dock Front Staff".</p>';
   html+='<table><tr><th>Name</th><th>Email</th><th>Login</th><th></th></tr>';
   staffMembers.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
-    const loginCell = !supabaseClient? '<span class="small muted">—</span>'
-      : s.authUserId==='pending'? '<span class="badge soon">Invited</span>'
-      : s.authUserId? '<span class="badge available">Active</span>'
-      : '<button class="btn sm ghost" onclick="inviteLogin(\''+s.email+'\',\'staff\',\''+s.id+'\',\''+s.name.replace(/'/g,"\\'")+'\')">Invite login</button>';
+    const loginCell = loginStatusCellHtml(s.authUserId,
+      '<button class="btn sm ghost" onclick="inviteLogin(\''+s.email+'\',\'staff\',\''+s.id+'\',\''+s.name.replace(/'/g,"\\'")+'\')">Invite login</button>');
     html+='<tr><td>'+s.name+'</td><td class="small">'+s.email+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditStaffForm(\''+s.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openStaffOneOffManager(\''+s.id+'\')">One-off shift change</button></td></tr>';
   });
   if(staffMembers.length===0) html+='<tr><td colspan="4" class="small muted">No named staff yet — everyone currently signs in with a shared front-desk login.</td></tr>';
@@ -10475,6 +10499,7 @@ function afterLogin(){
         regenerateAllRecurring();
         autoCheckOutPastClose();
         render();
+        loadLoginStatuses().then(renderUnlessEditing); // invite status for the Login columns (staff only, Oct 2026)
         // Live mode has no demo-clock button to trigger applyPromotions()/applyPlanChanges() as
         // days actually pass — real time just ticks forward on its own. Re-checking both on this
         // heartbeat (already needed for the checked-in "time left" countdown, see the offline-mode
@@ -10501,7 +10526,7 @@ function afterLogin(){
         if(!liveSyncStarted){
           liveSyncStarted=true;
           setInterval(function(){
-            loadAllData().then(function(){ applyPromotions(); applyPlanChanges(); autoCheckOutPastClose(); renderUnlessEditing(); })
+            loadAllData().then(function(){ applyPromotions(); applyPlanChanges(); autoCheckOutPastClose(); return loadLoginStatuses(); }).then(renderUnlessEditing)
               .catch(function(err){ console.error('Heartbeat refresh failed', err); });
           }, 180000);
           subscribeToLiveUpdates();
