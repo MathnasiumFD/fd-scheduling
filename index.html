@@ -6185,7 +6185,7 @@ function liveOccupancyGroups(dayKey){
     if(!student) return;
     const entry={name:student.name, exit:s.actualEnd, sessionId:s.id};
     if(s.online){ (byOnlineInstr[s.instructorId]=byOnlineInstr[s.instructorId]||[]).push(entry); }
-    else if(s.podId){ (byPod[s.podId]=byPod[s.podId]||[]).push(entry); }
+    else { (byPod[s.podId||'']=byPod[s.podId||'']||[]).push(entry); } // '' = no Pod (Oct 2026 — see the Unassigned group below)
   });
   const sortEntries=function(list){
     return list.slice().sort(function(a,b){
@@ -6212,11 +6212,20 @@ function liveOccupancyGroups(dayKey){
     // whose day override marks it Unassigned doesn't.
     else if(live && podShiftsOn(pod.id, new Date(dayKey)).some(function(s){ return !s.oneOff || s.instructorId; })){ groups.push({label:pod.name, podId:pod.id, entries:[]}); }
   });
+  // Checked in but not sitting anywhere the board can draw — no Pod at all, a Pod that no longer
+  // exists, or an Online group whose instructor can't be found. These used to be silently dropped
+  // from the board, so there was nothing to click to seat them (Oct 2026, per Allie: "students in
+  // the whos in right now list, i want to be able to change their pod from there too, at least the
+  // ones in a pod that isnt assigned to anyone"). Their own group (flagged `unassigned`), names
+  // clickable to the same today-only quick move as everyone else.
+  const unassigned=(byPod['']||[]).slice();
+  Object.keys(byPod).forEach(function(podId){ if(podId && !findPod(podId)) unassigned.push.apply(unassigned, byPod[podId]); });
   Object.keys(byOnlineInstr).forEach(function(instrId){
     const instr=findInstructor(instrId);
-    if(!instr) return;
+    if(!instr){ unassigned.push.apply(unassigned, byOnlineInstr[instrId]); return; }
     groups.push({label:'Online — '+instr.name, podId:null, entries:sortEntries(byOnlineInstr[instrId])});
   });
+  if(unassigned.length) groups.push({label:'Unassigned — needs a Pod', podId:null, unassigned:true, entries:sortEntries(unassigned)});
   return groups;
 }
 // Who's here right now — grid layout matching the Availability lookup's own look (Sept 2026, per
@@ -6353,7 +6362,8 @@ function renderLiveOccupancyBoard(dayKey){
   if(onlineGroups.length){
     html+='<div style="display:flex;flex-wrap:wrap;gap:16px">'
       +onlineGroups.map(function(g){
-        return '<div style="min-width:150px"><h4 style="margin:0 0 4px 0">'+g.label+'</h4>'
+        return '<div style="min-width:150px"><h4 style="margin:0 0 4px 0'+(g.unassigned?';color:var(--danger)':'')+'">'+g.label+'</h4>'
+          +(g.unassigned && live? '<div class="small muted" style="margin-bottom:4px">Click a name to put them in a Pod.</div>' : '')
           +'<table><tr><th>Student</th><th>Leaves</th></tr>'
           +g.entries.map(function(e){
             const nameHtml = live
