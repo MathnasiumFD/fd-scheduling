@@ -5104,7 +5104,28 @@ function closeNewStudentForm(){ state.newStudentForm=null; render(); }
 function setNSF(field, value){
   state.newStudentForm[field]=value;
   state.newStudentForm.error='';
+  if(field==='studentName'){ state.newStudentForm.duplicateOf=null; state.newStudentForm.duplicateConfirmed=false; }
   render();
+}
+// Same-name safety net (Oct 2026, per Allie, after Grace Barnes ended up with two student records —
+// an imported student with no standing slot got enrolled again as a brand-new student instead of
+// having their schedule set via "Edit schedule"). Names are compared letters-only, ignoring case,
+// spaces and punctuation (same normalisation as find_hidden_duplicates.sql). Only ACTIVE students
+// count: re-enrolling someone whose enrolment has stopped is meant to create a fresh record (see
+// isStudentInactive), so that isn't flagged.
+function studentNameKey(name){ return String(name||'').toLowerCase().replace(/[^a-z]/g,''); }
+function activeStudentsNamed(name){
+  const key=studentNameKey(name);
+  if(!key) return [];
+  return students.filter(function(s){ return !isStudentInactive(s) && studentNameKey(s.name)===key; });
+}
+function editExistingInsteadOfEnrolling(studentId){
+  state.newStudentForm=null;
+  openRecurringForm(studentId);
+}
+function enrolDuplicateAnyway(){
+  state.newStudentForm.duplicateConfirmed=true;
+  saveNewStudent();
 }
 function setNSFParentMode(mode){ state.newStudentForm.parentMode=mode; state.newStudentForm.error=''; render(); }
 function setNSFSessionsPerWeek(v){
@@ -5137,6 +5158,10 @@ function saveNewStudent(){
   if(!f.year){ f.error='Choose a school year.'; render(); return; }
   if(!f.startDate){ f.error='Choose a start date.'; render(); return; }
   if(toKey(new Date(f.startDate))<toKey(simNow())){ f.error='Start date can\'t be in the past.'; render(); return; }
+  // Same-name check — see activeStudentsNamed(). Stops here and shows the choice in the form
+  // (renderNewStudentModal) until front desk either edits the existing student instead or confirms.
+  const sameName=activeStudentsNamed(f.studentName);
+  if(sameName.length && !f.duplicateConfirmed){ f.duplicateOf=sameName.map(function(s){ return s.id; }); render(); return; }
   let parentId=null;
   // Set only when creating a brand-new parent alongside this student — its actual remote insert is
   // deferred and chained as the FIRST step of the student's own dbWrite below (see there for why:
@@ -8718,6 +8743,19 @@ function renderNewStudentModal(){
   html+='<p class="small muted" style="margin-top:-6px">Optionally set each session\'s own Preferred Pod — its default Pod going forward, as long as it has room. Front desk can still move '+(f.studentName.trim()||'them')+' to a different Pod any time from the Students list ("Change Pod").</p>';
   html+=renderRecurringPickers(f.recurring, starts, 'setNSFRecurring', 'setNSFRecurring');
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  // Same-name warning (Oct 2026) — see activeStudentsNamed()/saveNewStudent().
+  const dupes=(f.duplicateOf||[]).map(findStudent).filter(Boolean);
+  if(dupes.length && !f.duplicateConfirmed){
+    html+='<div class="banner warn"><b>There\'s already '+(dupes.length===1? 'a student' : dupes.length+' students')+' called '+dupes[0].name+'.</b> Did you mean to edit '+(dupes.length===1?'their':'one of their')+' schedule instead?'
+      +dupes.map(function(s){
+        const p=parents.find(function(x){ return x.id===s.parentId; });
+        return '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px">'
+          +'<span class="small">'+yearLabel(s.year)+' · parent '+(p? p.name : '—')+' · '+recurringSummary(s)+'</span>'
+          +'<button class="btn sm primary" onclick="editExistingInsteadOfEnrolling(\''+s.id+'\')">Edit '+s.name+'\'s schedule</button></div>';
+      }).join('')
+      +'<div style="margin-top:8px"><button class="btn sm ghost" onclick="enrolDuplicateAnyway()">No — they\'re a different child, enrol as a new student</button></div>'
+    +'</div>';
+  }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeNewStudentForm()">Cancel</button>'
     +'<button class="btn primary" onclick="saveNewStudent()">Enroll student</button>'
