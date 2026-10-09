@@ -5428,10 +5428,14 @@ function setNSFRecurring(idx, field, value){
   render();
 }
 
+// Kindy is year 0 (Pre-K is -1), so a plain `!f.year` treated Kindy as "no year chosen" (Oct 2026,
+// per Allie: "when enrolling a new student in kindy, when i select K, it says please select a school
+// year. even though i have"). Only an empty / non-numeric choice counts as missing.
+function schoolYearMissing(v){ return v===null || v===undefined || v==='' || isNaN(Number(v)); }
 function saveNewStudent(){
   const f=state.newStudentForm;
   if(!f.studentName.trim()){ f.error='Enter the student\'s name.'; render(); return; }
-  if(!f.year){ f.error='Choose a school year.'; render(); return; }
+  if(schoolYearMissing(f.year)){ f.error='Choose a school year.'; render(); return; }
   if(!f.startDate){ f.error='Choose a start date.'; render(); return; }
   if(toKey(new Date(f.startDate))<toKey(simNow())){ f.error='Start date can\'t be in the past.'; render(); return; }
   // Same-name check — see activeStudentsNamed(). Stops here and shows the choice in the form
@@ -5561,7 +5565,7 @@ function saveEditStudent(){
   const f=state.editStudentForm;
   const student=findStudent(f.studentId);
   if(!f.name.trim()){ f.error='Enter the student\'s name.'; render(); return; }
-  if(!f.year){ f.error='Choose a school year.'; render(); return; }
+  if(schoolYearMissing(f.year)){ f.error='Choose a school year.'; render(); return; }
   if(!f.parentId){ f.error='Choose a parent.'; render(); return; }
   student.name=f.name.trim();
   // A plain student.year=... would get silently clobbered the next time applyPromotions() runs
