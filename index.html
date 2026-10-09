@@ -448,6 +448,13 @@ function notifyParentOfCheckIn(sessionId, actualStartMin, actualEndMin){
     if(r && r.error) console.error('Check-in email failed:', r.error);
   }).catch(function(err){ console.error('Check-in email failed:', err); });
 }
+// Same email function, "pick-up time changed" variant (Oct 2026) — see setExitTime().
+function notifyParentOfPickupChange(sessionId, actualStartMin, actualEndMin, previousEndMin){
+  if(!CHECKIN_EMAIL_ENABLED || !supabaseClient || !currentUser) return;
+  supabaseClient.functions.invoke('send-checkin-email', {body:{sessionId, actualStartMin, actualEndMin, previousEndMin, pickupUpdate:true}}).then(function(r){
+    if(r && r.error) console.error('Pick-up update email failed:', r.error);
+  }).catch(function(err){ console.error('Pick-up update email failed:', err); });
+}
 // Closure reminder emails — a daily scheduled job (see add_closure_reminder_cron.sql) already
 // catches every closure on its own once it's 7 days out, so this call is purely for the
 // last-minute case: a closure added with less than a week's notice shouldn't have to wait for
@@ -4115,9 +4122,22 @@ function renderMoveModal(){
 
 function setExitTime(sessionId, v){
   const sess=findSession(sessionId);
+  const previousEnd=sess.actualEnd;
   sess.actualEnd=Number(v);
   dbWrite('updating exit time', function(){ return supabaseClient.from('sessions').update({actual_end_min:sess.actualEnd}).eq('id', sess.id); });
-  toast(findStudent(sess.studentId).name+'\'s exit time updated to '+minToLabel(sess.actualEnd)+'.');
+  const student=findStudent(sess.studentId);
+  // Oct 2026, per Allie ("sometimes kids ask to stay a little longer or leave a little earlier"):
+  // the parent's check-in email gave the original pick-up time, so offer to tell them the new one.
+  // Asked rather than automatic, so fixing a mis-click doesn't email a family. Only while the child
+  // is still here today — a past day's record or someone already checked out isn't news to them.
+  const stillHere = sess.status==='attended' && !sess.checkedOut && toKey(sess.date)===toKey(simNow());
+  if(stillHere && previousEnd!=null && previousEnd!==sess.actualEnd && CHECKIN_EMAIL_ENABLED && supabaseClient && currentUser
+     && confirm(student.name+'\'s exit time is now '+minToLabel(sess.actualEnd)+' (was '+minToLabel(previousEnd)+').\n\nEmail the parent the new pick-up time?')){
+    notifyParentOfPickupChange(sess.id, sess.actualStart, sess.actualEnd, previousEnd);
+    toast(student.name+'\'s exit time updated to '+minToLabel(sess.actualEnd)+' — parent emailed the new pick-up time.');
+    return;
+  }
+  toast(student.name+'\'s exit time updated to '+minToLabel(sess.actualEnd)+'.');
 }
 // Corrects the check-in time recorded for an already-checked-in student (5.23) — lives in the
 // "Checked in today" table right next to exit time, which was already editable there; check-in
