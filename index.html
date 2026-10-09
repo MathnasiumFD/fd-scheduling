@@ -5700,10 +5700,26 @@ function openRecurringForm(studentId){
   // form purely to show "Currently: ..." next to each picker (see renderRecurringPickers) — slots
   // itself gets overwritten row by row as the pickers change, so without a separate copy there'd be
   // nothing left to compare against once you started editing.
-  state.recurringForm={studentId, slots, originalSlots: slots.map(function(s){ return {weekday:s.weekday, start:s.start}; })};
+  state.recurringForm={studentId, slots, originalSlots: slots.map(function(s){ return {weekday:s.weekday, start:s.start}; }), duration:student.duration};
   render();
 }
 function closeRecurringForm(){ state.recurringForm=null; render(); }
+// Session length is editable here too (Oct 2026, per Allie: "when editing a students permanent
+// schedule, i need to be able to change the session durations" — one length for all of a child's
+// regular sessions, which is how students.duration already works). A longer session can't start as
+// late, so any picked start time that no longer fits before close moves to the latest one that does.
+function setRecurringDuration(v){
+  const f=state.recurringForm;
+  f.duration=Number(v);
+  const starts=possibleStarts(f.duration);
+  f.slots.forEach(function(s){
+    if(starts.indexOf(s.start)===-1){
+      const fits=starts.filter(function(t){ return t<=s.start; });
+      s.start = fits.length? fits[fits.length-1] : starts[0];
+    }
+  });
+  render();
+}
 function setRecurringSlot(idx, field, value){
   state.recurringForm.slots[idx][field] = field==='start'? Number(value) : value;
   render();
@@ -5712,6 +5728,19 @@ function saveRecurringForm(){
   const f=state.recurringForm;
   const student=findStudent(f.studentId);
   student.recurring = f.slots.map(function(s){ return {weekday:s.weekday, start:s.start}; });
+
+  // New session length (Oct 2026) — set before the sessions are regenerated below, since they're
+  // booked at student.duration. Make-up credits that don't record their own length were earned at
+  // the OLD length, so that's stamped on them first rather than letting them silently change size.
+  const durationChanged = f.duration && f.duration!==student.duration;
+  if(durationChanged){
+    const oldDuration=student.duration;
+    const unsized=credits.filter(function(c){ return c.studentId===student.id && !c.minutes; });
+    unsized.forEach(function(c){ c.minutes=oldDuration; });
+    if(unsized.length) dbWrite('recording make-up credit lengths', function(){ return supabaseClient.from('credits').update({minutes:oldDuration}).in('id', unsized.map(function(c){ return c.id; })); });
+    student.duration=f.duration;
+    dbWrite('changing session length', function(){ return supabaseClient.from('students').update({duration:student.duration}).eq('id', student.id); });
+  }
 
   // Persist the edited pattern to student_recurring_slots — the table loadAllData() actually
   // rebuilds student.recurring from on every page load. This form used to only ever change
@@ -5757,7 +5786,7 @@ function saveRecurringForm(){
   if(uncovered.length){
     toast(student.name+'’s regular schedule saved, but no Pod '+student.name+' qualifies for (by age) is currently staffed for '+describeUncoveredSlots(uncovered)+' — those session(s) couldn\'t be pre-booked yet. Assign coverage on the Schedule tab, then reopen this schedule and save it again.', 9000);
   } else {
-    toast(student.name+'’s regular schedule saved — '+made+' upcoming session(s) pre-booked.'+(clearedCount? ' '+clearedCount+' old-schedule session(s) cleared.' : ''));
+    toast(student.name+'’s regular schedule saved'+(durationChanged? ' — now '+student.duration+'-minute sessions' : '')+' — '+made+' upcoming session(s) pre-booked.'+(clearedCount? ' '+clearedCount+' old-schedule session(s) cleared.' : ''));
   }
   state.recurringForm=null;
   render();
@@ -9140,10 +9169,18 @@ function renderRecurringModal(){
   if(!state.recurringForm) return '';
   const f=state.recurringForm;
   const student=findStudent(f.studentId);
-  const starts=possibleStarts(student.duration);
+  const duration=f.duration||student.duration;
+  const starts=possibleStarts(duration);
   let html='<div class="overlay" onclick="if(event.target===this) closeRecurringForm()"><div class="modal">';
   html+='<h3>'+student.name+'’s regular schedule</h3>';
   html+='<p>The system pre-books actual sessions from this automatically, using the same qualification, availability, and capacity rules as any other booking. Front desk can still move or cancel any individual session.</p>';
+  // Session length (Oct 2026) — applies to all of this child's regular sessions.
+  html+='<label>Session length</label><select onchange="setRecurringDuration(this.value)" style="max-width:180px">'
+    +DURATIONS.map(function(d){ return '<option value="'+d+'"'+(d===duration?' selected':'')+'>'+d+' min'+(d===student.duration?' (current)':'')+'</option>'; }).join('')
+    +'</select>';
+  if(duration!==student.duration){
+    html+='<div class="banner info">All of '+student.name+'’s regular sessions change from '+student.duration+' to '+duration+' minutes, from today. Upcoming regular sessions are re-booked at the new length; one-off and make-up sessions aren’t changed.</div>';
+  }
   html+=renderRecurringPickers(f.slots, starts, 'setRecurringSlot', null, f.originalSlots);
   html+='<div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeRecurringForm()">Cancel</button>'
