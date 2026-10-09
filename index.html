@@ -504,16 +504,34 @@ function loadLoginStatuses(){
     loginStatusByAuthId=m;
   });
 }
-function loginStatusCellHtml(authUserId, inviteButtonHtml){
+// resendButtonHtml (Oct 2026): offered next to "Invite sent" for anyone who hasn't got in yet —
+// invite links are single-use and short-lived, and some mail apps use them up by pre-scanning.
+function loginStatusCellHtml(authUserId, inviteButtonHtml, resendButtonHtml){
   if(!supabaseClient) return '<span class="small muted">—</span>';
   if(!authUserId) return inviteButtonHtml;
   const sent='<span class="badge soon" title="They haven\'t set a password and signed in yet">Invite sent</span>';
+  const resend=resendButtonHtml? ' '+resendButtonHtml : '';
   if(authUserId==='pending') return sent+' <span class="small muted">just now</span>';
   if(!loginStatusByAuthId) return '<span class="badge available">Active</span>';
   const st=loginStatusByAuthId[authUserId];
-  if(!st) return sent; // linked but not in the last status load — almost always a brand-new invite
+  if(!st) return sent+resend; // linked but not in the last status load — almost always a brand-new invite
   if(st.lastSignInAt) return '<span class="badge available" title="Last signed in '+fmtShort(st.lastSignInAt)+'">Active</span>';
-  return sent+(st.invitedAt? ' <span class="small muted">'+fmtShort(st.invitedAt)+'</span>' : '');
+  return sent+(st.invitedAt? ' <span class="small muted">'+fmtShort(st.invitedAt)+'</span>' : '')+resend;
+}
+function resendInviteButtonHtml(email, role, linkedId, name){
+  return '<button class="btn sm ghost" onclick="resendInvite(\''+email+'\',\''+role+'\',\''+linkedId+'\',\''+String(name).replace(/'/g,"\\'")+'\')" title="Send them a fresh link — the old one may have expired or been used up">Resend</button>';
+}
+function resendInvite(email, role, linkedId, personName){
+  if(!supabaseClient || !currentUser){ toast('Invites only work when signed in to the live app.'); return; }
+  if(!confirm('Send '+personName+' a fresh sign-up link at '+email+'?\n\nAny earlier link they were sent will stop working.')) return;
+  supabaseClient.functions.invoke('invite-user', {body:{email:email, role:role, linkedId:linkedId, resend:true}}).then(function(r){
+    const errMsg = (r && r.error && r.error.message) || (r && r.data && r.data.error);
+    if(errMsg){ toast('Could not resend to '+personName+' — '+errMsg, 7000); return; }
+    toast((r.data && r.data.mode==='password_setup')
+      ? 'Sent '+personName+' a link to set their password ('+email+').'
+      : 'New invite sent to '+email+'.', 6000);
+    loadLoginStatuses().then(renderUnlessEditing);
+  }).catch(function(err){ toast('Could not resend to '+personName+' — '+(err&&err.message?err.message:'unknown error')); });
 }
 function deactivateInstructor(instrId){
   const instr=findInstructor(instrId);
@@ -8058,7 +8076,8 @@ function renderInstructorsPanel(){
       : 'Not rostered';
     const inactive = instr.active===false;
     const loginCell = loginStatusCellHtml(instr.authUserId,
-      '<button class="btn sm ghost" onclick="inviteLogin(\''+instr.email+'\',\'instructor\',\''+instr.id+'\',\''+instr.name.replace(/'/g,"\\'")+'\')">Invite login</button>');
+      '<button class="btn sm ghost" onclick="inviteLogin(\''+instr.email+'\',\'instructor\',\''+instr.id+'\',\''+instr.name.replace(/'/g,"\\'")+'\')">Invite login</button>',
+      resendInviteButtonHtml(instr.email, 'instructor', instr.id, instr.name));
     html+='<tr'+(inactive?' style="opacity:.55"':'')+'><td>'+instr.name+(inactive?' <span class="small muted">(inactive)</span>':'')+'</td><td class="small">'+instr.email+'</td><td>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</td><td class="small">'+availSummary+'</td><td class="small">'+shiftSummary+'</td>'
       +'<td>'+loginCell+'</td>'
       +'<td><button class="btn sm ghost" onclick="openEditInstructorForm(\''+instr.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openStaffAvailManager(\''+instr.id+'\')">Adjust availability</button> '
@@ -8176,7 +8195,8 @@ function renderParentsPanel(){
   parents.filter(function(p){ return !isParentInactive(p); }).sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(p){
     const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); return s? s.name : null; }).filter(Boolean);
     const loginCell = loginStatusCellHtml(p.authUserId,
-      '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>');
+      '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>',
+      resendInviteButtonHtml(p.email, 'parent', p.id, p.name));
     html+='<tr><td>'+p.name+'</td><td class="small">'+p.email+'</td><td class="small">'+(kids.length? kids.join(', ') : '—')+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditParentForm(\''+p.id+'\')">Edit details</button></td></tr>';
   });
   html+='</table></div>';
@@ -8417,7 +8437,8 @@ function renderFrontStaffPanel(){
   html+='<table><tr><th>Name</th><th>Email</th><th>Login</th><th></th></tr>';
   staffMembers.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
     const loginCell = loginStatusCellHtml(s.authUserId,
-      '<button class="btn sm ghost" onclick="inviteLogin(\''+s.email+'\',\'staff\',\''+s.id+'\',\''+s.name.replace(/'/g,"\\'")+'\')">Invite login</button>');
+      '<button class="btn sm ghost" onclick="inviteLogin(\''+s.email+'\',\'staff\',\''+s.id+'\',\''+s.name.replace(/'/g,"\\'")+'\')">Invite login</button>',
+      resendInviteButtonHtml(s.email, 'staff', s.id, s.name));
     html+='<tr><td>'+s.name+'</td><td class="small">'+s.email+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditStaffForm(\''+s.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openStaffOneOffManager(\''+s.id+'\')">One-off shift change</button></td></tr>';
   });
   if(staffMembers.length===0) html+='<tr><td colspan="4" class="small muted">No named staff yet — everyone currently signs in with a shared front-desk login.</td></tr>';
@@ -10292,7 +10313,7 @@ function showLoginScreen(errorMsg){
     +'<div class="brand-logo"><img src="'+MATHNASIUM_LOGO+'" alt="Mathnasium"/></div>'
     +'<h2>Sign in</h2>'
     +(errorMsg? '<div class="banner danger">'+errorMsg+'</div>' : '')
-    +'<label>Email</label><input id="loginEmail" type="email" autocomplete="username" />'
+    +'<label>Email <span class="small muted" style="font-weight:400">(this is your username)</span></label><input id="loginEmail" type="email" autocomplete="username" placeholder="the email your invite was sent to" />'
     +'<label>Password</label>'
     +'<div style="position:relative">'
       +'<input id="loginPassword" type="password" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding-right:40px"/>'
@@ -10369,6 +10390,11 @@ function sendPasswordReset(){
 // Reached via the link in either an invite email or a password-reset email — Supabase's SDK
 // parses the token in the URL and establishes a session automatically; this just asks for (and
 // sets) the actual new password before letting them into the app proper.
+// Oct 2026, per Allie: parents setting up their account were confused about what their "username"
+// is — this screen now says plainly that it's their email address, and shows it (read from the
+// invite/reset link's own session). The email sits in a read-only autocomplete="username" field so
+// phones/password managers save it together with the new password.
+var setPasswordEmail='';
 function showSetPasswordScreen(errorMsg){
   const app=document.getElementById('app');
   app.innerHTML =
@@ -10376,10 +10402,20 @@ function showSetPasswordScreen(errorMsg){
     +'<div class="brand-logo"><img src="'+MATHNASIUM_LOGO+'" alt="Mathnasium"/></div>'
     +'<h2>Set your password</h2>'
     +(errorMsg? '<div class="banner danger">'+errorMsg+'</div>' : '')
+    +'<div class="banner accent" id="usernameBanner"><b>Your username is your email address'+(setPasswordEmail? ':' : '.')+'</b>'
+      +(setPasswordEmail? '<div style="font-size:1.05rem;font-weight:700;margin-top:4px;word-break:break-all">'+setPasswordEmail+'</div>' : '')
+      +'<div class="small" style="margin-top:4px">Choose a password below. From now on you\'ll sign in with this email address and that password.</div></div>'
+    +'<label>Username (your email)</label><input id="setPwEmail" type="email" autocomplete="username" readonly value="'+setPasswordEmail+'" style="background:var(--surface-2)"/>'
     +'<label>New password</label><input id="newPassword" type="password" autocomplete="new-password" />'
     +'<label>Confirm password</label><input id="newPassword2" type="password" autocomplete="new-password" />'
     +'<button class="btn" onclick="setNewPassword()">Set password</button>'
     +'</div></div>';
+  if(!setPasswordEmail && supabaseClient){
+    supabaseClient.auth.getUser().then(function(r){
+      const email=r && r.data && r.data.user && r.data.user.email;
+      if(email){ setPasswordEmail=email; showSetPasswordScreen(errorMsg); }
+    });
+  }
 }
 function setNewPassword(){
   const p1=document.getElementById('newPassword').value||'';
@@ -10388,6 +10424,10 @@ function setNewPassword(){
   if(p1!==p2){ showSetPasswordScreen('Passwords don\'t match.'); return; }
   supabaseClient.auth.updateUser({password:p1}).then(function(res){
     if(res.error){ showSetPasswordScreen(res.error.message); return; }
+    // Queued rather than toast()-ed: toast() renders immediately, which would draw the app before
+    // afterLogin() has loaded this person's data. afterLogin's own render picks this up instead.
+    state.toast='You\'re all set! Next time, sign in with '+(setPasswordEmail||'your email address')+' and the password you just chose.';
+    setTimeout(function(){ state.toast=null; renderUnlessEditing(); }, 12000);
     afterLogin();
   });
 }
