@@ -1105,17 +1105,38 @@ function confirmTermBreakBooking(){
   state.termBreakBookingForm=null;
   render();
 }
-// Cancelling a self-booked summer-hours session is a plain cancel, never a make-up credit — the
-// family picked this slot themselves rather than losing a regular one, so there's nothing "owed"
-// back to them the way there is for parentCancelSession's regular standing sessions.
+// Cancelling a summer-hours session now works like a regular one (Oct 2026, per Allie: "summer
+// hours should still cancel with credits" — she chose a make-up credit over handing the session
+// back to the summer allowance): with notice (any earlier day, or the same day before the 10am
+// cutoff) it earns a make-up credit valid 3 months; after the cutoff it still cancels, without one.
+// Either way it stays counted as used from the summer allowance (parent_cancelled — see
+// studentTermBreakUsed), so the session isn't given back twice.
 function parentCancelTermBreakSession(sessionId){
   const sess=findSession(sessionId);
   if(!sess || sess.status!=='scheduled' || !sess.termBreak) return;
   const student=findStudent(sess.studentId);
-  if(!confirm('Cancel '+student.name+'\'s summer session on '+fmtLong(sess.date)+' at '+minToLabel(sess.start)+'?')) return;
+  const pastCutoff = toKey(sess.date)===toKey(simNow()) && sameDayMakeUpCutoffPassed();
+  const issued=sess.date, expiry=addMonths(issued,3);
+  if(!confirm('Cancel '+student.name+'\'s summer session on '+fmtLong(sess.date)+' at '+minToLabel(sess.start)+'?\n\n'
+    +'This still counts as one of '+student.name+'\'s summer sessions. '
+    +(pastCutoff
+      ? 'It\'s after the 10:00am same-day cutoff, so this cancellation will NOT come with a make-up credit.'
+      : 'You\'ll get a make-up credit valid until '+fmtShort(expiry)+'.'))) return;
   sess.status='cancelled';
-  dbWrite('cancelling a summer-hours session (parent)', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
-  toast('Summer session cancelled.');
+  sess.parentCancelled=true;
+  dbWrite('cancelling a summer-hours session (parent)', function(){ return supabaseClient.from('sessions').update({status:'cancelled', parent_cancelled:true}).eq('id', sess.id); });
+  if(pastCutoff){
+    toast('Summer session cancelled — no make-up credit was issued since it\'s after the 10:00am same-day cutoff.', 6000);
+    render();
+    return;
+  }
+  const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'parent-cancel', note:'Cancelled summer-hours session', minutes:sessionBaseMinutes(sess), minutesUsed:0};
+  credits.push(c);
+  dbWrite('issuing a make-up credit (summer session)', function(){ return supabaseClient.from('credits').insert({
+    id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
+    status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note, minutes:c.minutes||null
+  }); });
+  toast('Summer session cancelled — a make-up credit was added, valid until '+fmtShort(expiry)+'.', 6000);
   render();
 }
 
@@ -1142,7 +1163,9 @@ function studentTermBreakUsed(tb, studentId){
   const startKey=toKey(tb.startDate), endKey=toKey(tb.endDate);
   return sessions.filter(function(s){
     const dk=toKey(s.date);
-    return s.studentId===studentId && s.termBreak && s.status!=='cancelled' && dk>=startKey && dk<=endKey;
+    // A summer session the parent cancelled still counts as used — they get a make-up credit for it
+    // instead (Oct 2026); one front desk cancelled (or a closure) frees the allowance back up.
+    return s.studentId===studentId && s.termBreak && (s.status!=='cancelled' || s.parentCancelled) && dk>=startKey && dk<=endKey;
   }).length;
 }
 function studentTermBreakRemaining(tb, studentId){
@@ -3667,7 +3690,8 @@ function parentCancelSession(sessionId){
   if(!confirm(confirmMsg)) return;
   returnTopUpLocally(sess); // +30 minutes back on the credit (the database does the same, Oct 2026)
   sess.status='cancelled';
-  dbWrite('cancelling session (parent'+(pastCutoff?', after same-day cutoff — no make-up':', with notice')+')', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
+  dbWrite('cancelling session (parent'+(pastCutoff?', after same-day cutoff — no make-up':', with notice')+')', function(){ return supabaseClient.from('sessions').update({status:'cancelled', parent_cancelled:true}).eq('id', sess.id); });
+  sess.parentCancelled=true;
   if(pastCutoff){
     toast('Session cancelled — no make-up credit was issued since it\'s after the 10:00am same-day cutoff. Call the centre if you\'d like to discuss options.', 6000);
     return;
@@ -4030,7 +4054,8 @@ function restoreSession(sessionId){
   if(!confirm('Restore '+student.name+'\'s session on '+fmtShort(sess.date)+' at '+minToLabel(sess.start)+'?'
     +(unused? '\n\nThe make-up credit issued for it will be removed.' : ''))) return;
   sess.status='scheduled';
-  dbWrite('restoring a session', function(){ return supabaseClient.from('sessions').update({status:'scheduled'}).eq('id', sess.id); });
+  sess.parentCancelled=false;
+  dbWrite('restoring a session', function(){ return supabaseClient.from('sessions').update({status:'scheduled', parent_cancelled:false}).eq('id', sess.id); });
   if(ownCredit && ownCredit.status==='available'){
     ownCredit.status='redeemed'; ownCredit.redeemedSessionId=sess.id;
     dbWrite('re-using the make-up credit for a restored session', function(){ return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sess.id}).eq('id', ownCredit.id); });
@@ -10288,7 +10313,7 @@ function renderParent(){
         // with a make-up credit past that point (5.26, per Allie: previously refused outright,
         // which just pushed the family to phone in instead). Flag it here too, not only in the
         // confirm dialog, so it's not a surprise after they've already clicked Cancel.
-        const noMakeUpToday = !s.termBreak && toKey(s.date)===toKey(simNow()) && sameDayMakeUpCutoffPassed();
+        const noMakeUpToday = toKey(s.date)===toKey(simNow()) && sameDayMakeUpCutoffPassed(); // summer sessions too since Oct 2026 — they now earn credits
         return '<div class="session-row">'
           +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
           +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b>'+topUpBadgeHtml(s)+'<div class="small muted">'+(s.online?'Online':(pod?pod.name:'—'))+' · '+(instr?instr.name:'Unassigned')+'</div>'
@@ -11172,7 +11197,7 @@ function fetchParentsGroup(){
 
 function fetchSessionsGroup(){
   const mySeq=nextGroupSeq('sessions');
-  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break,created_at,extra_min,extra_credit_id').then(function(sessionRows){
+  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break,created_at,extra_min,extra_credit_id,parent_cancelled').then(function(sessionRows){
     if(!isLatestGroupSeq('sessions', mySeq)) return; // a newer sessions refresh was dispatched after this one — this response is now stale, discard it rather than clobber fresher state (task #246)
     sessions=sessionRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
@@ -11180,6 +11205,7 @@ function fetchSessionsGroup(){
       actualStart:r.actual_start_min, actualEnd: r.actual_end_min==null? null : Math.min(r.actual_end_min, CENTER_CLOSE), checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false, // finish never shown past close (Oct 2026)
       bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false, termBreak:r.term_break||false,
       extraMin:r.extra_min||0, extraCreditId:r.extra_credit_id||null, // +30 top-ups (Oct 2026)
+      parentCancelled:!!r.parent_cancelled, // the parent cancelled it themselves (Oct 2026)
       // Task #253: schedule regenerations (saveRecurringForm, before task #87's fix) can leave several
       // rows on file for the same student+date — createdAt lets holdMonthlyBreakdown() trust only the
       // most recently written row per date instead of every stale duplicate.
