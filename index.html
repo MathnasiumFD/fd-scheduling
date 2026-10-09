@@ -474,18 +474,42 @@ function notifyFrontDeskOfEnrollmentRequest(requestId){
 // Supabase dashboard, then paste SQL to link their role" process. Unlike dbWrite(), this isn't
 // fire-and-forget — front desk is actively waiting to know whether the invite actually went out,
 // so it always leaves a toast either way.
+// Oct 2026, per Allie: "invite login button not working on first click" — it was working, but the
+// invite function takes 2–3s (cold start + sending the email) and the app showed nothing until it
+// finished, so it looked dead and got clicked again (auth logs: two invites to one parent 4s
+// apart). Now the Login cell flips to "Sending…" straight away, and a second click is ignored while
+// the first is still in flight.
+var inviteInFlight={};
+function recordForLogin(role, linkedId){
+  if(role==='instructor') return findInstructor(linkedId);
+  if(role==='parent') return parents.find(function(x){ return x.id===linkedId; });
+  if(role==='staff') return staffMembers.find(function(x){ return x.id===linkedId; });
+  return null;
+}
 function inviteLogin(email, role, linkedId, personName){
   if(!supabaseClient || !currentUser){ toast('Invites only work when signed in to the live app.'); return; }
+  const key=role+':'+linkedId;
+  if(inviteInFlight[key]) return;
+  inviteInFlight[key]=true;
+  const rec=recordForLogin(role, linkedId);
+  const before=rec? rec.authUserId : null;
+  if(rec) rec.authUserId='sending';
+  toast('Sending invite to '+email+'…', 8000);
   supabaseClient.functions.invoke('invite-user', {body:{email:email, role:role, linkedId:linkedId}}).then(function(r){
+    delete inviteInFlight[key];
     const errMsg = (r && r.error && r.error.message) || (r && r.data && r.data.error);
-    if(errMsg){ toast('Could not invite '+personName+' — '+errMsg); return; }
+    if(errMsg){ if(rec && rec.authUserId==='sending') rec.authUserId=before; toast('Could not invite '+personName+' — '+errMsg, 7000); return; }
     if(role==='instructor'){ const i=findInstructor(linkedId); if(i) i.authUserId='pending'; }
     if(role==='parent'){ const p=parents.find(function(x){ return x.id===linkedId; }); if(p) p.authUserId='pending'; }
     if(role==='staff'){ const s=staffMembers.find(function(x){ return x.id===linkedId; }); if(s) s.authUserId='pending'; }
     toast('Invite sent to '+email+' — they\'ll get an email to set their own password.');
     render();
     loadLoginStatuses().then(renderUnlessEditing);
-  }).catch(function(err){ toast('Could not invite '+personName+' — '+(err&&err.message?err.message:'unknown error')); });
+  }).catch(function(err){
+    delete inviteInFlight[key];
+    if(rec && rec.authUserId==='sending') rec.authUserId=before;
+    toast('Could not invite '+personName+' — '+(err&&err.message?err.message:'unknown error'));
+  });
 }
 // Invite status for the Login column on the Parents / Instructors / Front desk staff lists (Oct 2026,
 // per Allie: "when sending invite out to parents, can it say sent or something until the parents set
@@ -509,6 +533,7 @@ function loadLoginStatuses(){
 function loginStatusCellHtml(authUserId, inviteButtonHtml, resendButtonHtml){
   if(!supabaseClient) return '<span class="small muted">—</span>';
   if(!authUserId) return inviteButtonHtml;
+  if(authUserId==='sending') return '<span class="badge soon">Sending…</span>';
   const sent='<span class="badge soon" title="They haven\'t set a password and signed in yet">Invite sent</span>';
   const resend=resendButtonHtml? ' '+resendButtonHtml : '';
   if(authUserId==='pending') return sent+' <span class="small muted">just now</span>';
@@ -762,11 +787,11 @@ function cancelSessionsOnClosedDate(date){
     sess.status='cancelled';
     dbWrite('cancelling a session for a centre closure', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
     const issued=sess.date, expiry=addMonths(issued,3);
-    const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'closure', note:''};
+    const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'closure', note:'', minutes:sessionBaseMinutes(sess), minutesUsed:0};
     credits.push(c);
     dbWrite('issuing a make-up credit (closure)', function(){ return supabaseClient.from('credits').insert({
       id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
-      status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
+      status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note, minutes:c.minutes||null
     }); });
   });
   return affected.length;
@@ -1231,6 +1256,42 @@ function removeTermBreakRecurringPick(studentId, weekday, start){
 // one (applyHold); approving a cancellation schedules a "stop attending" plan change from the
 // requested date, same mechanism front desk already uses for that (see applyStopEnrollment).
 var enrollmentRequests=[];
+// Extra parents/guardians per child (Oct 2026, per Allie: "what do i do for kids with divorced
+// parents?"). students.parentId stays the MAIN parent; each entry here links one more parent to one
+// child: {studentId, parentId, receivesEmails, canManage}. Mirrors the student_guardians table
+// (add_student_guardians.sql), whose RLS lookups decide what each parent can see/change server-side.
+var studentGuardians=[];
+// Every child a parent is connected to: their own (main) children plus any they're linked to.
+function parentStudentIdsFor(parentId){
+  const ids=students.filter(function(s){ return s.parentId===parentId; }).map(function(s){ return s.id; });
+  studentGuardians.forEach(function(g){ if(g.parentId===parentId && ids.indexOf(g.studentId)===-1) ids.push(g.studentId); });
+  return ids;
+}
+function refreshParentStudentIds(){ parents.forEach(function(p){ p.studentIds=parentStudentIdsFor(p.id); }); }
+// Which parent is submitting a request right now (stored as enrollment_requests.requested_by_parent_id).
+function requestingParentId(){
+  if(currentUser) return currentUser.role==='parent'? currentUser.parentId : null;
+  return state.role==='parent'? (state.parentLoggedIn||null) : null; // offline demo
+}
+// "Requested by …" for a request — front desk sees the parent's name; a parent sees "you" or
+// "another parent" (never the other parent's name — their details stay private, Oct 2026).
+function requestedByLabel(req){
+  if(!req.requestedBy) return '';
+  const viewingParent = currentUser? (currentUser.role==='parent'? currentUser.parentId : null) : (state.role==='parent'? state.parentLoggedIn : null);
+  if(viewingParent) return req.requestedBy===viewingParent? 'requested by you' : 'requested by another parent/guardian';
+  const p=parents.find(function(x){ return x.id===req.requestedBy; });
+  return p? 'requested by '+p.name : '';
+}
+function guardianLinksFor(studentId){ return studentGuardians.filter(function(g){ return g.studentId===studentId; }); }
+// Whether the person signed in may make changes for this child. Staff/offline always; a parent if
+// it's their own (main) child, or they're linked with "Can make changes" on (otherwise view-only).
+function parentCanManage(studentId){
+  if(!currentUser || currentUser.role==='staff') return true;
+  if(currentUser.role!=='parent') return false;
+  const s=findStudent(studentId);
+  if(s && s.parentId===currentUser.parentId) return true;
+  return studentGuardians.some(function(g){ return g.studentId===studentId && g.parentId===currentUser.parentId && g.canManage; });
+}
 var nextEnrollmentRequestId=1;
 
 function findPod(id){ return pods.find(p=>p.id===id); }
@@ -2560,10 +2621,10 @@ function submitHoldRequest(){
   // case). `monthNoticeOk` is re-checked from req.start at approval time too, so nothing about
   // "late" needs to be persisted here.
   const late=!monthNoticeOk(start);
-  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'hold', start:start, end:new Date(f.end), effectiveFrom:null, note:f.note.trim(), status:'open', createdAt:simNow()};
+  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'hold', start:start, end:new Date(f.end), effectiveFrom:null, note:f.note.trim(), status:'open', createdAt:simNow(), requestedBy:requestingParentId()};
   enrollmentRequests.push(req);
   dbWrite('submitting a hold request', function(){ return supabaseClient.from('enrollment_requests').insert({
-    id:req.id, student_id:req.studentId, type:req.type, start_date:toKey(req.start), end_date:toKey(req.end), effective_from:null, note:req.note, status:req.status, created_at:req.createdAt.toISOString()
+    id:req.id, student_id:req.studentId, type:req.type, start_date:toKey(req.start), end_date:toKey(req.end), effective_from:null, note:req.note, status:req.status, created_at:req.createdAt.toISOString(), requested_by_parent_id:req.requestedBy
   }); });
   state.holdRequestForm=null;
   notifyFrontDeskOfEnrollmentRequest(req.id);
@@ -2596,10 +2657,10 @@ function submitCancelRequest(){
   // plainly rather than making them guess-and-check a date).
   const late=!monthNoticeOk(effectiveFrom);
   if(late) effectiveFrom=earliestMonthNoticeDate();
-  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'cancel', start:null, end:null, effectiveFrom:effectiveFrom, note:f.note.trim(), status:'open', createdAt:simNow()};
+  const req={id:newId()||('er'+(nextEnrollmentRequestId++)), studentId:f.studentId, type:'cancel', start:null, end:null, effectiveFrom:effectiveFrom, note:f.note.trim(), status:'open', createdAt:simNow(), requestedBy:requestingParentId()};
   enrollmentRequests.push(req);
   dbWrite('submitting a cancellation request', function(){ return supabaseClient.from('enrollment_requests').insert({
-    id:req.id, student_id:req.studentId, type:req.type, start_date:null, end_date:null, effective_from:toKey(req.effectiveFrom), note:req.note, status:req.status, created_at:req.createdAt.toISOString()
+    id:req.id, student_id:req.studentId, type:req.type, start_date:null, end_date:null, effective_from:toKey(req.effectiveFrom), note:req.note, status:req.status, created_at:req.createdAt.toISOString(), requested_by_parent_id:req.requestedBy
   }); });
   state.cancelRequestForm=null;
   notifyFrontDeskOfEnrollmentRequest(req.id);
@@ -3020,7 +3081,7 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
         // just fail with a 403 — skip it here instead, same pattern as the self-heal branch
         // above. The local sessions.push() above still runs unconditionally so rendering stays
         // correct regardless of whose session this is.
-        const canPersist = !currentUser || currentUser.role==='staff' || (currentUser.role==='parent' && student.parentId===currentUser.parentId);
+        const canPersist = !currentUser || currentUser.role==='staff' || (currentUser.role==='parent' && parentCanManage(student.id)); // second parents too (Oct 2026), unless view-only
         // onDuplicateConflict — see dbWrite's own comment (Sept 2026, per Allie: "every kid got 2
         // make up for the same day"). A unique-violation here means another tab's own
         // regenerateAllRecurring() already inserted the real row for this exact student/date/slot a
@@ -3139,6 +3200,7 @@ function closeBooking(){ state.booking=null; render(); }
 function openBookingForCredit(creditId){
   const credit=findCredit(creditId);
   if(!credit || credit.status!=='available') return; // guards direct calls; the button itself only ever shows for an available credit
+  if(creditPartlyUsed(credit)){ toast('This credit has already been partly used for +30 min top-ups ('+creditMinutesLeft(credit)+' min left), so it can only be used for more top-ups, not a whole session.', 7000); return; }
   const student=findStudent(credit.studentId);
   // Defaults to the nearest non-closed day from today (usually just today) — rolls forward day by
   // day rather than leaving staff to land on a day the centre's marked closed and have to change it
@@ -3269,6 +3331,127 @@ function chainAfterInsert(insertPromise, writeFn){
 // doesn't exist yet (Sept 2026, root cause of "makeup credits are not saving to server" when
 // redeeming one from the front desk's manual "assign make-up" flow — same class of bug already fixed
 // once for saveNewStudent's own parent/student ordering).
+/* ---------- +30 min make-up top-ups (Oct 2026) ---------- */
+// Per Allie: "I sometimes offer up the option to our parents to make up a missed session (whether
+// its 1.5 hrs or 1hr or 2 hrs) in additional 30 min to an already scheduled session". Chosen:
+// parents can add it too (if they can make changes for that child), it must be clear it uses
+// make-up time and show what's left; the extra time goes AFTER the session; a credit is used in
+// 30-minute pieces; front desk sees it flagged at check-in. A credit with nothing used yet can still
+// be booked as one whole make-up session; once part-used it's top-ups only. The database does the
+// real checks (add_session_topup / remove_session_topup, add_session_topups.sql) and hands minutes
+// back automatically if a topped-up session is cancelled or marked away / not in.
+var TOPUP_MIN=30;
+function sessionBaseMinutes(s){ return s.duration-(s.extraMin||0); }
+function creditTotalMinutes(c){ if(c.minutes) return c.minutes; const st=findStudent(c.studentId); return st? st.duration : 90; }
+function creditMinutesLeft(c){ return Math.max(0, creditTotalMinutes(c)-(c.minutesUsed||0)); }
+function creditPartlyUsed(c){ return (c.minutesUsed||0)>0; }
+function creditUsableForTopUp(c, date){
+  return c.status==='available' && toKey(c.expiryDate)>=toKey(date) && toKey(c.expiryDate)>=toKey(simNow()) && creditMinutesLeft(c)>=TOPUP_MIN;
+}
+// Which credit a top-up would come from: an already-started one first (so families don't end up
+// with several half-used credits), then whichever expires soonest.
+function topUpCreditFor(studentId, date){
+  return credits.filter(function(c){ return c.studentId===studentId && creditUsableForTopUp(c, date); })
+    .sort(function(a,b){ return (creditPartlyUsed(b)-creditPartlyUsed(a)) || (a.expiryDate-b.expiryDate); })[0] || null;
+}
+function totalTopUpMinutesLeft(studentId){
+  return credits.filter(function(c){ return c.studentId===studentId && c.status==='available' && toKey(c.expiryDate)>=toKey(simNow()); })
+    .reduce(function(sum,c){ return sum+creditMinutesLeft(c); }, 0);
+}
+// Why +30 can't be added to this session right now (null = it can). Parents get the same strict
+// checks the booking calendar uses; front desk can still overbook a Pod on the day, as elsewhere.
+function topUpBlockedReason(sess, byParent){
+  const student=findStudent(sess.studentId);
+  const name=student? student.name : 'They';
+  if(sess.status!=='scheduled') return 'Only an upcoming booked session can be extended.';
+  const dk=toKey(sess.date), todayKey=toKey(simNow());
+  if(dk<todayKey) return 'That session has already happened.';
+  if(sess.extraMin>0) return 'This session already has an extra 30 minutes.';
+  if(!topUpCreditFor(sess.studentId, sess.date)) return name+' doesn\'t have 30 minutes of make-up time available for that date.';
+  const end=sess.start+sess.duration;
+  if(end+TOPUP_MIN>CENTER_CLOSE) return 'The centre closes before an extra 30 minutes would finish.';
+  if(byParent && dk===todayKey && sameDayMakeUpCutoffPassed()) return 'Same-day changes close at 10:00am — please call the centre.';
+  if(studentOverlapClash(sess.studentId, dk, end, TOPUP_MIN, sess.id)) return 'It would run into another session '+name+' has that day.';
+  if(sess.podId && !sess.online){
+    const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
+    const pod=findPod(sess.podId);
+    if((byParent || dk!==todayKey) && podCapacityBlocked(sess.podId, dk, {start:end, duration:TOPUP_MIN})) return (pod? pod.name : 'The Pod')+' is full for those extra 30 minutes.';
+    if(byParent && !podCoverageDetail(sess.podId, weekday, end, TOPUP_MIN, sess.date).ok) return 'No instructor is rostered for those extra 30 minutes — please call the centre.';
+  }
+  return null;
+}
+function applyTopUpLocally(sess, credit){
+  sess.duration+=TOPUP_MIN; sess.extraMin=TOPUP_MIN; sess.extraCreditId=credit.id;
+  credit.minutes=creditTotalMinutes(credit);
+  credit.minutesUsed=(credit.minutesUsed||0)+TOPUP_MIN;
+  if(creditMinutesLeft(credit)<=0) credit.status='redeemed';
+}
+function addTopUp(sessionId){
+  const sess=findSession(sessionId);
+  if(!sess) return;
+  const byParent = currentUser? currentUser.role==='parent' : state.role==='parent';
+  const reason=topUpBlockedReason(sess, byParent);
+  if(reason){ toast(reason, 7000); return; }
+  const student=findStudent(sess.studentId);
+  const credit=topUpCreditFor(sess.studentId, sess.date);
+  const leftAfter=creditMinutesLeft(credit)-TOPUP_MIN;
+  const oldEnd=sess.start+sess.duration, newEnd=oldEnd+TOPUP_MIN;
+  if(!confirm('Add 30 extra minutes to '+student.name+'\'s session on '+fmtShort(sess.date)+'?\n\n'
+    +'This uses 30 minutes of make-up time from a missed session ('+leftAfter+' min left on that credit after this).\n'
+    +'The session will finish at '+minToLabel(newEnd)+' instead of '+minToLabel(oldEnd)+'.')) return;
+  const done=function(){
+    applyTopUpLocally(sess, credit);
+    toast('Added 30 minutes — '+student.name+' now finishes at '+minToLabel(newEnd)+' on '+fmtShort(sess.date)+'. '+leftAfter+' min of make-up time left on that credit.', 7000);
+    render();
+  };
+  if(!supabaseClient || !currentUser){ done(); return; }
+  supabaseClient.rpc('add_session_topup', {p_session_id:sess.id, p_credit_id:credit.id}).then(function(r){
+    if(r.error){
+      const msg=String(r.error.message||'');
+      toast('Couldn\'t add the extra 30 minutes — '+(/overlap|exclusion|conflict/i.test(msg)? 'it would run into another session that day.' : msg), 7000);
+      return;
+    }
+    done();
+  });
+}
+function removeTopUp(sessionId){
+  const sess=findSession(sessionId);
+  if(!sess || !sess.extraMin) return;
+  const student=findStudent(sess.studentId);
+  if(!confirm('Remove the extra 30 minutes from '+student.name+'\'s session on '+fmtShort(sess.date)+'?\n\nThe 30 minutes go back onto their make-up credit.')) return;
+  const done=function(){
+    const credit=sess.extraCreditId? findCredit(sess.extraCreditId) : null;
+    if(credit){
+      credit.minutesUsed=Math.max(0,(credit.minutesUsed||0)-sess.extraMin);
+      if(credit.status==='redeemed' && !credit.redeemedSessionId) credit.status='available';
+    }
+    sess.duration-=sess.extraMin; sess.extraMin=0; sess.extraCreditId=null;
+    toast('Extra 30 minutes removed — the time is back on '+student.name+'\'s make-up credit.');
+    render();
+  };
+  if(!supabaseClient || !currentUser){ done(); return; }
+  supabaseClient.rpc('remove_session_topup', {p_session_id:sess.id}).then(function(r){
+    if(r.error){ toast('Couldn\'t remove it — '+r.error.message, 7000); return; }
+    done();
+  });
+}
+// On-screen mirror of the database's return_topup_minutes trigger: when a topped-up session is
+// cancelled or marked away/not in, its extra 30 minutes go back onto the credit and the session
+// returns to its normal length. Only touches local state — the database does it for real.
+function returnTopUpLocally(sess){
+  if(!sess || !sess.extraMin || sess.status!=='scheduled') return;
+  const credit=sess.extraCreditId? findCredit(sess.extraCreditId) : null;
+  if(credit){
+    credit.minutesUsed=Math.max(0,(credit.minutesUsed||0)-sess.extraMin);
+    if(credit.status==='redeemed' && !credit.redeemedSessionId) credit.status='available';
+  }
+  sess.duration-=sess.extraMin; sess.extraMin=0; sess.extraCreditId=null;
+}
+// Short marker used wherever a session is listed (Oct 2026).
+function topUpBadgeHtml(sess){
+  return sess.extraMin? ' <span class="badge firstday" title="Includes '+sess.extraMin+' extra minutes of make-up time">+'+sess.extraMin+' min make-up</span>' : '';
+}
+
 function redeemCreditForBooking(creditId, sessionId){
   if(!creditId) return null;
   const credit=findCredit(creditId);
@@ -3415,16 +3598,17 @@ function confirmBooking(){
 // (a parent's own self-cancel, a centre closure): a make-up credit is issued, same 90-day rule.
 function markStatus(sessionId, status){
   const sess=findSession(sessionId);
+  if(status==='cancelled' || status==='excused' || status==='no-show') returnTopUpLocally(sess); // +30 minutes back on the credit (Oct 2026)
   sess.status=status;
   dbWrite('updating attendance', function(){ return supabaseClient.from('sessions').update({status}).eq('id', sess.id); });
   if(status==='excused'){
     const issued=sess.date;
     const expiry=addMonths(issued,3);
-    const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:''};
+    const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:'', minutes:sessionBaseMinutes(sess), minutesUsed:0};
     credits.push(c);
     dbWrite('issuing a make-up credit', function(){ return supabaseClient.from('credits').insert({
       id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
-      status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
+      status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note, minutes:c.minutes||null
     }); });
     toast(findStudent(sess.studentId).name+' marked excused (notified in advance) — a make-up credit was issued, expires '+fmtShort(expiry)+'.');
   } else if(status==='no-show'){
@@ -3455,17 +3639,18 @@ function parentCancelSession(sessionId){
       ? 'It\'s after the 10:00am same-day cutoff, so this cancellation will NOT come with a make-up credit.'
       : 'You\'ll get a make-up credit valid until '+fmtShort(expiry)+'.');
   if(!confirm(confirmMsg)) return;
+  returnTopUpLocally(sess); // +30 minutes back on the credit (the database does the same, Oct 2026)
   sess.status='cancelled';
   dbWrite('cancelling session (parent'+(pastCutoff?', after same-day cutoff — no make-up':', with notice')+')', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
   if(pastCutoff){
     toast('Session cancelled — no make-up credit was issued since it\'s after the 10:00am same-day cutoff. Call the centre if you\'d like to discuss options.', 6000);
     return;
   }
-  const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'parent-cancel', note:''};
+  const c={id:newId()||('c'+(nextCreditId++)), studentId:sess.studentId, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'parent-cancel', note:'', minutes:sessionBaseMinutes(sess), minutesUsed:0};
   credits.push(c);
   dbWrite('issuing a make-up credit', function(){ return supabaseClient.from('credits').insert({
     id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
-    status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
+    status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note, minutes:c.minutes||null
   }); });
   toast('Session cancelled — a make-up credit was added, valid until '+fmtShort(expiry)+'.');
 }
@@ -3554,7 +3739,7 @@ function saveAddCredit(){
   credits.push(c);
   dbWrite('adding a manual credit', function(){ return supabaseClient.from('credits').insert({
     id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
-    status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
+    status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note, minutes:c.minutes||null
   }); });
   toast('Make-up credit added for '+student.name+' — expires '+fmtShort(c.expiryDate)+'.');
   state.addCreditForm=null;
@@ -4210,7 +4395,11 @@ function instructorLoginSubmit(email){
 function instructorLogout(){ state.instructorLoggedIn=null; render(); }
 function quickInstructorLogin(email){ instructorLoginSubmit(email); }
 
-function startBookMakeUp(creditId){ state.parentBookingCreditId=creditId; render(); }
+function startBookMakeUp(creditId){
+  const c=findCredit(creditId);
+  if(c && creditPartlyUsed(c)){ toast('This make-up credit has been partly used for extra 30-minute top-ups — the remaining '+creditMinutesLeft(c)+' min can be added onto upcoming sessions instead.', 7000); return; }
+  state.parentBookingCreditId=creditId; render();
+}
 function cancelBookMakeUp(){ state.parentBookingCreditId=null; render(); }
 
 // Whether it's already too late to request a make-up for today (5.7) — past the 10:00am
@@ -5352,6 +5541,12 @@ function saveEditStudent(){
     newParent.studentIds=newParent.studentIds||[];
     if(newParent.studentIds.indexOf(student.id)===-1) newParent.studentIds.push(student.id);
     student.parentId=f.parentId;
+    // If the new main parent was linked as an "other parent", that link is now redundant (Oct 2026).
+    if(studentGuardians.some(function(g){ return g.studentId===student.id && g.parentId===f.parentId; })){
+      studentGuardians=studentGuardians.filter(function(g){ return !(g.studentId===student.id && g.parentId===f.parentId); });
+      dbWrite('tidying a now-redundant parent link', function(){ return supabaseClient.from('student_guardians').delete().eq('student_id', student.id).eq('parent_id', f.parentId); });
+    }
+    refreshParentStudentIds();
   }
   dbWrite('editing student details', function(){ return supabaseClient.from('students').update({
     name:student.name, year:student.year, base_year:student.baseYear, year_baseline:student.yearBaseline, parent_id:student.parentId
@@ -5655,12 +5850,12 @@ function applyHold(student, start, end, note, grantMakeupCredits){
       // insufficient notice... i need it to be issued for the missed sessions, not for when they were
       // put through").
       const issued=s.date, expiry=addMonths(issued,3);
-      const c={id:newId()||('c'+(nextCreditId++)), studentId:student.id, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:'Missed during a late-notice hold — session on '+fmtShort(s.date)};
+      const c={id:newId()||('c'+(nextCreditId++)), studentId:student.id, issuedDate:issued, expiryDate:expiry, status:'available', redeemedSessionId:null, warningSent:false, source:'excused-absence', note:'Missed during a late-notice hold — session on '+fmtShort(s.date), minutes:sessionBaseMinutes(s), minutesUsed:0};
       credits.push(c);
       madeUpCount++;
       dbWrite('issuing a make-up credit (hold)', function(){ return supabaseClient.from('credits').insert({
         id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
-        status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note
+        status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note, minutes:c.minutes||null
       }); });
     }
   });
@@ -6200,7 +6395,7 @@ function sessionRowHtml(sess, weekday, dayKey, now){
   } else if(sess.instructorId){
     handoffNote = ' · with '+findInstructor(sess.instructorId).name+(sess.online? ' (online)' : '');
   }
-  let html='<tr><td><b>'+student.name+'</b></td><td>'+yearLabel(student.year)+'</td><td>'+rangeLabel(sess.start,sess.duration)+'</td>';
+  let html='<tr><td><b>'+student.name+'</b></td><td>'+yearLabel(student.year)+'</td><td>'+rangeLabel(sess.start,sess.duration)+topUpBadgeHtml(sess)+'</td>';
   // Oct 2026: this table now lives on the Today tab's day-by-day "Pod seating" (renderPodSummaryStrip,
   // per Allie: "show me all the kids expected to show up today... so we can organise where everyone
   // will be sitting in advance"), so its picker is a ONE-OFF move for this session only
@@ -6221,6 +6416,11 @@ function sessionRowHtml(sess, weekday, dayKey, now){
     actions+='<button class="btn sm ghost" onclick="markStatus(\''+sess.id+'\',\'cancelled\')">Cancel</button>';
   } else if(sess.status==='attended'){
     actions+='<button class="btn sm ghost" onclick="undoCheckIn(\''+sess.id+'\')">Undo check-in</button>';
+  }
+  // +30 min make-up top-up (Oct 2026) — front desk can add or take off the extra 30 minutes here.
+  if(sess.status==='scheduled'){
+    if(sess.extraMin) actions+='<button class="btn sm ghost" onclick="removeTopUp(\''+sess.id+'\')" title="Take the extra 30 minutes off and return them to the make-up credit">− 30 min</button>';
+    else if(!sess.termBreak && topUpCreditFor(sess.studentId, sess.date)) actions+='<button class="btn sm ghost" onclick="addTopUp(\''+sess.id+'\')" title="Add 30 minutes to the end, using the student\'s make-up time">+30 min</button>';
   }
   html+='<td>'+actions+'</td></tr>';
   return html;
@@ -7465,7 +7665,12 @@ function renderEnrollmentRequestsPanel(){
       : r.type==='time_change'
       ? timeChangeSwapDetail(r)+' from '+fmtShort(r.effectiveFrom)+(readyToApprove? ' <span class="badge available">All times open — ready to approve</span>' : '')
       : '<span class="badge full">Cancel enrolment</span> from '+fmtShort(r.effectiveFrom);
-    html+='<tr><td>'+student.name+'</td><td class="small">'+(parent?parent.name:'—')+'</td>'
+    // Who actually sent it (Oct 2026) — with a second parent linked, it may not be the main parent.
+    const sender=r.requestedBy? parents.find(function(p){ return p.id===r.requestedBy; }) : null;
+    const parentCell = sender && (!parent || sender.id!==parent.id)
+      ? sender.name+' <span class="muted">(2nd parent/guardian)</span>'
+      : (parent? parent.name : '—');
+    html+='<tr><td>'+student.name+'</td><td class="small">'+parentCell+'</td>'
       +'<td>'+detail+'</td>'
       +'<td class="small muted">'+(r.note||'—')+'</td>'
       +'<td><button class="btn sm primary" style="margin:2px" onclick="approveEnrollmentRequest(\''+r.id+'\')">Approve</button> <button class="btn sm ghost" style="margin:2px" onclick="declineEnrollmentRequest(\''+r.id+'\')">Decline</button></td></tr>';
@@ -7750,6 +7955,9 @@ function renderCheckInModal(){
 
   let html='<div class="overlay" onclick="if(event.target===this) closeCheckIn()"><div class="modal">';
   html+='<h3>Check in '+student.name+'</h3>';
+  // Flagged at check-in (Oct 2026, per Allie: "when we check in the kids - that the specific session
+  // is an extra long one").
+  if(sess.extraMin) html+='<div class="banner warn"><b>Extra-long session</b> — includes +'+sess.extraMin+' min of make-up time. Normally '+sessionBaseMinutes(sess)+' min; today they finish at '+minToLabel(sess.start+sess.duration)+'.</div>';
   html+='<p>Scheduled '+rangeLabel(sess.start,sess.duration)+'. Record when they actually arrived — the exit time below fills in automatically from that, however late (or early) it was, but you can adjust it in 5-minute steps if needed.</p>';
   html+='<label>Pod</label><select onchange="setSessionLocation(\''+sess.id+'\',this.value)"><option value=""'+(sessionLocationValue(sess)===''?' selected':'')+'>Unassigned</option>'
     +locationOptionsHtml(weekday, dateKey, sess.start, sess.duration, sessionLocationValue(sess), sess.id)
@@ -8193,7 +8401,7 @@ function renderParentsPanel(){
   html+='<p>Parents are usually created automatically when you enroll their first child. Use "Add parent" here only if you need their record to exist before that (e.g. lining up their login in advance).</p>';
   html+='<table><tr><th>Parent</th><th>Email</th><th>Children</th><th>Login</th><th></th></tr>';
   parents.filter(function(p){ return !isParentInactive(p); }).sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(p){
-    const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); return s? s.name : null; }).filter(Boolean);
+    const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); return s? s.name+(s.parentId!==p.id? ' <span class="muted">(as 2nd parent)</span>' : '') : null; }).filter(Boolean);
     const loginCell = loginStatusCellHtml(p.authUserId,
       '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>',
       resendInviteButtonHtml(p.email, 'parent', p.id, p.name));
@@ -8809,6 +9017,99 @@ function renderNewStudentModal(){
   return html;
 }
 
+/* ---------- other parents/guardians per child (Oct 2026) ---------- */
+// Per Allie ("kids with divorced parents"), with her chosen defaults: an extra parent gets the same
+// emails and can make the same changes as the main parent, and front desk can switch either off per
+// parent here. Each parent only ever sees their own contact details (enforced by the database —
+// see add_student_guardians.sql). Changes in this section save immediately, separately from the
+// student form's own Save button.
+function renderGuardiansSection(student, f){
+  const links=guardianLinksFor(student.id);
+  let html='<div style="border-top:1px solid var(--border);margin-top:14px;padding-top:10px">'
+    +'<label style="margin-top:0">Other parents/guardians</label>'
+    +'<p class="small muted" style="margin-top:-4px">For separated families etc. Each parent gets their own login and sees '+student.name+'\'s sessions and credits — but never the other parent\'s details. Changes here save straight away.</p>';
+  if(!links.length) html+='<div class="small muted" style="margin-bottom:6px">None — only the main parent above.</div>';
+  links.forEach(function(g){
+    const p=parents.find(function(x){ return x.id===g.parentId; });
+    if(!p) return;
+    html+='<div style="border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:6px">'
+      +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><b>'+p.name+'</b><span class="small muted">'+p.email+'</span>'
+        +'<span style="margin-left:auto">'+loginStatusCellHtml(p.authUserId,
+          '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>',
+          resendInviteButtonHtml(p.email,'parent',p.id,p.name))+'</span></div>'
+      +'<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:6px;font-size:.8rem">'
+        +'<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0"><input type="checkbox" style="width:auto" '+(g.receivesEmails?'checked':'')+' onchange="setGuardianFlag(\''+student.id+'\',\''+p.id+'\',\'receivesEmails\',this.checked)"/> Gets emails</label>'
+        +'<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0"><input type="checkbox" style="width:auto" '+(g.canManage?'checked':'')+' onchange="setGuardianFlag(\''+student.id+'\',\''+p.id+'\',\'canManage\',this.checked)"/> Can make changes</label>'
+        +'<button class="btn sm ghost" style="margin-left:auto" onclick="removeGuardianLink(\''+student.id+'\',\''+p.id+'\')">Remove</button>'
+      +'</div></div>';
+  });
+  // Add an existing parent record, or a brand-new one.
+  const linkedIds=links.map(function(g){ return g.parentId; });
+  const candidates=parents.filter(function(p){ return p.id!==student.parentId && linkedIds.indexOf(p.id)===-1; })
+    .sort(function(a,b){ return a.name.localeCompare(b.name); });
+  html+='<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">'
+    +'<select style="flex:1;min-width:180px" onchange="setEditStudentField(\'guardianAddParentId\', this.value)">'
+      +'<option value="">Add an existing parent…</option>'
+      +candidates.map(function(p){ return '<option value="'+p.id+'"'+(f.guardianAddParentId===p.id?' selected':'')+'>'+p.name+' ('+p.email+')</option>'; }).join('')
+    +'</select>'
+    +'<button class="btn sm" onclick="addGuardianLink(\''+student.id+'\', state.editStudentForm.guardianAddParentId)">Add</button></div>'
+    +'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">'
+    +'<input type="text" placeholder="…or a new parent\'s name" style="flex:1;min-width:140px" value="'+(f.guardianNewName||'')+'" oninput="state.editStudentForm.guardianNewName=this.value"/>'
+    +'<input type="email" placeholder="their email" style="flex:1;min-width:160px" value="'+(f.guardianNewEmail||'')+'" oninput="state.editStudentForm.guardianNewEmail=this.value"/>'
+    +'<button class="btn sm" onclick="addNewGuardian(\''+student.id+'\')">Add new parent</button></div>';
+  return html+'</div>';
+}
+function addGuardianLink(studentId, parentId){
+  if(!parentId){ toast('Choose a parent to add.'); return; }
+  const student=findStudent(studentId);
+  if(parentId===student.parentId || studentGuardians.some(function(g){ return g.studentId===studentId && g.parentId===parentId; })) return;
+  studentGuardians.push({studentId:studentId, parentId:parentId, receivesEmails:true, canManage:true});
+  refreshParentStudentIds();
+  if(state.editStudentForm) state.editStudentForm.guardianAddParentId='';
+  dbWrite('linking another parent', function(){ return supabaseClient.from('student_guardians').insert({student_id:studentId, parent_id:parentId}); });
+  const p=parents.find(function(x){ return x.id===parentId; });
+  toast((p? p.name : 'Parent')+' linked to '+student.name+(p && !p.authUserId? ' — use "Invite login" to send them their own login.' : '.'), 6000);
+  render();
+}
+function addNewGuardian(studentId){
+  const f=state.editStudentForm;
+  const name=(f.guardianNewName||'').trim(), email=(f.guardianNewEmail||'').trim();
+  if(!name || !email){ toast('Enter the new parent\'s name and email.'); return; }
+  if(parents.some(function(p){ return p.email.toLowerCase()===email.toLowerCase(); })){ toast('A parent with that email already exists — pick them from "Add an existing parent" instead.', 6000); return; }
+  const p={id:newId()||('p'+(nextParentId++)), name:name, email:email, studentIds:[], authUserId:null};
+  parents.push(p);
+  studentGuardians.push({studentId:studentId, parentId:p.id, receivesEmails:true, canManage:true});
+  refreshParentStudentIds();
+  f.guardianNewName=''; f.guardianNewEmail='';
+  // Parent row first, then the link — the link's parent_id is a real foreign key.
+  dbWrite('adding another parent', function(){
+    return supabaseClient.from('parents').insert({id:p.id, name:p.name, email:p.email}).then(function(r){
+      if(r.error) return r;
+      return supabaseClient.from('student_guardians').insert({student_id:studentId, parent_id:p.id});
+    });
+  });
+  toast(name+' added as another parent of '+findStudent(studentId).name+' — use "Invite login" to send them their own login.', 6000);
+  render();
+}
+function setGuardianFlag(studentId, parentId, field, value){
+  const g=studentGuardians.find(function(x){ return x.studentId===studentId && x.parentId===parentId; });
+  if(!g) return;
+  g[field]=!!value;
+  const col = field==='receivesEmails'? 'receives_emails' : 'can_manage';
+  const upd={}; upd[col]=!!value;
+  dbWrite('updating another parent\'s settings', function(){ return supabaseClient.from('student_guardians').update(upd).eq('student_id', studentId).eq('parent_id', parentId); });
+  render();
+}
+function removeGuardianLink(studentId, parentId){
+  const p=parents.find(function(x){ return x.id===parentId; });
+  const student=findStudent(studentId);
+  if(!confirm('Remove '+(p? p.name : 'this parent')+' from '+student.name+'?\n\nThey\'ll no longer see '+student.name+' or get emails about them. Their own login and any other children stay as they are.')) return;
+  studentGuardians=studentGuardians.filter(function(g){ return !(g.studentId===studentId && g.parentId===parentId); });
+  refreshParentStudentIds();
+  dbWrite('removing another parent', function(){ return supabaseClient.from('student_guardians').delete().eq('student_id', studentId).eq('parent_id', parentId); });
+  render();
+}
+
 function renderEditStudentModal(){
   const f=state.editStudentForm;
   if(!f) return '';
@@ -8825,6 +9126,7 @@ function renderEditStudentModal(){
     }).join('')
     +'</select>';
   html+='<p class="small muted" style="margin-top:-6px">For their regular day/time schedule, use "Edit schedule" instead; for a frequency change or stopping, use "Stop / change plan" — both apply from a chosen date rather than right away.</p>';
+  html+=renderGuardiansSection(student, f);
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeEditStudentForm()">Cancel</button>'
@@ -8876,7 +9178,8 @@ function creditReportRowHtml(c){
   // make-up sessions") — offered for any available credit, not just manually-added ones, since a
   // parent might call in about ANY kind of make-up (a no-show credit, an excused absence, etc.)
   // and ask front desk to just book it for them rather than doing it themselves online.
-  const bookable = c.status==='available';
+  // A credit already part-used for +30 top-ups (Oct 2026) can only be topped up further, not booked whole.
+  const bookable = c.status==='available' && !creditPartlyUsed(c);
   // Re-book (Sept 2026, per Allie: give the Booked section its own "still pending" place with a way
   // to change the date/time) — only for a make-up that's booked but hasn't happened yet; one that's
   // already completed is history, not something to move.
@@ -8885,7 +9188,7 @@ function creditReportRowHtml(c){
   // completed) — those are tied to a real session and shouldn't be deleted out from under it
   // (Sept 2026, per Allie: "not the redeemed ones").
   const removable = !c.redeemedSessionId;
-  return '<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
+  return '<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+(c.status==='available'? ' <span class="small muted">'+creditMinutesLeft(c)+' min'+(creditPartlyUsed(c)? ' left' : '')+'</span>' : '')+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
     +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')+(rebookable? '<button class="btn sm ghost" onclick="rebookMakeUp(\''+c.id+'\')">Re-book</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
 }
 // Still actionable — available now, or expiring soon (both cases front desk might need to chase a
@@ -9811,6 +10114,7 @@ function renderParent(){
     const studentCredits=credits.filter(function(c){ return c.studentId===sid; })
       .sort(function(a,b){ return a.expiryDate-b.expiryDate; });
     const initials=student.name.split(' ').filter(Boolean).slice(0,2).map(function(w){ return w[0]; }).join('').toUpperCase();
+    const canManage=parentCanManage(sid); // false = view-only second parent (Oct 2026)
 
     html+='<div class="card parent-card">';
     // Holds are the one request type a parent can have more than one open at once (Sept 2026, per
@@ -9832,10 +10136,13 @@ function renderParent(){
       +'<div><h2>'+student.name+'</h2><div class="small muted">'+yearLabel(student.year)+' · '+student.sessionsPerWeek+'x/week · '+student.duration+'-min sessions</div>'
       +'<div class="small muted">Regular schedule: '+recurringSummary(student)+'</div></div>'
       +'<div style="margin-left:auto;display:flex;flex-direction:column;gap:4px;align-items:flex-end">'
-        +'<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>'
+        // View-only second parent (Oct 2026, see parentCanManage) — the database refuses their
+        // changes anyway; this just doesn't offer buttons that can't work.
+        +(!canManage? '<span class="small muted" style="text-align:right">View only — please contact the centre<br>to make changes for '+student.name+'.</span>'
+        : '<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>'
         +(openHoldCount>0? '<span class="small muted">'+openHoldCount+' hold request'+(openHoldCount===1?'':'s')+' pending</span>' : '')
         +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Change regular day/time</a>')
-        +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>')
+        +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>'))
       +'</div></div>';
 
     // -- This child's own waitlist entries (5.17, parent self-service Sept 2026) — a parent can see
@@ -9852,7 +10159,7 @@ function renderParent(){
         return '<div class="session-row"><div class="session-main"><b>'+w.weekday+' '+rangeLabel(w.start,w.duration)+'</b>'
           +(w.swapWeekday? '<div class="small muted">Swapping out: '+w.swapWeekday+' '+minToLabel(w.swapStart)+'</div>' : '')
           +(w.note? '<div class="small muted">'+w.note+'</div>' : '')+'</div>'+statusNote
-          +'<button class="btn sm ghost" onclick="parentRemoveWaitlistEntry(\''+w.id+'\')">Leave waitlist</button></div>';
+          +(canManage? '<button class="btn sm ghost" onclick="parentRemoveWaitlistEntry(\''+w.id+'\')">Leave waitlist</button>' : '')+'</div>';
       }).join('')+'</div>';
     }
 
@@ -9886,11 +10193,14 @@ function renderParent(){
         const noMakeUpToday = !s.termBreak && toKey(s.date)===toKey(simNow()) && sameDayMakeUpCutoffPassed();
         return '<div class="session-row">'
           +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
-          +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(s.online?'Online':(pod?pod.name:'—'))+' · '+(instr?instr.name:'Unassigned')+'</div>'
+          +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b>'+topUpBadgeHtml(s)+'<div class="small muted">'+(s.online?'Online':(pod?pod.name:'—'))+' · '+(instr?instr.name:'Unassigned')+'</div>'
             +(noMakeUpToday? '<div class="small" style="color:var(--danger)">Past 10am — cancelling now won\'t include a make-up credit</div>' : '')
+            // +30 top-up (Oct 2026): offered only when this child has make-up time that could cover it.
+            +(canManage && s.extraMin? '<div class="small"><a href="#" onclick="removeTopUp(\''+s.id+'\');return false;">Remove the extra 30 min</a></div>' : '')
           +'</div>'
           +typeBadge
-          +'<button class="btn sm ghost" onclick="'+(s.termBreak? 'parentCancelTermBreakSession' : 'parentCancelSession')+'(\''+s.id+'\')">Cancel</button>'
+          +(canManage && !s.termBreak && !s.extraMin && topUpCreditFor(s.studentId, s.date)? '<button class="btn sm" onclick="addTopUp(\''+s.id+'\')" title="Add 30 minutes to the end of this session, using make-up time">+30 min</button>' : '')
+          +(canManage? '<button class="btn sm ghost" onclick="'+(s.termBreak? 'parentCancelTermBreakSession' : 'parentCancelSession')+'(\''+s.id+'\')">Cancel</button>' : '')
         +'</div>';
       }).join('')+'</div>';
     }
@@ -9904,7 +10214,7 @@ function renderParent(){
       if(availableCount>0){
         html+='<div class="makeup-summary"><div><div class="makeup-count">'+availableCount+'</div><div class="makeup-count-label">available</div></div>'
           +(soonest? '<div><div class="small muted">Next expiry</div><b>'+fmtShort(soonest.expiryDate)+'</b><div class="small muted">'+daysUntil(simNow(),soonest.expiryDate)+' days remaining</div></div>' : '')
-          +(soonest? '<button class="btn primary" style="margin-left:auto" onclick="startBookMakeUp(\''+soonest.id+'\')">Book a make-up</button>' : '')
+          +(soonest && canManage? '<button class="btn primary" style="margin-left:auto" onclick="startBookMakeUp(\''+soonest.id+'\')">Book a make-up</button>' : '')
         +'</div>';
       }
       studentCredits.forEach(function(c){ html+=renderParentCredit(c, student); });
@@ -9924,8 +10234,9 @@ function renderParent(){
         const statusBadge = r.status==='open' ? '<span class="badge soon">Pending</span>'
           : r.status==='approved' ? '<span class="badge available">Approved</span>'
           : '<span class="badge full">Denied</span>';
+        const by=requestedByLabel(r);
         return '<div class="session-row"><div class="session-main"><b>'+fmtShort(r.start)+'–'+fmtShort(r.end)+'</b>'
-          +(r.note? '<div class="small muted">'+r.note+'</div>' : '')+'</div>'+statusBadge+'</div>';
+          +(r.note || by? '<div class="small muted">'+[r.note, by].filter(Boolean).join(' · ')+'</div>' : '')+'</div>'+statusBadge+'</div>';
       }).join('')+'</div>';
     }
     html+='</div>';
@@ -9969,8 +10280,9 @@ function renderParentSummerTab(parent){
     html+='<div class="makeup-summary"><div><div class="makeup-count">'+remaining+'</div><div class="makeup-count-label">available</div></div>'
       +'<div><div class="small muted">Used so far</div><b>'+used+' of '+total+'</b></div>'
       +'<div style="margin-left:auto;display:flex;gap:8px">'
-        +'<button class="btn sm'+(remaining<=0?' ghost':' primary')+'" '+(remaining<=0?'disabled':'')+' onclick="openTermBreakBookingForm(\''+sid+'\')">Book a single session</button>'
-        +'<button class="btn sm ghost" '+((remaining<=0||atRecurringCap)?'disabled':'')+' onclick="openTermBreakRecurringForm(\''+sid+'\')">+ Add a recurring time</button>'
+        +(!parentCanManage(sid)? '<span class="small muted">View only — contact the centre to book</span>'
+        : '<button class="btn sm'+(remaining<=0?' ghost':' primary')+'" '+(remaining<=0?'disabled':'')+' onclick="openTermBreakBookingForm(\''+sid+'\')">Book a single session</button>'
+        +'<button class="btn sm ghost" '+((remaining<=0||atRecurringCap)?'disabled':'')+' onclick="openTermBreakRecurringForm(\''+sid+'\')">+ Add a recurring time</button>')
       +'</div></div>';
     if(remaining<=0){ html+='<p class="small muted">No summer session credits left for '+student.name+' this period.</p>'; }
 
@@ -9991,7 +10303,7 @@ function renderParentSummerTab(parent){
         return '<div class="session-row">'
           +'<div class="session-date-chip"><div class="sd-day">'+s.date.toLocaleDateString('en-AU',{weekday:'short'})+'</div><div class="sd-num">'+s.date.getDate()+'</div></div>'
           +'<div class="session-main"><b>'+rangeLabel(s.start,s.duration)+'</b><div class="small muted">'+(pod?pod.name:'—')+' · '+(instr?instr.name:'Unassigned')+(s.recurring?' · recurring':'')+'</div></div>'
-          +'<button class="btn sm ghost" onclick="parentCancelTermBreakSession(\''+s.id+'\')">Cancel</button>'
+          +(parentCanManage(s.studentId)? '<button class="btn sm ghost" onclick="parentCancelTermBreakSession(\''+s.id+'\')">Cancel</button>' : '')
         +'</div>';
       }).join('')+'</div>';
     }
@@ -10235,11 +10547,18 @@ function renderParentCredit(c, student){
   const now=simNow();
   let html='<div class="credit-card st-'+st+'">';
   if(st==='available' || st==='soon'){
-    html+='<div class="row"><div><b>Make-up credit available</b><div class="small muted">From missed session on '+fmtShort(c.issuedDate)+'</div></div>'
+    // Minutes (Oct 2026, +30 top-ups): what this credit is worth and what's left of it.
+    const left=creditMinutesLeft(c), total=creditTotalMinutes(c);
+    html+='<div class="row"><div><b>Make-up credit available — '+(creditPartlyUsed(c)? left+' of '+total+' min left' : total+' min')+'</b><div class="small muted">From missed session on '+fmtShort(c.issuedDate)+'</div></div>'
       + (st==='soon'? '<span class="badge soon">Expires '+fmtShort(c.expiryDate)+'</span>' : '<span class="badge available">Expires '+fmtShort(c.expiryDate)+'</span>') +'</div>';
     if(st==='soon') html+='<div class="banner warn">⏰ Only '+daysUntil(now,c.expiryDate)+' day(s) left to use this credit before it expires.</div>';
-    if(state.parentBookingCreditId===c.id){ html+=renderSlotPicker(c); }
-    else html+='<button class="btn primary sm" onclick="startBookMakeUp(\''+c.id+'\')">Book a make-up</button>';
+    if(creditPartlyUsed(c)){
+      html+='<div class="small muted" style="margin:4px 0">'+(total-left)+' min already used as extra time on sessions. Use the rest 30 minutes at a time with the "+30 min" button on an upcoming session.</div>';
+    } else if(state.parentBookingCreditId===c.id){ html+=renderSlotPicker(c); }
+    else if(parentCanManage(student.id)){
+      html+='<button class="btn primary sm" onclick="startBookMakeUp(\''+c.id+'\')">Book a make-up</button>'
+        +'<div class="small muted" style="margin-top:4px">Or add it 30 minutes at a time onto upcoming sessions with "+30 min".</div>';
+    }
   } else if(st==='booked'){
     const sess=findSession(c.redeemedSessionId);
     // Sept 2026, root cause of "Signed in, but loading your data failed: undefined is not an object
@@ -10462,7 +10781,7 @@ var DATA_GROUP_TABLES={
   instructors:['instructors','instructor_avail_rules','instructor_one_offs'],
   pods:['pods','pod_shift_blocks','pod_shift_assignments','pod_shift_one_off_coverage'],
   podDayOverrides:['pod_day_overrides'],
-  students:['students','student_recurring_slots','student_holds','student_pod_assignments','student_plan_changes','student_plan_change_recurring'],
+  students:['students','student_recurring_slots','student_holds','student_pod_assignments','student_plan_changes','student_plan_change_recurring','student_guardians'],
   parents:['parents'],
   sessions:['sessions'],
   credits:['credits'],
@@ -10706,9 +11025,11 @@ function fetchStudentsGroup(){
     fetchTablePaginated('student_pod_assignments','id,student_id,pod_id,effective_from,weekday,online,instructor_id'),
     fetchTablePaginated('student_plan_changes','id,student_id,effective_from,stopped,sessions_per_week'),
     fetchTablePaginated('student_plan_change_recurring','plan_change_id,weekday,start_min'),
+    fetchTablePaginated('student_guardians','student_id,parent_id,receives_emails,can_manage'),
   ]).then(function(t){
     if(!isLatestGroupSeq('students', mySeq)) return; // a newer students refresh was dispatched after this one — this response is now stale, discard it rather than clobber fresher state (task #246)
-    const [studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows]=t;
+    const [studentRows,slotRows,holdRows,podAssignRows,planChangeRows,planChangeRecurRows,guardianRows]=t;
+    studentGuardians=guardianRows.map(function(g){ return {studentId:g.student_id, parentId:g.parent_id, receivesEmails:g.receives_emails!==false, canManage:g.can_manage!==false}; });
     students=studentRows.map(function(r){ return {
       id:r.id, parentId:r.parent_id, name:r.name, year:r.year, baseYear:r.base_year, yearBaseline:r.year_baseline,
       duration:r.duration, sessionsPerWeek:r.sessions_per_week, startDate: r.start_date? new Date(r.start_date) : null,
@@ -10735,9 +11056,7 @@ function fetchStudentsGroup(){
     // which groups were actually requested — no extra network call, since `parents` itself is
     // already in memory; this just re-derives one field on it from the students array just fetched.
     if(typeof parents!=='undefined' && parents && parents.length){
-      parents.forEach(function(p){
-        p.studentIds = students.filter(function(s){ return s.parentId===p.id; }).map(function(s){ return s.id; });
-      });
+      parents.forEach(function(p){ p.studentIds = parentStudentIdsFor(p.id); });
     }
   });
 }
@@ -10748,20 +11067,21 @@ function fetchParentsGroup(){
   return fetchTablePaginated('parents','id,name,email,auth_user_id').then(function(parentRows){
     parents=parentRows.map(function(r){ return {
       id:r.id, name:r.name, email:r.email, authUserId:r.auth_user_id,
-      studentIds: students.filter(function(s){ return s.parentId===r.id; }).map(function(s){ return s.id; }),
+      studentIds: parentStudentIdsFor(r.id),
     }; });
   });
 }
 
 function fetchSessionsGroup(){
   const mySeq=nextGroupSeq('sessions');
-  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break,created_at').then(function(sessionRows){
+  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break,created_at,extra_min,extra_credit_id').then(function(sessionRows){
     if(!isLatestGroupSeq('sessions', mySeq)) return; // a newer sessions refresh was dispatched after this one — this response is now stale, discard it rather than clobber fresher state (task #246)
     sessions=sessionRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
       actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false,
       bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false, termBreak:r.term_break||false,
+      extraMin:r.extra_min||0, extraCreditId:r.extra_credit_id||null, // +30 top-ups (Oct 2026)
       // Task #253: schedule regenerations (saveRecurringForm, before task #87's fix) can leave several
       // rows on file for the same student+date — createdAt lets holdMonthlyBreakdown() trust only the
       // most recently written row per date instead of every stale duplicate.
@@ -10868,10 +11188,11 @@ function mathqDebugAvailability(weekdayInput, timeLabel, duration){
 }
 
 function fetchCreditsGroup(){
-  return fetchTablePaginated('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note').then(function(creditRows){
+  return fetchTablePaginated('credits','id,student_id,issued_date,expiry_date,status,redeemed_session_id,warning_sent,source,note,minutes,minutes_used').then(function(creditRows){
     credits=creditRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, issuedDate:new Date(r.issued_date), expiryDate:new Date(r.expiry_date),
       status:r.status, redeemedSessionId:r.redeemed_session_id, warningSent:r.warning_sent, source:r.source, note:r.note||'',
+      minutes:r.minutes||null, minutesUsed:r.minutes_used||0, // +30 top-ups (Oct 2026)
     }; });
   });
 }
@@ -10927,7 +11248,7 @@ function fetchTermBreaksGroup(){
 
 function fetchEnrollmentRequestsGroup(){
   return Promise.all([
-    fetchTablePaginated('enrollment_requests','id,student_id,type,start_date,end_date,effective_from,note,status,created_at'),
+    fetchTablePaginated('enrollment_requests','id,student_id,type,start_date,end_date,effective_from,note,status,created_at,requested_by_parent_id'),
     fetchTablePaginated('enrollment_request_recurring','id,request_id,weekday,start_min'),
     fetchTablePaginated('enrollment_request_previous_recurring','id,request_id,weekday,start_min'),
   ]).then(function(t){
@@ -10942,6 +11263,7 @@ function fetchEnrollmentRequestsGroup(){
       previousRecurring: enrollRequestPrevRecurRows.filter(function(rr){ return rr.request_id===r.id; })
         .map(function(rr){ return {weekday:rr.weekday, start:rr.start_min}; }),
       note:r.note||'', status:r.status, createdAt:new Date(r.created_at),
+      requestedBy: r.requested_by_parent_id||null,
     }; });
   });
 }
