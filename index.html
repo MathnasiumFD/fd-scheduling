@@ -178,6 +178,8 @@
   .row2{ display:flex; gap:10px; }
   .row2 > div{ flex:1; }
 
+  /* Oct 2026: whole-page re-renders confuse the browser's scroll anchoring (it can jump halfway down) — render() restores the scroll position itself instead. */
+  html, body{ overflow-anchor:none; }
   .toast{ position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:var(--text); color:var(--bg); padding:10px 18px; border-radius:999px; font-size:.8rem; box-shadow:var(--shadow); z-index:60; max-width:80vw; text-align:center; }
 
   .slot-opt{ border:1px solid var(--border); border-radius:8px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; font-size:.8rem; }
@@ -378,7 +380,8 @@ function minToLabel(min){
   let h12 = h%12; if(h12===0) h12=12;
   return h12+(m? ':'+String(m).padStart(2,'0') : '')+period;
 }
-function rangeLabel(start,duration){ return minToLabel(start)+'–'+minToLabel(start+duration); }
+// End capped at closing (Oct 2026, per Allie: "if a child is scheduled to finish after 7, it should still only ever say 7pm").
+function rangeLabel(start,duration){ return minToLabel(start)+'–'+minToLabel(Math.min(start+duration, CENTER_CLOSE)); }
 // A Pod shift block's own range label — same as rangeLabel(), but a block flagged closesLate
 // (Sept 2026, per Allie: "add an extra time after 7pm called Close", extended from front-desk staff
 // shifts to Pod shift blocks too) always shows "Close" instead of its numeric end time. closesLate
@@ -1572,8 +1575,24 @@ var CHECKIN_TIME_OPTIONS=EXIT_TIME_OPTIONS;
 // working, especially when there's accidents etc." — a genuinely late arrival (traffic, a mix-up, an
 // actual accident on the way in) still deserves their full session length from whenever they actually
 // showed up, not a default quietly shortened by however far past 15 minutes they were running.
+// Capped at closing time (Oct 2026, per Allie: "when a student comes in late and its the end of day,
+// the picker will say 7:05 which is wrong because we're closed, and then it ticks to 3pm") — a late
+// arrival's full-length session can run past CENTER_CLOSE, which isn't a real option in the exit
+// picker (EXIT_TIME_OPTIONS stops at close), so the dropdown showed a non-existent 7:05 and then
+// snapped to its first option, 3pm. uncappedExitTime() keeps the raw figure for the check-in note.
+function uncappedExitTime(sess, offset){ return sess.start+offset+sess.duration; }
+// Exit-time <option>s. Per Allie, a finish time past closing only ever shows as 7pm ("if a child is
+// scheduled to finish after 7, it should still only ever say 7pm") — so a saved value after close
+// selects 7pm; any other off-step value is still listed and selected, rather than the browser
+// silently showing the first option (3pm) as if that were the saved time.
+function exitOptionsHtml(selected){
+  if(selected!=null && selected>CENTER_CLOSE) selected=CENTER_CLOSE;
+  const opts=EXIT_TIME_OPTIONS.slice();
+  if(selected!=null && opts.indexOf(selected)===-1){ opts.push(selected); opts.sort(function(a,b){ return a-b; }); }
+  return opts.map(function(t){ return '<option value="'+t+'"'+(t===selected?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('');
+}
 function autoExitTime(sess, offset){
-  return sess.start+offset+sess.duration;
+  return Math.min(CENTER_CLOSE, uncappedExitTime(sess, offset));
 }
 
 // Picks whichever value in a preset list (e.g. CHECKIN_TIME_OPTIONS, EXIT_TIME_OPTIONS) sits closest
@@ -6156,7 +6175,19 @@ function render(){
       }
     }
   }
+  // Keep the reader exactly where they were (Oct 2026, per Allie: "it keeps scrolling me halfway
+  // down"). render() replaces the whole page — after most clicks, and on the 30s background refresh
+  // — and the browser's scroll anchoring then latches onto whatever element it can find in the new
+  // page, which can land anywhere. Remember the page's own scroll position and an open pop-up's
+  // (.overlay scrolls independently) and put both back afterwards. Scroll anchoring is also switched
+  // off in the CSS (overflow-anchor:none) so it can't fight this.
+  const pageY=window.pageYOffset||document.documentElement.scrollTop||0;
+  const prevOverlay=app.querySelector('.overlay');
+  const overlayY=prevOverlay? prevOverlay.scrollTop : 0;
   app.innerHTML = renderTop() + renderTabs() + renderRole() + (state.toast? '<div class="toast">'+state.toast+'</div>':'') + renderFooter();
+  if(Math.abs((window.pageYOffset||document.documentElement.scrollTop||0)-pageY)>1) window.scrollTo(0, pageY);
+  const newOverlay=app.querySelector('.overlay');
+  if(newOverlay && prevOverlay && overlayY) newOverlay.scrollTop=overlayY;
   if(restore){
     const scope = restore.inModal ? app.querySelector('.modal') : app;
     const el = scope && scope.querySelectorAll('input, textarea')[restore.idx];
@@ -7763,7 +7794,7 @@ function renderCheckedInPanel(){
           +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===s.actualStart?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
         +'</select></td>'
         +'<td><select onchange="setExitTime(\''+s.id+'\',this.value)">'
-          +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===s.actualEnd?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+          +exitOptionsHtml(s.actualEnd)
         +'</select>'
         +(adjusted? ' <span class="small muted">(usually '+minToLabel(defaultEnd)+')</span>' : '')
         +'</td><td><span class="badge '+cd.cls+'">'+cd.label+'</span></td>'
@@ -8015,12 +8046,18 @@ function renderCheckInModal(){
     +checkInArrivalOptions(sess).map(function(t){ return '<option value="'+t+'"'+(t===arrival?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
     +'</select>';
   html+='<label>Exit time</label><select onchange="setCheckInExit(this.value)">'
-    +EXIT_TIME_OPTIONS.map(function(t){ return '<option value="'+t+'"'+(t===exitTime?' selected':'')+'>'+minToLabel(t)+'</option>'; }).join('')
+    +exitOptionsHtml(exitTime)
     +'</select>';
   if(adjusted){
     html+='<div class="banner accent">Exit time adjusted — auto-filled would\'ve been '+minToLabel(autoEnd)+'.</div>';
   } else {
     html+='<div class="banner info">Session will run '+minToLabel(arrival)+'–'+minToLabel(exitTime)+'.</div>';
+  }
+  // Late arrival whose full session would run past close (Oct 2026) — say so, rather than silently
+  // giving them a shorter session.
+  const fullEnd=uncappedExitTime(sess, offset);
+  if(fullEnd>CENTER_CLOSE){
+    html+='<div class="banner warn">Arrived late — a full session would run to '+minToLabel(fullEnd)+', past closing, so their finish time is set to '+minToLabel(CENTER_CLOSE)+' ('+(fullEnd-CENTER_CLOSE)+' min short).</div>';
   }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeCheckIn()">Cancel</button>'
@@ -11136,7 +11173,7 @@ function fetchSessionsGroup(){
     sessions=sessionRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
-      actualStart:r.actual_start_min, actualEnd:r.actual_end_min, checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false,
+      actualStart:r.actual_start_min, actualEnd: r.actual_end_min==null? null : Math.min(r.actual_end_min, CENTER_CLOSE), checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false, // finish never shown past close (Oct 2026)
       bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false, termBreak:r.term_break||false,
       extraMin:r.extra_min||0, extraCreditId:r.extra_credit_id||null, // +30 top-ups (Oct 2026)
       // Task #253: schedule regenerations (saveRecurringForm, before task #87's fix) can leave several
