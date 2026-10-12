@@ -3430,14 +3430,15 @@ function totalTopUpMinutesLeft(studentId){
 }
 // Why +30 can't be added to this session right now (null = it can). Parents get the same strict
 // checks the booking calendar uses; front desk can still overbook a Pod on the day, as elsewhere.
-function topUpBlockedReason(sess, byParent){
+// `credit` (optional): use that specific credit (the credits list's +30 button) instead of picking one.
+function topUpBlockedReason(sess, byParent, credit){
   const student=findStudent(sess.studentId);
   const name=student? student.name : 'They';
   if(sess.status!=='scheduled') return 'Only an upcoming booked session can be extended.';
   const dk=toKey(sess.date), todayKey=toKey(simNow());
   if(dk<todayKey) return 'That session has already happened.';
   if(sess.extraMin>0) return 'This session already has an extra 30 minutes.';
-  if(!topUpCreditFor(sess.studentId, sess.date)) return name+' doesn\'t have 30 minutes of make-up time available for that date.';
+  if(credit? !creditUsableForTopUp(credit, sess.date) : !topUpCreditFor(sess.studentId, sess.date)) return credit && toKey(credit.expiryDate)<dk? 'That credit expires before this session.' : name+' doesn\'t have 30 minutes of make-up time available for that date.';
   const end=sess.start+sess.duration;
   if(end+TOPUP_MIN>CENTER_CLOSE) return 'The centre closes before an extra 30 minutes would finish.';
   if(byParent && dk===todayKey && sameDayMakeUpCutoffPassed()) return 'Same-day changes close at 10:00am — please call the centre.';
@@ -3456,14 +3457,15 @@ function applyTopUpLocally(sess, credit){
   credit.minutesUsed=(credit.minutesUsed||0)+TOPUP_MIN;
   if(creditMinutesLeft(credit)<=0) credit.status='redeemed';
 }
-function addTopUp(sessionId){
+function addTopUp(sessionId, creditId){
   const sess=findSession(sessionId);
   if(!sess) return;
   const byParent = currentUser? currentUser.role==='parent' : state.role==='parent';
-  const reason=topUpBlockedReason(sess, byParent);
+  const chosen=creditId? findCredit(creditId) : null;
+  const reason=topUpBlockedReason(sess, byParent, chosen);
   if(reason){ toast(reason, 7000); return; }
   const student=findStudent(sess.studentId);
-  const credit=topUpCreditFor(sess.studentId, sess.date);
+  const credit=chosen || topUpCreditFor(sess.studentId, sess.date);
   const leftAfter=creditMinutesLeft(credit)-TOPUP_MIN;
   const oldEnd=sess.start+sess.duration, newEnd=oldEnd+TOPUP_MIN;
   if(!confirm('Add 30 extra minutes to '+student.name+'\'s session on '+fmtShort(sess.date)+'?\n\n'
@@ -3471,6 +3473,7 @@ function addTopUp(sessionId){
     +'The session will finish at '+minToLabel(newEnd)+' instead of '+minToLabel(oldEnd)+'.')) return;
   const done=function(){
     applyTopUpLocally(sess, credit);
+    state.topUpPicker=null;
     toast('Added 30 minutes — '+student.name+' now finishes at '+minToLabel(newEnd)+' on '+fmtShort(sess.date)+'. '+leftAfter+' min of make-up time left on that credit.', 7000);
     render();
   };
@@ -9333,7 +9336,12 @@ function creditReportRowHtml(c){
   // (Sept 2026, per Allie: "not the redeemed ones").
   const removable = !c.redeemedSessionId;
   return '<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+(c.status==='available'? ' <span class="small muted">'+creditMinutesLeft(c)+' min'+(creditPartlyUsed(c)? ' left' : '')+'</span>' : '')+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
-    +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')+(rebookable? '<button class="btn sm ghost" onclick="rebookMakeUp(\''+c.id+'\')">Re-book</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
+    +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')
+    +(c.status==='available' && creditMinutesLeft(c)>=TOPUP_MIN? '<button class="btn sm ghost" onclick="openTopUpPicker(\''+c.id+'\')" title="Use 30 minutes of this credit to extend one of their booked sessions">+30 min</button> ' : '')
+    // A booked make-up session can itself be extended from another of the child's credits.
+    +(rebookable? (function(){ const s=findSession(c.redeemedSessionId); if(!s || s.status!=='scheduled') return '';
+        if(s.extraMin) return '<button class="btn sm ghost" onclick="removeTopUp(\''+s.id+'\')" title="Take the extra 30 minutes off and return them to the make-up credit">− 30 min</button> ';
+        return topUpCreditFor(s.studentId, s.date)? '<button class="btn sm ghost" onclick="addTopUp(\''+s.id+'\')" title="Add 30 minutes to the end of this make-up session, using another of their make-up credits">+30 min</button> ' : ''; })() : '')+(rebookable? '<button class="btn sm ghost" onclick="rebookMakeUp(\''+c.id+'\')">Re-book</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
 }
 // Still actionable — available now, or expiring soon (both cases front desk might need to chase a
 // family to actually use before it lapses). Everything else (already booked into a make-up session,
@@ -9379,6 +9387,38 @@ function renderCreditsReport(){
   }
   html+='</div>';
   html+=renderAddCreditModal();
+  html+=renderTopUpPickerModal();
+  return html;
+}
+// +30 min from the credits list (Oct 2026, per Allie: "I also need a +30 min next to booked
+// sessions" — "can't find it under booked credits"): pick which of the child's booked sessions
+// gets the extra 30 minutes, taken from THIS credit.
+function openTopUpPicker(creditId){ state.topUpPicker={creditId:creditId}; render(); }
+function closeTopUpPicker(){ state.topUpPicker=null; render(); }
+function renderTopUpPickerModal(){
+  if(!state.topUpPicker) return '';
+  const c=findCredit(state.topUpPicker.creditId);
+  if(!c) return '';
+  const student=findStudent(c.studentId);
+  const todayKey=toKey(simNow()), expKey=toKey(c.expiryDate);
+  const upcoming=sessions.filter(function(s){ return s.studentId===c.studentId && s.status==='scheduled' && !s.termBreak && toKey(s.date)>=todayKey && toKey(s.date)<=expKey; })
+    .sort(function(a,b){ return (a.date-b.date) || (a.start-b.start); }).slice(0,20);
+  let html='<div class="overlay" onclick="if(event.target===this) closeTopUpPicker()"><div class="modal">';
+  html+='<h3>+30 min for '+student.name+'</h3>';
+  html+='<p>Pick a booked session to finish 30 minutes later. This uses 30 minutes of this make-up credit ('+creditMinutesLeft(c)+' min left, expires '+fmtShort(c.expiryDate)+').</p>';
+  if(!upcoming.length){ html+='<div class="empty-note">'+student.name+' has no booked sessions before this credit expires.</div>'; }
+  else{
+    html+='<table><tr><th>Date</th><th>Time</th><th></th></tr>';
+    upcoming.forEach(function(s){
+      const reason=topUpBlockedReason(s, false, c);
+      html+='<tr><td>'+fmtShort(s.date)+'</td><td>'+rangeLabel(s.start,s.duration)+topUpBadgeHtml(s)+'</td><td>'
+        +(reason? '<span class="small muted">'+reason+'</span>' : '<button class="btn sm primary" onclick="addTopUp(\''+s.id+'\',\''+c.id+'\')">+30 min → '+minToLabel(s.start+s.duration+TOPUP_MIN)+'</button>')
+        +'</td></tr>';
+    });
+    html+='</table>';
+  }
+  html+='<div style="display:flex;justify-content:flex-end;margin-top:12px"><button class="btn ghost" onclick="closeTopUpPicker()">Close</button></div>';
+  html+='</div></div>';
   return html;
 }
 // Booked credits — a make-up session is on the calendar but hasn't happened yet. The one settled
