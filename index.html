@@ -3091,7 +3091,11 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
       const plan=studentPlanOn(student.id, date); // respects any scheduled stop/frequency change
       const slot=(plan.recurring||[]).find(function(r){ return r.weekday===weekday; });
       if(!slot) return; // this weekday isn't part of whichever plan governs this date
-      const dup=sessions.find(function(s){ return s.studentId===student.id && toKey(s.date)===dateKey && s.start===slot.start && s.status!=='cancelled'; });
+      // A session cancelled for just that day (by the parent, or front desk's Cancel) still counts
+      // as this occurrence — otherwise it was booked straight back in (Oct 2026, per Allie: "some
+      // kids cancelled their session earlier today, but they re-appeared"). Other cancels (Pod
+      // move, schedule edit, plan change) are meant to be re-booked, so they don't count.
+      const dup=sessions.find(function(s){ return s.studentId===student.id && toKey(s.date)===dateKey && s.start===slot.start && (s.status!=='cancelled' || s.parentCancelled || s.oneOffCancel); });
       if(dup){
         // Already exists — normally nothing to do. The one exception: a previously-unassigned
         // occurrence (see below) is always worth trying again, since regenerateAllRecurring() runs
@@ -3673,7 +3677,8 @@ function markStatus(sessionId, status){
   const sess=findSession(sessionId);
   if(status==='cancelled' || status==='excused' || status==='no-show') returnTopUpLocally(sess); // +30 minutes back on the credit (Oct 2026)
   sess.status=status;
-  dbWrite('updating attendance', function(){ return supabaseClient.from('sessions').update({status}).eq('id', sess.id); });
+  if(status==='cancelled') sess.oneOffCancel=true; // keeps auto-booking from re-booking it (Oct 2026)
+  dbWrite('updating attendance', function(){ return supabaseClient.from('sessions').update(status==='cancelled'? {status, one_off_cancel:true} : {status}).eq('id', sess.id); });
   if(status==='excused'){
     const issued=sess.date;
     const expiry=addMonths(issued,3);
@@ -4078,8 +4083,8 @@ function restoreSession(sessionId){
   if(!confirm('Restore '+student.name+'\'s session on '+fmtShort(sess.date)+' at '+minToLabel(sess.start)+'?'
     +(unused? '\n\nThe make-up credit issued for it will be removed.' : ''))) return;
   sess.status='scheduled';
-  sess.parentCancelled=false;
-  dbWrite('restoring a session', function(){ return supabaseClient.from('sessions').update({status:'scheduled', parent_cancelled:false}).eq('id', sess.id); });
+  sess.parentCancelled=false; sess.oneOffCancel=false;
+  dbWrite('restoring a session', function(){ return supabaseClient.from('sessions').update({status:'scheduled', parent_cancelled:false, one_off_cancel:false}).eq('id', sess.id); });
   if(ownCredit && ownCredit.status==='available'){
     ownCredit.status='redeemed'; ownCredit.redeemedSessionId=sess.id;
     dbWrite('re-using the make-up credit for a restored session', function(){ return supabaseClient.from('credits').update({status:'redeemed', redeemed_session_id:sess.id}).eq('id', ownCredit.id); });
@@ -11289,7 +11294,7 @@ function fetchParentsGroup(){
 
 function fetchSessionsGroup(){
   const mySeq=nextGroupSeq('sessions');
-  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break,created_at,extra_min,extra_credit_id,parent_cancelled').then(function(sessionRows){
+  return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break,created_at,extra_min,extra_credit_id,parent_cancelled,one_off_cancel').then(function(sessionRows){
     if(!isLatestGroupSeq('sessions', mySeq)) return; // a newer sessions refresh was dispatched after this one — this response is now stale, discard it rather than clobber fresher state (task #246)
     sessions=sessionRows.map(function(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
@@ -11298,6 +11303,7 @@ function fetchSessionsGroup(){
       bookedBy:r.booked_by, recurring:r.is_recurring, creditId:r.credit_id, online:r.online||false, termBreak:r.term_break||false,
       extraMin:r.extra_min||0, extraCreditId:r.extra_credit_id||null, // +30 top-ups (Oct 2026)
       parentCancelled:!!r.parent_cancelled, // the parent cancelled it themselves (Oct 2026)
+      oneOffCancel:!!r.one_off_cancel, // front desk cancelled just that day — not to be re-booked (Oct 2026)
       // Task #253: schedule regenerations (saveRecurringForm, before task #87's fix) can leave several
       // rows on file for the same student+date — createdAt lets holdMonthlyBreakdown() trust only the
       // most recently written row per date instead of every stale duplicate.
