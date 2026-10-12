@@ -250,6 +250,27 @@ var AUTH_REDIRECT_TYPE = (function(){
   return m? m[1] : null;
 })();
 
+// Scanner-proof invite / reset links (Oct 2026). Work email systems (Microsoft "Safe Links" etc.)
+// open every link in an email to check it — and an invite/reset link only works ONCE, so the
+// scanner used it up and the parent then got "invalid or has expired" and a plain sign-in screen
+// (auth logs, 2026-10-12: a Microsoft server opened a parent's reset link 23 seconds before she
+// did). The Invite and Reset-password email templates now link to the app with
+// ?token_hash=...&type=invite|recovery instead of a one-click sign-in link; opening the page doesn't
+// use the link up — it's only spent when the person actually submits their new password
+// (setNewPassword -> verifyOtp), which a scanner never does. EMAIL_LINK keeps that token.
+var EMAIL_LINK = (function(){
+  if(typeof window==='undefined' || !window.location) return null;
+  const q=new URLSearchParams(window.location.search||'');
+  const th=q.get('token_hash'), t=q.get('type');
+  return (th && (t==='invite' || t==='recovery'))? {tokenHash:th, type:t} : null;
+})();
+// A link that was already used/expired comes back with #error_code=otp_expired (old-style links).
+var AUTH_LINK_ERROR = (function(){
+  if(typeof window==='undefined' || !window.location || !window.location.hash) return null;
+  const m=window.location.hash.match(/[#&]error_code=([\w-]+)/);
+  return m? m[1] : null;
+})();
+
 var SUPABASE_URL = 'https://irtydpjjrscmtctoeffc.supabase.co';
 var SUPABASE_ANON_KEY = 'sb_publishable_rcmZZ2KIplqWI1nGeuLlMg_tusxf0KG';
 var supabaseClient = (typeof window !== 'undefined' && window.supabase)
@@ -10844,7 +10865,7 @@ function showSetPasswordScreen(errorMsg){
     +'<div class="brand-logo"><img src="'+MATHNASIUM_LOGO+'" alt="Mathnasium"/></div>'
     +'<h2>Set your password</h2>'
     +(errorMsg? '<div class="banner danger">'+errorMsg+'</div>' : '')
-    +'<div class="banner accent" id="usernameBanner"><b>Your username is your email address'+(setPasswordEmail? ':' : '.')+'</b>'
+    +'<div class="banner accent" id="usernameBanner"><b>Your username is your email address'+(setPasswordEmail? ':' : (EMAIL_LINK? ' — the one this link was emailed to.' : '.'))+'</b>'
       +(setPasswordEmail? '<div style="font-size:1.05rem;font-weight:700;margin-top:4px;word-break:break-all">'+setPasswordEmail+'</div>' : '')
       +'<div class="small" style="margin-top:4px">Choose a password below. From now on you\'ll sign in with this email address and that password.</div></div>'
     +'<label>Username (your email)</label><input id="setPwEmail" type="email" autocomplete="username" readonly value="'+setPasswordEmail+'" style="background:var(--surface-2)"/>'
@@ -10852,7 +10873,9 @@ function showSetPasswordScreen(errorMsg){
     +'<label>Confirm password</label><input id="newPassword2" type="password" autocomplete="new-password" />'
     +'<button class="btn" onclick="setNewPassword()">Set password</button>'
     +'</div></div>';
-  if(!setPasswordEmail && supabaseClient){
+  // (Not for a scanner-proof link: nobody's signed in by it yet, and any session in this browser
+  // could be someone else's.)
+  if(!setPasswordEmail && supabaseClient && !EMAIL_LINK){
     supabaseClient.auth.getUser().then(function(r){
       const email=r && r.data && r.data.user && r.data.user.email;
       if(email){ setPasswordEmail=email; showSetPasswordScreen(errorMsg); }
@@ -10864,7 +10887,26 @@ function setNewPassword(){
   const p2=document.getElementById('newPassword2').value||'';
   if(p1.length<6){ showSetPasswordScreen('Password must be at least 6 characters.'); return; }
   if(p1!==p2){ showSetPasswordScreen('Passwords don\'t match.'); return; }
-  supabaseClient.auth.updateUser({password:p1}).then(function(res){
+  // Scanner-proof link: only now is the link actually used (signs them in), then the password is set.
+  const verify = EMAIL_LINK
+    ? supabaseClient.auth.verifyOtp({token_hash:EMAIL_LINK.tokenHash, type:EMAIL_LINK.type}).then(function(v){
+        if(v.error) return {linkError:v.error};
+        EMAIL_LINK=null;
+        try{ history.replaceState(null,'',window.location.pathname); }catch(e){}
+        const u=v.data && v.data.user; if(u && u.email) setPasswordEmail=u.email;
+        return {};
+      })
+    : Promise.resolve({});
+  verify.then(function(v){
+    if(v.linkError){
+      EMAIL_LINK=null;
+      try{ history.replaceState(null,'',window.location.pathname); }catch(e){}
+      showForgotPasswordScreen('That link has expired or was already used. Enter your email below and we\'ll send you a fresh one.', true);
+      return null;
+    }
+    return supabaseClient.auth.updateUser({password:p1});
+  }).then(function(res){
+    if(!res) return;
     if(res.error){ showSetPasswordScreen(res.error.message); return; }
     // Queued rather than toast()-ed: toast() renders immediately, which would draw the app before
     // afterLogin() has loaded this person's data. afterLogin's own render picks this up instead.
@@ -11480,6 +11522,9 @@ if(supabaseClient){
   // signed-in result is treated as final and always wins, whenever it arrives.
   var routedToApp = false; // true once we've acted on an actual session — later events can't undo it
   supabaseClient.auth.onAuthStateChange(function(event, session){
+    // A scanner-proof invite/reset link (EMAIL_LINK): always ask for the new password first,
+    // whatever session this browser happens to have — the link is only used on Set password.
+    if(EMAIL_LINK && !routedToApp){ routedToApp=true; showSetPasswordScreen(); return; }
     // PASSWORD_RECOVERY is supposedly Supabase's dedicated event for this, but it isn't firing
     // reliably for this project's link format — so both invite and recovery links are now decided
     // purely from the link's own type (captured synchronously from the URL at the very top of this
@@ -11494,6 +11539,10 @@ if(supabaseClient){
       return;
     }
     if(!session && event==='INITIAL_SESSION' && !routedToApp){
+      // An old-style link that a scanner (or an earlier click) already used comes back with an
+      // error instead of a session — say so and offer a fresh link, rather than a bare sign-in
+      // screen that leaves them guessing at a password that was never set.
+      if(AUTH_LINK_ERROR){ showForgotPasswordScreen('That link has expired or was already used. Enter your email below and we\'ll send you a fresh one — then open it straight away.', true); return; }
       showLoginScreen(); // provisional — a following SIGNED_IN with a real session still overrides this
     }
   });
