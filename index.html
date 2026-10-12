@@ -7824,11 +7824,7 @@ function renderCheckedInPanel(){
   const todayKey=toKey(simNow());
   const cameToday=new Set(sessions.filter(function(s){ return s.status==='attended' && toKey(s.date)===todayKey; }).map(function(s){ return s.studentId; })).size;
   let html=sectionOpen('checkedin','Checked in today',
-    '<span class="small muted">'+todays.length+' here now · '+cameToday+' today</span>');
-  html+='<div style="display:flex;gap:12px;flex-wrap:wrap;margin:4px 0 12px">'
-    +'<div class="card" style="margin:0;padding:10px 16px;min-width:140px"><div style="font-size:1.8rem;font-weight:700;line-height:1.1">'+cameToday+'</div><div class="small muted">student'+(cameToday===1?'':'s')+' came in today</div></div>'
-    +'<div class="card" style="margin:0;padding:10px 16px;min-width:140px"><div style="font-size:1.8rem;font-weight:700;line-height:1.1">'+todays.length+'</div><div class="small muted">here right now</div></div>'
-  +'</div>';
+    '<span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+' · '+cameToday+' total today</span>');
   // Relocated here, at the very top of the section (Sept 2026, per Allie: "move who's here right
   // now to the top of the checked in today section") — always today, since this panel only ever
   // concerns itself with today regardless of which day is picked in the Schedule section below.
