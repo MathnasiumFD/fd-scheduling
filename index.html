@@ -10876,17 +10876,27 @@ function showForgotPasswordScreen(msg, isError){
     +'<p class="small muted">Enter the email your account was set up with — we\'ll send a link to reset your password.</p>'
     +(msg? '<div class="banner '+(isError?'danger':'info')+'">'+msg+'</div>' : '')
     +'<label>Email</label><input id="forgotEmail" type="email" autocomplete="username" />'
-    +'<button class="btn" onclick="sendPasswordReset()">Send reset link</button>'
+    +'<button class="btn" id="forgotSendBtn" onclick="sendPasswordReset()">Send reset link</button>'
     +'<p style="text-align:center;margin-top:12px"><a href="#" onclick="showLoginScreen();return false;" class="small">Back to sign in</a></p>'
     +'</div></div>';
 }
+// One send per press (Oct 2026): the auth logs showed many parents sending two reset requests 1–2s
+// apart (a double-tap) — each new link cancels the previous one, so opening the FIRST email then
+// said "expired". The button is disabled while sending.
+var passwordResetInFlight=false;
 function sendPasswordReset(){
+  if(passwordResetInFlight) return;
   const email=(document.getElementById('forgotEmail').value||'').trim();
   if(!email){ showForgotPasswordScreen('Enter your email address.', true); return; }
-  supabaseClient.auth.resetPasswordForEmail(email, {redirectTo:SITE_URL}).then(function(){
+  passwordResetInFlight=true;
+  const btn=document.getElementById('forgotSendBtn');
+  if(btn){ btn.disabled=true; btn.textContent='Sending…'; }
+  supabaseClient.auth.resetPasswordForEmail(email, {redirectTo:SITE_URL}).finally(function(){ passwordResetInFlight=false; }).then(function(){
     // Same confirmation whether or not that email is actually registered — never reveal which
     // emails have accounts.
-    showForgotPasswordScreen('If that email has an account, a reset link is on its way.', false);
+    showForgotPasswordScreen('If that email has an account, a reset link is on its way. Use the newest email if you get more than one.', false);
+  }).catch(function(){
+    showForgotPasswordScreen('Could not reach the server — check your connection and try again.', true);
   });
 }
 
