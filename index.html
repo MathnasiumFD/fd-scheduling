@@ -3447,12 +3447,9 @@ function topUpBlockedReason(sess, byParent, credit){
   if(end+TOPUP_MIN>CENTER_CLOSE) return 'The centre closes before an extra 30 minutes would finish.';
   if(byParent && dk===todayKey && sameDayMakeUpCutoffPassed()) return 'Same-day changes close at 10:00am — please call the centre.';
   if(studentOverlapClash(sess.studentId, dk, end, TOPUP_MIN, sess.id)) return 'It would run into another session '+name+' has that day.';
-  if(sess.podId && !sess.online){
-    const weekday=WEEKDAY_KEYS[(sess.date.getDay()+6)%7];
-    const pod=findPod(sess.podId);
-    if((byParent || dk!==todayKey) && podCapacityBlocked(sess.podId, dk, {start:end, duration:TOPUP_MIN})) return (pod? pod.name : 'The Pod')+' is full for those extra 30 minutes.';
-    if(byParent && !podCoverageDetail(sess.podId, weekday, end, TOPUP_MIN, sess.date).ok) return 'No instructor is rostered for those extra 30 minutes — please call the centre.';
-  }
+  // Centre-wide staff ratio for those extra 30 minutes (Oct 2026, see ratioDay) — front desk can
+  // still squeeze someone in on the day itself, as elsewhere.
+  if((byParent || dk!==todayKey) && !ratioHasRoom(dk, end, TOPUP_MIN, !!sess.online)) return 'The centre is full for those extra 30 minutes'+(byParent? ' — please call the centre.' : '.');
   return null;
 }
 function applyTopUpLocally(sess, credit){
@@ -4532,20 +4529,18 @@ function openSlotsForCredit(credit){
       const dateKey=toKey(date);
       possibleStarts(duration).forEach(function(start){
         if(studentOverlapClash(student.id, dateKey, start, duration, null)) return;
-        const podId=pickBestPod(weekday, dateKey, start, duration, student.year);
-        if(podId){
-          const cov=podCoverageDetail(podId, weekday, start, duration, date); // tolerant of a short unattended gap, same as pickBestPod just validated
-          opts.push({date, start, duration, podId, online:false, instructorId:cov.primaryInstructorId});
+        // Centre-wide ratio decides (Oct 2026, see ratioDay): room in person → a Pod if one fits,
+        // otherwise Unassigned for front desk to seat; else room online → Online.
+        if(ratioHasRoom(dateKey, start, duration, false)){
+          const podId=pickBestPod(weekday, dateKey, start, duration, student.year);
+          const cov=podId? podCoverageDetail(podId, weekday, start, duration, date) : null;
+          opts.push({date, start, duration, podId:podId||null, online:false, instructorId:cov? cov.primaryInstructorId : null});
           return;
         }
-        // No physical Pod fits — try Online before giving up on this date/time entirely. Any
-        // instructor genuinely on shift somewhere (instructorsOnShift) with combined headroom
-        // (!instructorOnlineBlocked) can take one more Online student; first eligible wins, same
-        // "predictable, no ranking" approach pickBestPod itself uses for Pods.
-        const onlineInstr=instructorsOnShift(weekday, start, duration, date)
-          .find(function(instr){ return !instructorOnlineBlocked(instr.id, dateKey, start, duration); });
-        if(onlineInstr){
-          opts.push({date, start, duration, podId:null, online:true, instructorId:onlineInstr.id});
+        if(ratioHasRoom(dateKey, start, duration, true)){
+          const onShift=instructorsOnShift(weekday, start, duration, date);
+          const onlineInstr=onShift.find(function(instr){ return !instructorOnlineBlocked(instr.id, dateKey, start, duration); }) || onShift[0];
+          if(onlineInstr) opts.push({date, start, duration, podId:null, online:true, instructorId:onlineInstr.id});
         }
       });
     }
@@ -4561,14 +4556,13 @@ function openSlotsForCredit(credit){
 function bookSlot(creditId, dateKey, start, duration, podId, instructorId, online){
   const credit=findCredit(creditId);
   const student=findStudent(credit.studentId);
-  if(online && instructorOnlineBlocked(instructorId, dateKey, Number(start), Number(duration))){
-    // Rare race — someone else filled the last Online seat between opening this picker and clicking
-    // Book. Same courtesy as confirmBooking()'s own guard: refuse cleanly and let them try again
-    // rather than silently overbooking.
-    toast("That Online slot just filled up — refresh and pick another time.");
+  // Rare race — someone else took the last place between opening the picker and clicking Book.
+  // Re-checked against the centre-wide ratio (Oct 2026), same rule the picker used.
+  if(!ratioHasRoom(dateKey, Number(start), Number(duration), !!online)){
+    toast("That time just filled up — refresh and pick another time.");
     return;
   }
-  const sess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId: online? null : podId, instructorId, instructorId2:null, handoff:null, online:!!online, date:new Date(dateKey), start:Number(start), duration:Number(duration), status:'scheduled', bookedBy:'parent', creditId};
+  const sess={id:newId()||('sess'+(nextSessionId++)), studentId:student.id, podId: online? null : (podId||null), instructorId:instructorId||null, instructorId2:null, handoff:null, online:!!online, date:new Date(dateKey), start:Number(start), duration:Number(duration), status:'scheduled', bookedBy:'parent', creditId};
   sessions.push(sess);
   credit.status='redeemed';
   credit.redeemedSessionId=sess.id;
@@ -4976,21 +4970,69 @@ function unassignedPeakInWindow(dateKey, winStart, winEnd){
   }).map(function(s){ return {start:Math.max(s.start,winStart), end:Math.min(s.start+s.duration,winEnd)}; });
   return peakConcurrencyOf(list);
 }
+/* ---------- centre-wide staff ratio (Oct 2026) ---------- */
+// Per Allie: "make it show availability to the parents based on the total ratio — 1 staff to every 8
+// kids, plus 1 online kid per staff". So "is there room" is no longer a question about any one Pod
+// (kids get moved between Pods all the time): at every moment of the session, the whole centre's
+// in-person kids must stay within 8 per instructor on shift, and its online kids within 1 per
+// instructor on shift. An instructor with a personal reduced ratio (combinedCapOverride, e.g. 1:5)
+// counts for that many in-person and no online. Checked every RATIO_STEP minutes. Unassigned kids
+// count like anyone else. A booking that fits the ratio but no single Pod is saved Unassigned for
+// front desk to seat.
+var RATIO_STEP=5;
+var ratioDayCache={};
+function clearRatioCache(){ ratioDayCache={}; }
+function ratioIdx(min){ return Math.floor(min/RATIO_STEP); }
+// Per-RATIO_STEP arrays for one date: in-person / online capacity (from who's on shift) and
+// headcount (from sessions taking a seat).
+function ratioDay(dateKey){
+  // Cache is cleared on every render(); the signature also catches a booking/cancel made between renders.
+  let seated=0, mins=0;
+  sessions.forEach(function(s){ if(sessionTakesSeat(s)){ seated++; mins+=s.duration; } });
+  const sig=sessions.length+'|'+seated+'|'+mins+'|'+podDayOverrides.length;
+  if(ratioDayCache[dateKey] && ratioDayCache[dateKey].sig===sig) return ratioDayCache[dateKey];
+  const n=ratioIdx(24*60), date=new Date(dateKey);
+  const capIn=new Array(n).fill(0), capOn=new Array(n).fill(0), kidsIn=new Array(n).fill(0), kidsOn=new Array(n).fill(0);
+  const onShift=[]; for(let i=0;i<n;i++) onShift.push({});
+  pods.forEach(function(pod){
+    podShiftsOn(pod.id, date).forEach(function(sh){
+      if(!sh.instructorId) return;
+      for(let i=ratioIdx(sh.start); i<ratioIdx(sh.end) && i<n; i++) onShift[i][sh.instructorId]=true;
+    });
+  });
+  for(let i=0;i<n;i++){
+    Object.keys(onShift[i]).forEach(function(id){
+      const cap=combinedCapFor(id);
+      capIn[i]+=Math.min(CAPACITY, cap);
+      capOn[i]+=Math.max(0, cap-CAPACITY);
+    });
+  }
+  sessions.forEach(function(s){
+    if(toKey(s.date)!==dateKey || !sessionTakesSeat(s)) return;
+    const arr=s.online? kidsOn : kidsIn;
+    for(let i=ratioIdx(s.start); i<ratioIdx(s.start+s.duration) && i<n; i++) arr[i]++;
+  });
+  return (ratioDayCache[dateKey]={capIn, capOn, kidsIn, kidsOn, sig});
+}
+// Fewest open places at any moment in [start, start+duration) — in person, or online.
+function ratioSeatsOpen(dateKey, start, duration, online){
+  const d=ratioDay(dateKey);
+  const cap=online? d.capOn : d.capIn, kids=online? d.kidsOn : d.kidsIn;
+  let min=Infinity;
+  for(let i=ratioIdx(start); i<ratioIdx(start+duration); i++) min=Math.min(min, cap[i]-kids[i]);
+  return min===Infinity? 0 : Math.max(0, min);
+}
+function ratioHasRoom(dateKey, start, duration, online){ return ratioSeatsOpen(dateKey, start, duration, online)>0; }
+
 function openSeatsAt(dateKey, weekday, blockStart, year, blockLen){
-  let seats=0, staffed=0;
-  const blockEnd=blockStart+blockLen;
+  let staffed=0;
   const date=new Date(dateKey);
   pods.forEach(function(pod){
     const cov=podCoverageBoundary(pod.id, weekday, blockStart, blockLen, date);
-    if(!cov.instructorId) return;
-    const winStart=blockStart, winEnd=Math.min(blockEnd, cov.boundary);
-    if(winEnd<=winStart) return;
-    staffed++;
-    const peak=peakInWindow(pod.id, dateKey, winStart, winEnd);
-    seats += Math.max(0, podCapacity(pod.id)-peak);
+    if(cov.instructorId && cov.boundary>blockStart) staffed++;
   });
-  seats = Math.max(0, seats - unassignedPeakInWindow(dateKey, blockStart, blockEnd));
-  return {seats, staffed};
+  // Seats now come from the centre-wide ratio (Oct 2026, see ratioDay above), not Pod by Pod.
+  return {seats:ratioSeatsOpen(dateKey, blockStart, blockLen, false), staffed};
 }
 // Combined (physical + online) peak headcount instructor X is minding, restricted to a window —
 // the Online counterpart to peakInWindow (used for Pods).
@@ -5004,13 +5046,7 @@ function instructorCombinedPeakInWindow(instructorId, dateKey, winStart, winEnd)
 // Online counterpart to openSeatsAt(), used by the availability lookup to show Online as its own
 // row rather than folding it into the Pod counts above.
 function onlineSeatsAt(dateKey, weekday, blockStart, blockLen){
-  const date=new Date(dateKey);
-  let seats=0;
-  instructorsOnShift(weekday, blockStart, blockLen, date).forEach(function(instr){
-    const peak=instructorCombinedPeakInWindow(instr.id, dateKey, blockStart, blockStart+blockLen);
-    seats += Math.max(0, combinedCapFor(instr.id)-peak);
-  });
-  return seats;
+  return ratioSeatsOpen(dateKey, blockStart, blockLen, true); // centre-wide 1 online per staff (Oct 2026)
 }
 // Sept 2026, per Allie: "I want the availability lookup to be an overview of regularly scheduled
 // sessions - not be so week-by-week" — front desk used to flip between "This week"/"Next week" and
@@ -10878,7 +10914,7 @@ function renderSlotPicker(credit){
     // tell bookSlot to force it null itself and stamp the session as Online.
     const locationLabel = o.online? ' <span class="pill online" style="margin-left:6px">Online — '+findInstructor(o.instructorId).name+'</span>' : '';
     html+='<div class="slot-opt"><span>'+fmtShort(o.date)+' · '+rangeLabel(o.start,o.duration)+locationLabel+'</span>'
-      +'<button class="btn sm primary" onclick="bookSlot(\''+credit.id+'\',\''+toKey(o.date)+'\','+o.start+','+o.duration+',\''+(o.online?'':o.podId)+'\',\''+o.instructorId+'\','+(!!o.online)+')">Book</button></div>';
+      +'<button class="btn sm primary" onclick="bookSlot(\''+credit.id+'\',\''+toKey(o.date)+'\','+o.start+','+o.duration+',\''+(o.online? '' : (o.podId||''))+'\',\''+(o.instructorId||'')+'\','+(!!o.online)+')">Book</button></div>';
   });
   html+='<button class="btn sm ghost" onclick="cancelBookMakeUp()">Back</button></div>';
   return html;
