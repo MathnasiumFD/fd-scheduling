@@ -9701,6 +9701,56 @@ function instructorUpcomingCoverShifts(instructorId){
   return out.sort(function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)) || a.start-b.start; });
 }
 
+// The instructor's actual shifts, date by date, for the next two weeks (Oct 2026, per Allie: "Rostered
+// shifts which lists their upcoming shifts for the next 2 weeks, a section for one-off shifts so
+// shifts they've picked up that are usually someone else's"). Split into:
+//   regular — their own usual shifts (status 'on', 'changed' = different times that day, 'off' =
+//             not needed that day, 'covered' = someone else is covering it);
+//   oneOff  — shifts they've picked up that are normally someone else's (or an extra one-off day).
+// Same sources as everywhere else: day overrides, one-off coverage swaps, summer hours, closures.
+var INSTRUCTOR_SHIFT_DAYS=14;
+function instructorShiftsAhead(instructorId){
+  const regular=[], oneOff=[];
+  const today=simNow();
+  for(let i=0;i<INSTRUCTOR_SHIFT_DAYS;i++){
+    const date=addDays(new Date(toKey(today)), i);
+    const dk=toKey(date), weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+    if(isClosedDate(date)) continue;
+    const tb=termBreakOn(date);
+    pods.forEach(function(pod){
+      if(tb){
+        if(termBreakCoverageFor(tb, pod.id, weekday)===instructorId) regular.push({date, start:tb.morningStart, end:tb.morningEnd, podId:pod.id, status:'on', note:tb.label||'Summer hours'});
+        return;
+      }
+      const blocks=podBlocksForDay(pod.id, weekday);
+      const ov=dayOverrideFor(pod.id, dk);
+      if(ov){
+        const mine=blocks.filter(function(b){ return blockInstructorOngoing(b, date)===instructorId; });
+        if(ov.instructorId===instructorId){
+          if(mine.length){
+            const same=mine[0].start===ov.start && mine[mine.length-1].end===ov.end;
+            regular.push({date, start:ov.start, end:ov.end, podId:pod.id, status: same? 'on' : 'changed', blockId:mine[0].id, weekday});
+          } else {
+            oneOff.push({date, start:ov.start, end:ov.end, podId:pod.id});
+          }
+        } else if(mine.length){
+          regular.push({date, start:mine[0].start, end:mine[mine.length-1].end, podId:pod.id, status:'off'});
+        }
+        return;
+      }
+      blocks.forEach(function(b){
+        const usual=blockInstructorOngoing(b, date), actual=blockInstructorOn(b, date);
+        if(usual===instructorId && actual===instructorId) regular.push({date, start:b.start, end:b.end, podId:pod.id, status:'on', blockId:b.id, weekday});
+        else if(usual===instructorId) regular.push({date, start:b.start, end:b.end, podId:pod.id, status:'covered', coveredBy:actual});
+        else if(actual===instructorId) oneOff.push({date, start:b.start, end:b.end, podId:pod.id, usualInstructorId:usual});
+      });
+    });
+  }
+  const byTime=function(a,b){ return toKey(a.date).localeCompare(toKey(b.date)) || a.start-b.start; };
+  return {regular:regular.sort(byTime), oneOff:oneOff.sort(byTime)};
+}
+function setInstructorTab(tab){ state.instructorTab=tab; render(); }
+
 // Which Pods this instructor actually covers TODAY (per each block's dated assignment history),
 // and which students are checked in at any of those Pods right now — used for the instructor's
 // own "My Pod today" roster, so they only ever see students physically at their Pod, and only once
@@ -9745,11 +9795,11 @@ function checkedInAtInstructorPodToday(instructorId){
 // swap lands in the block's oneOffCoverage list (blockInstructorOn resolves it automatically
 // everywhere else: booking, coverage summaries, capacity checks), leaving the instructor's regular
 // dated assignment (5.2/5.3) untouched for every other day.
-function openCoverageRequestForm(instructorId, podId, weekday, blockId){
+function openCoverageRequestForm(instructorId, podId, weekday, blockId, dateKey){
   const today=simNow();
   let d=new Date(today);
   while(WEEKDAY_KEYS[(d.getDay()+6)%7]!==weekday){ d=addDays(d,1); }
-  state.coverageRequestForm={instructorId, podId, weekday, blockId, date:toKey(d), note:'', error:''};
+  state.coverageRequestForm={instructorId, podId, weekday, blockId, date:dateKey||toKey(d), note:'', error:''};
   render();
 }
 function closeCoverageRequestForm(){ state.coverageRequestForm=null; render(); }
@@ -10002,6 +10052,17 @@ function renderInstructor(){
   let html='<div class="card"><div class="card-head"><h2>Welcome, '+instr.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'instructorLogout()')+'">Log out</button></div>'
     +'<p>Best suited for: <b>'+yearLabel(instr.yearMin)+'–'+yearLabel(instr.yearMax)+'</b> <span class="small muted">(a preference only — you can be assigned or booked for any year)</span></p>'
     +'<p>You can only see and manage your own availability — not other instructors\'.</p></div>';
+  // Two tabs (Oct 2026, per Allie): My shifts (today's Pod, the next 2 weeks, one-off shifts,
+  // coverage) and Availability (ongoing + one-off availability changes).
+  const tab=state.instructorTab==='availability'? 'availability' : 'shifts';
+  html+='<div class="subtabs"><button class="subtab'+(tab==='shifts'?' active':'')+'" onclick="setInstructorTab(\'shifts\')">My shifts</button>'
+    +'<button class="subtab'+(tab==='availability'?' active':'')+'" onclick="setInstructorTab(\'availability\')">Availability</button></div>';
+  if(tab==='availability'){
+    html+=renderAvailabilityManager(instr, 'My availability', 'Your usual weekly hours. Use an ongoing change for something that applies from a date onwards, or a one-off change for a single day.');
+    html+=renderAvailRuleModal();
+    html+=renderOneOffModal();
+    return html;
+  }
 
   const myPodIdsToday=instructorPodIdsToday(instr.id);
   const checkedInAtMyPods=checkedInAtInstructorPodToday(instr.id);
@@ -10058,38 +10119,46 @@ function renderInstructor(){
   // checkedInPresentForCurrentViewer()), not the whole centre.
   html+=renderCheckOutModal();
 
-  html+=renderAvailabilityManager(instr, 'My availability');
-  html+=renderAvailRuleModal();
-  html+=renderOneOffModal();
-
-  const shifts=instructorRosteredShifts(instr.id);
-  html+='<div class="card"><h2>Rostered shifts</h2><p>The shifts front desk has scheduled you to work. Can\'t make one? Request coverage for that specific date — front desk lines up a replacement, and your regular assignment is untouched every other week.</p>';
-  if(shifts.length===0) html+='<div class="empty-note">No shifts currently rostered.</div>';
+  // Rostered shifts — the next 2 weeks, by date (Oct 2026, per Allie).
+  const ahead=instructorShiftsAhead(instr.id);
+  const todayKey=toKey(simNow());
+  const dateCell=function(d){ const dk=toKey(d); return '<b>'+fmtShort(d)+'</b>'+(dk===todayKey? ' <span class="badge firstday">Today</span>' : ''); };
+  html+='<div class="card"><h2>Rostered shifts</h2><p class="small muted">Your shifts for the next 2 weeks. Can\'t make one? Use "Can\'t make it" on that date — front desk lines up a replacement, and every other week stays the same.</p>';
+  if(!ahead.regular.length) html+='<div class="empty-note">No shifts rostered in the next 2 weeks.</div>';
   else{
-    html+='<table><tr><th>Day</th><th>Time</th><th></th><th></th></tr>'
-      +shifts.sort(function(a,b){ return WEEKDAY_KEYS.indexOf(a.day)-WEEKDAY_KEYS.indexOf(b.day) || a.start-b.start; })
-        .map(function(a){ return '<tr><td>'+a.day+'</td><td>'+rangeLabel(a.start,a.end-a.start)+'</td><td class="small muted">'+(a.upcoming? 'Starting '+fmtShort(a.from) : '')+'</td>'
-          +'<td>'+(a.upcoming? '' : '<button class="btn sm ghost" onclick="openCoverageRequestForm(\''+instr.id+'\',\''+a.podId+'\',\''+a.day+'\',\''+a.blockId+'\')">Request coverage</button>')+'</td></tr>'; }).join('')
+    html+='<table><tr><th>Date</th><th>Time</th><th>Pod</th><th></th></tr>'
+      +ahead.regular.map(function(a){
+        const dk=toKey(a.date), pod=findPod(a.podId);
+        const time = (a.status==='off' || a.status==='covered')? '<s class="muted">'+rangeLabel(a.start,a.end-a.start)+'</s>' : rangeLabel(a.start,a.end-a.start);
+        const requested = a.blockId && coverageRequests.some(function(r){ return r.blockId===a.blockId && toKey(r.date)===dk && r.status==='open'; });
+        let action='';
+        if(a.status==='off') action='<span class="badge full">Not needed</span>';
+        else if(a.status==='covered') action='<span class="badge full">Covered by '+(a.coveredBy && findInstructor(a.coveredBy)? findInstructor(a.coveredBy).name : 'someone else')+'</span>';
+        else if(requested) action='<span class="badge soon">Coverage requested</span>';
+        else if(a.blockId) action='<button class="btn sm ghost" onclick="openCoverageRequestForm(\''+instr.id+'\',\''+a.podId+'\',\''+a.weekday+'\',\''+a.blockId+'\',\''+dk+'\')">Can\'t make it</button>';
+        if(a.status==='changed') action='<span class="badge soon">Times changed</span> '+action;
+        if(a.note) action='<span class="badge soon">'+a.note+'</span> '+action;
+        return '<tr><td>'+dateCell(a.date)+'</td><td>'+time+'</td><td class="small">'+(pod? pod.name : '—')+'</td><td>'+action+'</td></tr>';
+      }).join('')
       +'</table>';
   }
   html+='</div>';
 
-  html+=renderCalendarSyncCard(instr);
-
-  // A confirmed one-off cover shift for another instructor — shown as its own reminder, separate from
-  // "Rostered shifts" above, since it's a one-time swap rather than part of the regular pattern (Sept
-  // 2026, per Allie: "when i assign an instructor to cover another instructor, i need the one-off
-  // shift to come up on the instructors page so they're reminded of whats coming").
-  const upcomingCoverShifts=instructorUpcomingCoverShifts(instr.id);
-  if(upcomingCoverShifts.length>0){
-    // Retitled from "Upcoming cover shifts" (Oct 2026) — it now also lists one-day changes front desk
-    // made to their own shifts (different times, or not needed that day), not only extra cover shifts.
-    const kindLabel={cover:'<span class="badge available">Extra shift</span>', changed:'<span class="badge soon">Times changed</span>', off:'<span class="badge full">Not needed</span>'};
-    html+='<div class="card"><h2>Upcoming one-off changes</h2><p>One-time changes front desk has made to your shifts — extra shifts, different times, or a shift you\'re not needed for. Your regular roster is unchanged, and each one disappears from here once its date passes.</p>';
-    html+='<table><tr><th>Date</th><th>Day</th><th>Time</th><th>Pod</th><th></th></tr>'
-      +upcomingCoverShifts.map(function(c){ return '<tr><td>'+fmtShort(c.date)+'</td><td>'+c.day+'</td><td>'+(c.kind==='off'? '<s>'+rangeLabel(c.start,c.end-c.start)+'</s>' : rangeLabel(c.start,c.end-c.start))+'</td><td>'+findPod(c.podId).name+'</td><td>'+(kindLabel[c.kind]||'')+'</td></tr>'; }).join('')
-      +'</table></div>';
+  // One-off shifts — ones they've picked up that are usually someone else's (Oct 2026, per Allie).
+  const pickedUp=instructorUpcomingCoverShifts(instr.id).filter(function(c){ return c.kind==='cover'; });
+  html+='<div class="card"><h2>One-off shifts</h2><p class="small muted">Shifts you\'ve picked up that are usually someone else\'s. Each one drops off once its date passes.</p>';
+  if(!pickedUp.length) html+='<div class="empty-note">No one-off shifts coming up.</div>';
+  else{
+    html+='<table><tr><th>Date</th><th>Time</th><th>Pod</th><th>Usually</th></tr>'
+      +pickedUp.map(function(c){
+        const pod=findPod(c.podId);
+        const usual=podBlocksForDay(c.podId, c.day).filter(function(b){ return b.start<c.end && b.end>c.start; }).map(function(b){ return blockInstructorOngoing(b, c.date); }).filter(Boolean)[0];
+        const usualI=usual? findInstructor(usual) : null;
+        return '<tr><td>'+dateCell(c.date)+'</td><td>'+rangeLabel(c.start,c.end-c.start)+'</td><td class="small">'+(pod? pod.name : '—')+'</td><td class="small muted">'+(usualI? usualI.name : 'Extra shift')+'</td></tr>';
+      }).join('')
+      +'</table>';
   }
+  html+='</div>';
 
   const openForMe=openCoverageRequestsSortedForInstructor(instr.id);
   if(openForMe.length>0){
@@ -10127,6 +10196,7 @@ function renderInstructor(){
       }).join('')
       +'</table></div>';
   }
+  html+=renderCalendarSyncCard(instr);
   html+=renderCoverageRequestModal();
 
   return html;
