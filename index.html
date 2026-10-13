@@ -4488,7 +4488,7 @@ function quickInstructorLogin(email){ instructorLoginSubmit(email); }
 function startBookMakeUp(creditId){
   const c=findCredit(creditId);
   if(c && creditPartlyUsed(c)){ toast('This make-up credit has been partly used for extra 30-minute top-ups — the remaining '+creditMinutesLeft(c)+' min can be added onto upcoming sessions instead.', 7000); return; }
-  state.parentBookingCreditId=creditId; render();
+  state.parentBookingCreditId=creditId; state.parentBookingWeek=0; render();
 }
 function cancelBookMakeUp(){ state.parentBookingCreditId=null; render(); }
 
@@ -4507,7 +4507,9 @@ function sameDayMakeUpCutoffPassed(){ return nowMinutesOfDay()>=MAKEUP_SAME_DAY_
 // location picker already does (see confirmBooking's isOnline branch) — physical Pods first (a
 // parent already knows how a Pod session works), Online only as a fallback for a given date/time
 // when no Pod fits.
-function openSlotsForCredit(credit){
+// weekOff (Oct 2026, per Allie: "my parents want to be able to book further into the future") —
+// which Mon–Fri week to search, 0 = this week, any week up to the credit's expiry.
+function openSlotsForCredit(credit, weekOff){
   // Parents choose a date + time only — never which Pod or instructor, and never a duration
   // (that's fixed to the student's usual session length). The system auto-assigns a specific
   // qualified, available, under-capacity Pod (or, failing that, an available Online instructor)
@@ -4518,12 +4520,15 @@ function openSlotsForCredit(credit){
   const todayKey=toKey(now);
   const sameDayCutoffPassed=sameDayMakeUpCutoffPassed();
   const opts=[];
-  [0,1].forEach(function(weekOff){
+  const expiryKey=toKey(credit.expiryDate);
+  [weekOff||0].forEach(function(weekOff){
     const monday=addDays(getMonday(now), weekOff*7);
     for(let i=0;i<5;i++){
       const date=addDays(monday,i);
       if(date < new Date(todayKey)) continue;
+      if(toKey(date)>expiryKey) continue; // past the credit's expiry
       if(isClosedDate(date)) continue; // centre's closed this day — never offer it as a make-up slot
+      if(termBreakOn(date)) continue; // summer hours — booked from the Summer tab instead
       if(sameDayCutoffPassed && toKey(date)===todayKey) continue; // past 10am — today's no longer offered
       const weekday=WEEKDAY_KEYS[i];
       const dateKey=toKey(date);
@@ -8589,19 +8594,66 @@ function renderNewParentModal(){
   html+='</div></div>';
   return html;
 }
+// Deleting a parent (Oct 2026, per Allie: "I need the ability to delete parents also"). Runs through
+// the delete-parent Edge Function (delete-parent.ts), which also removes their login. Not allowed while
+// they're still the main parent of a child who's still enrolled — move the child first.
+var parentDeleteInFlight={};
+function parentActiveMainChildren(p){ return students.filter(function(s){ return s.parentId===p.id && !isStudentInactive(s); }); }
+function deleteParent(parentId){
+  const p=findParent(parentId);
+  if(!p || parentDeleteInFlight[parentId]) return;
+  const active=parentActiveMainChildren(p);
+  if(active.length){ toast(p.name+' is still the main parent of '+active.map(function(s){ return s.name; }).join(', ')+'. Change the parent on '+(active.length===1? 'that child' : 'those children')+' (Edit details) first.', 8000); return; }
+  const linked=studentGuardians.filter(function(g){ return g.parentId===p.id; }).map(function(g){ const s=findStudent(g.studentId); return s? s.name : null; }).filter(Boolean);
+  const finished=students.filter(function(s){ return s.parentId===p.id; }).map(function(s){ return s.name; });
+  if(!confirm('Delete '+p.name+' ('+p.email+')?\n\n'
+    +(p.authUserId? 'Their login will be removed — they won\'t be able to sign in.\n' : '')
+    +(linked.length? 'They\'ll be removed as 2nd parent/guardian of '+linked.join(', ')+'.\n' : '')
+    +(finished.length? finished.join(', ')+' (finished) will keep their records, with no parent on file.\n' : '')
+    +'\nThis can\'t be undone.')) return;
+  const removeLocally=function(){
+    parents=parents.filter(function(x){ return x.id!==p.id; });
+    students.forEach(function(s){ if(s.parentId===p.id) s.parentId=null; });
+    studentGuardians=studentGuardians.filter(function(g){ return g.parentId!==p.id; });
+    refreshParentStudentIds();
+    toast(p.name+' deleted.');
+    render();
+  };
+  if(!supabaseClient || !currentUser){ removeLocally(); return; }
+  parentDeleteInFlight[parentId]=true; render();
+  supabaseClient.functions.invoke('delete-parent', {body:{parentId:p.id}}).then(function(r){
+    delete parentDeleteInFlight[parentId];
+    const err=(r.error && (r.error.message||String(r.error))) || (r.data && r.data.error);
+    if(err){ toast('Couldn\'t delete '+p.name+' — '+err, 8000); render(); return; }
+    removeLocally();
+  });
+}
+function parentRowHtml(p){
+  const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); return s? s.name+(s.parentId!==p.id? ' <span class="muted">(as 2nd parent)</span>' : '') : null; }).filter(Boolean);
+  const loginCell = loginStatusCellHtml(p.authUserId,
+    '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>',
+    resendInviteButtonHtml(p.email, 'parent', p.id, p.name));
+  const delBtn = parentDeleteInFlight[p.id]? '<button class="btn sm ghost" disabled>Deleting…</button>'
+    : '<button class="btn sm ghost" style="color:var(--danger)" onclick="deleteParent(\''+p.id+'\')">Delete</button>';
+  return '<tr><td>'+p.name+'</td><td class="small">'+p.email+'</td><td class="small">'+(kids.length? kids.join(', ') : '—')+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditParentForm(\''+p.id+'\')">Edit details</button> '+delBtn+'</td></tr>';
+}
 function renderParentsPanel(){
   let html=sectionOpen('parents','Parents',
     '<button class="btn sm primary" onclick="openNewParentForm()">+ Add parent</button>');
   html+='<p>Parents are usually created automatically when you enroll their first child. Use "Add parent" here only if you need their record to exist before that (e.g. lining up their login in advance).</p>';
+  const byName=function(a,b){ return a.name.localeCompare(b.name); };
   html+='<table><tr><th>Parent</th><th>Email</th><th>Children</th><th>Login</th><th></th></tr>';
-  parents.filter(function(p){ return !isParentInactive(p); }).sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(p){
-    const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); return s? s.name+(s.parentId!==p.id? ' <span class="muted">(as 2nd parent)</span>' : '') : null; }).filter(Boolean);
-    const loginCell = loginStatusCellHtml(p.authUserId,
-      '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>',
-      resendInviteButtonHtml(p.email, 'parent', p.id, p.name));
-    html+='<tr><td>'+p.name+'</td><td class="small">'+p.email+'</td><td class="small">'+(kids.length? kids.join(', ') : '—')+'</td><td>'+loginCell+'</td><td><button class="btn sm ghost" onclick="openEditParentForm(\''+p.id+'\')">Edit details</button></td></tr>';
-  });
-  html+='</table></div>';
+  parents.filter(function(p){ return !isParentInactive(p); }).sort(byName).forEach(function(p){ html+=parentRowHtml(p); });
+  html+='</table>';
+  // Parents whose children have all finished (Oct 2026) — previously not listed anywhere.
+  const inactive=parents.filter(isParentInactive).sort(byName);
+  if(inactive.length){
+    html+='<h3 style="margin-top:18px">Inactive parents <span class="small muted" style="font-weight:400">— all their children have finished</span></h3>';
+    html+='<table><tr><th>Parent</th><th>Email</th><th>Children</th><th>Login</th><th></th></tr>';
+    inactive.forEach(function(p){ html+=parentRowHtml(p); });
+    html+='</table>';
+  }
+  html+='</div>';
   html+=renderNewParentModal();
   html+=renderEditParentModal();
   return html;
@@ -10903,20 +10955,36 @@ function renderParentCredit(c, student){
   return html;
 }
 
+// Week by week, any week up to the credit's expiry, every open time grouped by day (Oct 2026, per
+// Allie: "my parents want to be able to book further into the future" — this used to show only the
+// first 10 open times across this week and next).
+function setParentBookingWeek(n){ state.parentBookingWeek=n; render(); }
 function renderSlotPicker(credit){
-  const opts=openSlotsForCredit(credit);
-  let html='<div style="margin-top:10px"><div class="small muted" style="margin-bottom:6px">Open times only — you won\'t see who else is booked, or which instructor works which day.</div>';
-  if(sameDayMakeUpCutoffPassed()) html+='<div class="small muted" style="margin-bottom:6px">It\'s past 10:00am, so today isn\'t offered for a make-up — the earliest option below is tomorrow.</div>';
-  if(opts.length===0) html+='<div class="empty-note">No open slots in the next two weeks for this program.</div>';
-  opts.slice(0,10).forEach(function(o){
-    // An Online option's podId is a real null — pass '' through the onclick (never the string
-    // "null", which bookSlot would otherwise treat as a truthy Pod id) and let the trailing `true`
-    // tell bookSlot to force it null itself and stamp the session as Online.
-    const locationLabel = o.online? ' <span class="pill online" style="margin-left:6px">Online — '+findInstructor(o.instructorId).name+'</span>' : '';
-    html+='<div class="slot-opt"><span>'+fmtShort(o.date)+' · '+rangeLabel(o.start,o.duration)+locationLabel+'</span>'
-      +'<button class="btn sm primary" onclick="bookSlot(\''+credit.id+'\',\''+toKey(o.date)+'\','+o.start+','+o.duration+',\''+(o.online? '' : (o.podId||''))+'\',\''+(o.instructorId||'')+'\','+(!!o.online)+')">Book</button></div>';
+  // Capped at HORIZON_WEEKS: regular sessions are only booked that far ahead, so later weeks would
+  // look emptier than they really are.
+  const lastWeek=Math.min(HORIZON_WEEKS-1, Math.max(0, Math.round((getMonday(credit.expiryDate)-getMonday(simNow()))/(7*86400000))));
+  const week=Math.min(Math.max(0, state.parentBookingWeek||0), lastWeek);
+  const opts=openSlotsForCredit(credit, week);
+  const monday=addDays(getMonday(simNow()), week*7);
+  let html='<div style="margin-top:10px"><div class="small muted" style="margin-bottom:6px">Open times only — you won\'t see who else is booked, or which instructor works which day. Use Later › to look further ahead.</div>';
+  html+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+    +'<button class="btn sm ghost" '+(week<=0?'disabled':'')+' onclick="setParentBookingWeek('+(week-1)+')">‹ Earlier</button>'
+    +'<b style="flex:1;text-align:center">'+(week===0? 'This week' : week===1? 'Next week' : 'Week of '+fmtShort(monday))+'</b>'
+    +'<button class="btn sm ghost" '+(week>=lastWeek?'disabled':'')+' onclick="setParentBookingWeek('+(week+1)+')">Later ›</button></div>';
+  if(week===0 && sameDayMakeUpCutoffPassed()) html+='<div class="small muted" style="margin-bottom:6px">It\'s past 10:00am, so today isn\'t offered for a make-up.</div>';
+  if(opts.length===0) html+='<div class="empty-note">No open times this week — try '+(week<lastWeek? 'a later week.' : 'an earlier week.')+'</div>';
+  const byDay={};
+  opts.forEach(function(o){ const k=toKey(o.date); (byDay[k]=byDay[k]||[]).push(o); });
+  Object.keys(byDay).sort().forEach(function(k){
+    html+='<div class="small" style="font-weight:700;margin:8px 0 4px">'+fmtLong(new Date(k))+'</div><div style="display:flex;flex-wrap:wrap;gap:6px">';
+    byDay[k].forEach(function(o){
+      // An Online option's podId is a real null — pass '' through the onclick (never the string
+      // "null") and let the trailing `true` tell bookSlot to stamp the session as Online.
+      html+='<button class="btn sm '+(o.online?'ghost':'primary')+'" title="Book '+rangeLabel(o.start,o.duration)+(o.online?' (Online)':'')+'" onclick="if(confirm(\'Book a make-up on '+fmtShort(o.date)+', '+rangeLabel(o.start,o.duration)+(o.online?' (Online)':'')+'?\')) bookSlot(\''+credit.id+'\',\''+toKey(o.date)+'\','+o.start+','+o.duration+',\''+(o.online? '' : (o.podId||''))+'\',\''+(o.instructorId||'')+'\','+(!!o.online)+')">'+minToLabel(o.start)+(o.online?' · Online':'')+'</button>';
+    });
+    html+='</div>';
   });
-  html+='<button class="btn sm ghost" onclick="cancelBookMakeUp()">Back</button></div>';
+  html+='<div style="margin-top:10px"><button class="btn sm ghost" onclick="cancelBookMakeUp()">Back</button></div></div>';
   return html;
 }
 
