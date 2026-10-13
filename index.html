@@ -7186,7 +7186,7 @@ function notComingSessionsForDay(dayKey){
   if(dayKey<toKey(simNow())) return [];
   const date=new Date(dayKey);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
-  return sessions.filter(function(s){
+  const list=sessions.filter(function(s){
     if(toKey(s.date)!==dayKey || sessionTakesSeat(s)) return false;
     const student=findStudent(s.studentId);
     if(!student || isStudentInactive(student) || isStudentOnHold(s.studentId, date)) return false;
@@ -7196,7 +7196,17 @@ function notComingSessionsForDay(dayKey){
       if(!(plan.recurring||[]).some(function(r){ return r.weekday===weekday && r.start===s.start; })) return false;
     }
     return true;
-  }).sort(function(a,b){ return a.start-b.start; });
+  });
+  // One row per child per time (Oct 2026, per Allie: "why is there 3 cancelled sessions for
+  // mariella for today") — schedule edits and re-bookings can leave several cancelled copies of the
+  // same session. Keep the most meaningful: away/not in, then a deliberate cancel, then the newest.
+  const rank=function(s){ return s.status!=='cancelled'? 3 : (s.parentCancelled || s.oneOffCancel)? 2 : 1; };
+  const best={};
+  list.forEach(function(s){
+    const k=s.studentId+'|'+s.start, cur=best[k];
+    if(!cur || rank(s)>rank(cur) || (rank(s)===rank(cur) && String(s.id)>String(cur.id))) best[k]=s;
+  });
+  return Object.keys(best).map(function(k){ return best[k]; }).sort(function(a,b){ return a.start-b.start; });
 }
 function notComingCardHtml(dayKey){
   const list=notComingSessionsForDay(dayKey);
