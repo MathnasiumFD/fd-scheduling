@@ -3071,6 +3071,9 @@ function resolveStandingLocation(studentId, weekday, dateKey, date, start, durat
 // root cause of "when adding a student i'm getting an error code" / "...may not have saved").
 // Deferring lets the caller insert them only once the student row is confirmed to exist.
 function generateRecurringSessions(student, weeksAhead, deferredSessions){
+  // A held spot (Oct 2026) has no real sessions until it's confirmed — it only counts toward
+  // permanent availability (see ratioDay's includeHeld).
+  if(student.heldUntil) return 0;
   const startMonday=getMonday(simNow());
   let created=0;
   for(let w=0; w<weeksAhead; w++){
@@ -4989,13 +4992,19 @@ var ratioDayCache={};
 function clearRatioCache(){ ratioDayCache={}; }
 function ratioIdx(min){ return Math.floor(min/RATIO_STEP); }
 // Per-RATIO_STEP arrays for one date: in-person / online capacity (from who's on shift) and
-// headcount (from sessions taking a seat).
-function ratioDay(dateKey){
-  // Cache is cleared on every render(); the signature also catches a booking/cancel made between renders.
+// headcount (from sessions taking a seat). includeHeld (permanent-availability checks only — the
+// Availability Lookup and regular day/time changes) also counts children with a held spot at their
+// regular times; on-the-day checks (make-ups, +30, today) leave them out (Oct 2026, per Allie: "i
+// dont want it to affect on-the-day availability, just permanent availability").
+function heldSpotStudents(){ return students.filter(function(s){ return s.heldUntil && !isStudentInactive(s); }); }
+function ratioDay(dateKey, includeHeld){
+  // The signature catches any booking/cancel/hold change since the arrays were last built.
   let seated=0, mins=0;
   sessions.forEach(function(s){ if(sessionTakesSeat(s)){ seated++; mins+=s.duration; } });
-  const sig=sessions.length+'|'+seated+'|'+mins+'|'+podDayOverrides.length;
-  if(ratioDayCache[dateKey] && ratioDayCache[dateKey].sig===sig) return ratioDayCache[dateKey];
+  const held=includeHeld? heldSpotStudents() : [];
+  const sig=sessions.length+'|'+seated+'|'+mins+'|'+podDayOverrides.length+'|'+held.map(function(s){ return s.id+s.recurring.length; }).join(',');
+  const cacheKey=dateKey+(includeHeld?'|held':'');
+  if(ratioDayCache[cacheKey] && ratioDayCache[cacheKey].sig===sig) return ratioDayCache[cacheKey];
   const n=ratioIdx(24*60), date=new Date(dateKey);
   const capIn=new Array(n).fill(0), capOn=new Array(n).fill(0), kidsIn=new Array(n).fill(0), kidsOn=new Array(n).fill(0);
   const onShift=[]; for(let i=0;i<n;i++) onShift.push({});
@@ -5017,11 +5026,19 @@ function ratioDay(dateKey){
     const arr=s.online? kidsOn : kidsIn;
     for(let i=ratioIdx(s.start); i<ratioIdx(s.start+s.duration) && i<n; i++) arr[i]++;
   });
-  return (ratioDayCache[dateKey]={capIn, capOn, kidsIn, kidsOn, sig});
+  const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
+  held.forEach(function(s){
+    if(s.startDate && toKey(s.startDate)>dateKey) return;
+    (s.recurring||[]).forEach(function(r){
+      if(r.weekday!==weekday) return;
+      for(let i=ratioIdx(r.start); i<ratioIdx(r.start+s.duration) && i<n; i++) kidsIn[i]++;
+    });
+  });
+  return (ratioDayCache[cacheKey]={capIn, capOn, kidsIn, kidsOn, sig});
 }
 // Fewest open places at any moment in [start, start+duration) — in person, or online.
-function ratioSeatsOpen(dateKey, start, duration, online){
-  const d=ratioDay(dateKey);
+function ratioSeatsOpen(dateKey, start, duration, online, includeHeld){
+  const d=ratioDay(dateKey, includeHeld);
   const cap=online? d.capOn : d.capIn, kids=online? d.kidsOn : d.kidsIn;
   let min=Infinity;
   for(let i=ratioIdx(start); i<ratioIdx(start+duration); i++) min=Math.min(min, cap[i]-kids[i]);
@@ -5037,7 +5054,7 @@ function openSeatsAt(dateKey, weekday, blockStart, year, blockLen){
     if(cov.instructorId && cov.boundary>blockStart) staffed++;
   });
   // Seats now come from the centre-wide ratio (Oct 2026, see ratioDay above), not Pod by Pod.
-  return {seats:ratioSeatsOpen(dateKey, blockStart, blockLen, false), staffed};
+  return {seats:ratioSeatsOpen(dateKey, blockStart, blockLen, false, true), staffed}; // held spots count here
 }
 // Combined (physical + online) peak headcount instructor X is minding, restricted to a window —
 // the Online counterpart to peakInWindow (used for Pods).
@@ -5462,13 +5479,53 @@ function defaultRecurring(count, duration){
   return out;
 }
 
+/* ---------- holding a spot before a family signs up (Oct 2026) ---------- */
+// Per Allie: "temporarily book in a student before they sign up, so we can sort of hold the spot for
+// a child, for up to one week, while the parent decides. if after a week they dont want to sign up,
+// the student gets deleted" — and "i dont want it to affect on-the-day availability, just permanent
+// availability". A held child has a regular schedule but no sessions: their times count against the
+// Availability Lookup and regular day/time changes only (ratioDay includeHeld). Confirming books
+// their sessions; releasing (or the nightly release_expired_spot_holds job once heldUntil has passed —
+// add_spot_holds.sql) deletes them, and a parent created just for the hold if nothing else uses it.
+var SPOT_HOLD_DAYS=7;
+function confirmSpotHold(studentId){
+  const s=findStudent(studentId);
+  if(!s || !s.heldUntil) return;
+  const parent=findParent(s.parentId);
+  if(!confirm('Confirm '+s.name+'\'s enrolment?\n\n'+recurringSummary(s)+' — their regular sessions will be booked from '+fmtShort(s.startDate && toKey(s.startDate)>toKey(simNow())? s.startDate : simNow())+'.')) return;
+  s.heldUntil=null; s.heldNewParent=false;
+  dbWrite('confirming a held spot', function(){ return supabaseClient.from('students').update({held_until:null, held_new_parent:false}).eq('id', s.id); });
+  const made=generateRecurringSessions(s, HORIZON_WEEKS);
+  toast(s.name+' enrolled — '+made+' standing session(s) booked.', 6000);
+  if(parent && !parent.authUserId && supabaseClient && currentUser && confirm('Send '+parent.name+' an invite to set up their login now?')) inviteLogin(parent.email, 'parent', parent.id, parent.name);
+}
+function releaseSpotHold(studentId){
+  const s=findStudent(studentId);
+  if(!s || !s.heldUntil) return;
+  const parent=findParent(s.parentId);
+  const dropParent = parent && s.heldNewParent && !parent.authUserId
+    && !students.some(function(x){ return x.id!==s.id && x.parentId===parent.id; })
+    && !studentGuardians.some(function(g){ return g.parentId===parent.id; });
+  if(!confirm('Release the spot held for '+s.name+'?\n\n'+s.name+' will be removed'+(dropParent? ', along with '+parent.name+'\'s parent record (only created for this hold)' : '')+'. This can\'t be undone.')) return;
+  students=students.filter(function(x){ return x.id!==s.id; });
+  sessions=sessions.filter(function(x){ return x.studentId!==s.id; });
+  if(dropParent) parents=parents.filter(function(p){ return p.id!==parent.id; });
+  refreshParentStudentIds();
+  dbWrite('releasing a held spot', function(){ return supabaseClient.from('students').delete().eq('id', s.id).then(function(r){
+    if(r.error || !dropParent) return r;
+    return supabaseClient.from('parents').delete().eq('id', parent.id);
+  }); });
+  toast('Spot released — '+s.name+' removed.');
+  render();
+}
+
 function openNewStudentForm(){
   const dur=90, spw=2;
   // startDate defaults to today (the common case — starting right away) but front desk can push it
   // out to whenever the family's actually starting (Sept 2026, per Allie: "its not always straight
   // away"); generateRecurringSessions() won't pre-book anything before it, and it's what drives the
   // Today-tab "first day" warning and the instructor-side "First day!" tag once that date arrives.
-  state.newStudentForm={ parentMode:'existing', parentId: parents[0]? parents[0].id : '', parentName:'', parentEmail:'', studentName:'', year:1, startDate:toKey(simNow()), sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), error:'' };
+  state.newStudentForm={ parentMode:'existing', parentId: parents[0]? parents[0].id : '', parentName:'', parentEmail:'', studentName:'', year:1, startDate:toKey(simNow()), sessionsPerWeek:spw, duration:dur, recurring:defaultRecurring(spw,dur), holdSpot:false, error:'' };
   render();
 }
 function closeNewStudentForm(){ state.newStudentForm=null; render(); }
@@ -5561,6 +5618,8 @@ function saveNewStudent(){
     parentId=newParent.id;
   }
   const newStudent={id:newId()||('s'+(nextStudentId++)), name:f.studentName.trim(), year:Number(f.year), baseYear:Number(f.year), yearBaseline:schoolYearIndex(simNow()), duration:Number(f.duration), sessionsPerWeek:Number(f.sessionsPerWeek), parentId, startDate:new Date(f.startDate), recurring:f.recurring.map(function(r){ return {weekday:r.weekday, start:r.start}; }), holds:[]};
+  // Hold spot (Oct 2026) — see SPOT_HOLD_DAYS / confirmSpotHold / releaseSpotHold.
+  if(f.holdSpot){ newStudent.heldUntil=addDays(new Date(toKey(simNow())), SPOT_HOLD_DAYS); newStudent.heldNewParent=!!newParentInsert; }
   // A Preferred Pod chosen at enrollment (5.30, per Allie) isn't a separate field/column — it's just
   // one of the student's very first standing Pod pins, written the same way "Change Pod"
   // (openStudentPodForm/saveStudentPodAssignment) writes any other one, effective from day one. That
@@ -5600,7 +5659,8 @@ function saveNewStudent(){
       return supabaseClient.from('students').insert({
         id:newStudent.id, parent_id:newStudent.parentId, name:newStudent.name, year:newStudent.year, base_year:newStudent.baseYear,
         year_baseline:newStudent.yearBaseline, duration:newStudent.duration, sessions_per_week:newStudent.sessionsPerWeek,
-        start_date:toKey(newStudent.startDate)
+        start_date:toKey(newStudent.startDate),
+        held_until: newStudent.heldUntil? toKey(newStudent.heldUntil) : null, held_new_parent: !!newStudent.heldNewParent
       });
     }).then(function(r){
       if(r.error || !newStudent.recurring.length) return r;
@@ -5624,7 +5684,9 @@ function saveNewStudent(){
   parent.studentIds.push(newStudent.id);
   const made=generateRecurringSessions(newStudent, HORIZON_WEEKS, deferredSessions);
   const uncovered=slotsWithoutCoverage(newStudent.recurring, newStudent.duration, newStudent.year);
-  if(uncovered.length){
+  if(newStudent.heldUntil){
+    toast('Spot held for '+newStudent.name+' ('+recurringSummary(newStudent)+') until '+fmtShort(newStudent.heldUntil)+'. Use "Confirm enrolment" on the Students list once '+parent.name+' decides — their sessions get booked then. If not confirmed by '+fmtShort(newStudent.heldUntil)+', '+newStudent.name+' is removed automatically.', 10000);
+  } else if(uncovered.length){
     toast(newStudent.name+' enrolled, but no Pod '+newStudent.name+' qualifies for (by age) is currently staffed for '+describeUncoveredSlots(uncovered)+' — 0 session(s) could be pre-booked for that time yet. Assign coverage on the Schedule tab, then reopen '+newStudent.name+'\'s regular schedule and save it again.', 9000);
   } else if(preferredPodAssignments.length && made===0){
     // Some Pod generically covers every chosen slot (uncovered came back empty) — so the reason
@@ -7054,7 +7116,7 @@ function regularSeatingRows(weekday){
   const anchorKey=toKey(anchor);
   const rows=[];
   students.forEach(function(student){
-    if(isStudentInactive(student)) return;
+    if(isStudentInactive(student) || student.heldUntil) return; // a held spot isn't seated until confirmed
     const starting = !!(student.startDate && toKey(student.startDate)>anchorKey);
     const date = starting? nextRegularOccurrence(weekday, student.startDate) : anchor;
     const dayKey=toKey(date);
@@ -8420,7 +8482,7 @@ function renderStudentsPanel(){
     '<button class="btn sm primary" onclick="openNewStudentForm()">+ Add student</button>');
   html+='<p>Set once at enrollment: school year, sessions per week (1 or 2), usual length, and a regular day/time for each. The system pre-books actual sessions from that automatically, up to '+HORIZON_WEEKS+' weeks ahead — staff can still move, cancel, or add one-off sessions by hand any time. To pause a student for a date range without losing their regular spot, use “+ Hold” on the Holds tab.</p>';
   html+='<table><tr><th>Student</th><th>Year</th><th>Plan</th><th>Regular schedule</th><th>Booked this week</th><th>Parent</th><th></th></tr>';
-  students.filter(function(s){ return !isStudentInactive(s); }).sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
+  students.filter(function(s){ return !isStudentInactive(s); }).sort(function(a,b){ return (!!b.heldUntil-!!a.heldUntil) || a.name.localeCompare(b.name); }).forEach(function(s){
     const parent=parents.find(function(p){ return p.id===s.parentId; });
     const booked=bookedThisWeek(s.id);
     const short = booked < s.sessionsPerWeek;
@@ -8435,6 +8497,14 @@ function renderStudentsPanel(){
     const upcomingStop=currentOrUpcomingPlanChange(s.id);
     const stopping = upcomingStop && upcomingStop.stopped;
     const notYetStarted = isStudentNotYetStarted(s);
+    if(s.heldUntil){
+      // Held spot (Oct 2026) — no sessions yet, just Confirm or Release.
+      html+='<tr style="background:var(--surface-2)"><td>'+s.name+' <span class="badge soon">Spot held until '+fmtShort(s.heldUntil)+'</span></td><td>'+yearLabel(s.year)+'</td><td>'+s.sessionsPerWeek+'x/week · '+s.duration+' min</td>'
+        +'<td class="small">'+recurringSummary(s)+(s.startDate && toKey(s.startDate)>toKey(simNow())? ' <span class="muted">from '+fmtShort(s.startDate)+'</span>' : '')+'</td>'
+        +'<td class="small muted">Not booked yet</td><td class="small">'+(parent? parent.name : '—')+'</td>'
+        +'<td><button class="btn sm primary" onclick="confirmSpotHold(\''+s.id+'\')">Confirm enrolment</button> <button class="btn sm ghost" onclick="openEditStudentForm(\''+s.id+'\')">Edit details</button> <button class="btn sm ghost" onclick="openRecurringForm(\''+s.id+'\')">Edit schedule</button> <button class="btn sm ghost" style="color:var(--danger)" onclick="releaseSpotHold(\''+s.id+'\')">Release spot</button></td></tr>';
+      return;
+    }
     html+='<tr><td>'+s.name
         +(notYetStarted? ' <span class="badge firstday">Starting '+fmtShort(s.startDate)+'</span>' : '')
         +(hold? ' <span class="badge hold">'+(holdActive?'On hold':'Hold from '+fmtShort(hold.start))+'</span>' : '')
@@ -9241,6 +9311,9 @@ function renderNewStudentModal(){
   html+='<label>Regular schedule</label>';
   html+='<p class="small muted" style="margin-top:-6px">Optionally set each session\'s own Preferred Pod — its default Pod going forward, as long as it has room. Front desk can still move '+(f.studentName.trim()||'them')+' to a different Pod any time from the Students list ("Change Pod").</p>';
   html+=renderRecurringPickers(f.recurring, starts, 'setNSFRecurring', 'setNSFRecurring');
+  html+='<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-weight:400;margin-top:12px;padding:8px;border:1px solid var(--border);border-radius:8px">'
+    +'<input type="checkbox" style="width:auto;margin:3px 0 0" '+(f.holdSpot?'checked':'')+' onchange="setNSF(\'holdSpot\',this.checked)"/>'
+    +'<span><b>Hold the spot only</b> — the parent is still deciding. These regular times are kept off the permanent availability for '+SPOT_HOLD_DAYS+' days (until '+fmtShort(addDays(new Date(toKey(simNow())), SPOT_HOLD_DAYS))+'), without booking any sessions or affecting on-the-day availability. Confirm the enrolment from the Students list once they decide (sessions are booked then); otherwise '+(f.studentName.trim()||'the child')+' is removed automatically.</span></label>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   // Same-name warning (Oct 2026) — see activeStudentsNamed()/saveNewStudent().
   const dupes=(f.duplicateOf||[]).map(findStudent).filter(Boolean);
@@ -9257,7 +9330,7 @@ function renderNewStudentModal(){
   }
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeNewStudentForm()">Cancel</button>'
-    +'<button class="btn primary" onclick="saveNewStudent()">Enroll student</button>'
+    +'<button class="btn primary" onclick="saveNewStudent()">'+(f.holdSpot? 'Hold spot' : 'Enroll student')+'</button>'
   +'</div>';
   html+='</div></div>';
   return html;
@@ -10471,7 +10544,7 @@ function renderParent(){
     // Belt-and-suspenders alongside the studentIds-resync fix in fetchStudentsGroup(): if this id
     // still somehow doesn't resolve (a stale render mid-refresh, a genuinely removed student), skip
     // just this card instead of crashing the whole parent view on the next line's student.name.
-    if(!student) return;
+    if(!student || student.heldUntil) return; // held spot (Oct 2026) — not shown to the parent until confirmed
     const studentCredits=credits.filter(function(c){ return c.studentId===sid; })
       .sort(function(a,b){ return a.expiryDate-b.expiryDate; });
     const initials=student.name.split(' ').filter(Boolean).slice(0,2).map(function(w){ return w[0]; }).join('').toUpperCase();
@@ -10627,7 +10700,7 @@ function renderParentSummerTab(parent){
 
   parent.studentIds.forEach(function(sid){
     const student=findStudent(sid);
-    if(!student) return; // same defensive guard as renderParent() — see its own comment
+    if(!student || student.heldUntil) return; // same defensive guard as renderParent() — see its own comment
     const total=studentTermBreakCredits(tb, sid);
     const remaining=studentTermBreakRemaining(tb, sid);
     const used=total-remaining;
@@ -11427,7 +11500,7 @@ function fetchPodDayOverridesGroup(){
 function fetchStudentsGroup(){
   const mySeq=nextGroupSeq('students');
   return Promise.all([
-    fetchTablePaginated('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date,stopped_from'),
+    fetchTablePaginated('students','id,parent_id,name,year,base_year,year_baseline,duration,sessions_per_week,notes,start_date,stopped_from,held_until,held_new_parent'),
     fetchTablePaginated('student_recurring_slots','student_id,weekday,start_min'),
     fetchTablePaginated('student_holds','id,student_id,start_date,end_date,note,credits_issued'),
     fetchTablePaginated('student_pod_assignments','id,student_id,pod_id,effective_from,weekday,online,instructor_id'),
@@ -11445,6 +11518,7 @@ function fetchStudentsGroup(){
       // was never loaded at all, so isStudentInactive() only ever held for the one tab that happened to
       // apply the stop, and only until its next refresh.
       stoppedFrom: r.stopped_from? new Date(r.stopped_from) : null,
+      heldUntil: r.held_until? new Date(r.held_until) : null, heldNewParent: !!r.held_new_parent, // spot hold (Oct 2026)
       recurring: slotRows.filter(function(s){ return s.student_id===r.id; }).map(function(s){ return {weekday:s.weekday, start:s.start_min}; }),
       holds: holdRows.filter(function(h){ return h.student_id===r.id; }).map(function(h){ return {id:h.id, start:new Date(h.start_date), end:new Date(h.end_date), note:h.note||'', creditsIssued:h.credits_issued||0}; }),
       podAssignments: podAssignRows.filter(function(a){ return a.student_id===r.id; }).map(function(a){ return {podId:a.pod_id, effectiveFrom:new Date(a.effective_from), weekday:a.weekday||null, online:a.online||false, instructorId:a.instructor_id||null}; }),
