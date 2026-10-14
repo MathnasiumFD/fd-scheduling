@@ -6891,7 +6891,9 @@ function renderLiveOccupancyBoard(dayKey){
       const headAttrs = live? ' style="cursor:pointer" onclick="openQuickCoverageForm(\''+g.podId+'\')" title="Quick same-day coverage change"' : '';
       const instr=podInstructorLabel(g.podId, dayKey);
       return '<div class="cal-head"'+headAttrs+'>'+g.label+' <span class="badge '+(occupancy>=cap?'full':'available')+'" style="margin-left:4px">'+occupancy+'/'+cap+'</span>'
-        +(instr? '<br><span class="small muted">'+instr.name+' · '+instr.from+'–'+instr.until+'</span>' : '')
+        // Name in red, start blue, end purple, the times kept on one line (Oct 2026, per Allie).
+        +(instr? '<br><span class="small" style="color:var(--danger)">'+instr.name+'</span>'
+          +'<br><span class="small" style="white-space:nowrap"><span style="color:var(--online)">'+instr.from+'</span><span class="muted">–</span><span style="color:var(--purple)">'+instr.until+'</span></span>' : '')
       +'</div>';
     }).join('');
     for(let seat=0; seat<maxCap; seat++){
