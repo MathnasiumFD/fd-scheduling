@@ -6831,10 +6831,14 @@ function podInstructorLabel(podId, dayKey){
   // with no block of their own, then the Pod block, same as before.
   const shift=instructorShiftEndOn(instrId, date);
   const avail=instructorAvailabilityOn(instrId, date);
-  let until;
+  let until, from;
   if(shift) until = (avail && avail.end<shift.end)? minToLabel(avail.end) : (shift.closesLate? 'Close' : minToLabel(shift.end));
   else until = avail? minToLabel(avail.end) : (block.closesLate? 'Close' : minToLabel(block.end));
-  return {name: findInstructor(instrId).name, until: until};
+  // Start time too (Oct 2026, per Allie): same rule mirrored — the earliest block they cover that
+  // day in any Pod, pushed later if their availability that day starts later (a one-off "in at 4").
+  if(shift) from = minToLabel((avail && avail.start>shift.start)? avail.start : shift.start);
+  else from = minToLabel(avail? avail.start : block.start);
+  return {name: findInstructor(instrId).name, until: until, from: from};
 }
 // When an instructor's rostered day actually ends: the latest-ending shift block they're covering
 // on this date in any Pod (one-off coverage swaps included, via blockInstructorOn). null if they
@@ -6844,7 +6848,8 @@ function instructorShiftEndOn(instructorId, date){
   pods.forEach(function(pod){
     podShiftsOn(pod.id, date).forEach(function(b){ // day overrides included (Oct 2026)
       if(b.instructorId!==instructorId) return;
-      if(!latest || b.end>latest.end || (b.end===latest.end && b.closesLate)) latest={end:b.end, closesLate:!!b.closesLate};
+      if(!latest || b.end>latest.end || (b.end===latest.end && b.closesLate)) latest={end:b.end, closesLate:!!b.closesLate, start:latest? latest.start : b.start};
+      latest.start=Math.min(latest.start, b.start); // earliest start that day (for "who's here" from–until)
     });
   });
   return latest;
@@ -6886,7 +6891,7 @@ function renderLiveOccupancyBoard(dayKey){
       const headAttrs = live? ' style="cursor:pointer" onclick="openQuickCoverageForm(\''+g.podId+'\')" title="Quick same-day coverage change"' : '';
       const instr=podInstructorLabel(g.podId, dayKey);
       return '<div class="cal-head"'+headAttrs+'>'+g.label+' <span class="badge '+(occupancy>=cap?'full':'available')+'" style="margin-left:4px">'+occupancy+'/'+cap+'</span>'
-        +(instr? '<br><span class="small muted">'+instr.name+' · until '+instr.until+'</span>' : '')
+        +(instr? '<br><span class="small muted">'+instr.name+' · '+instr.from+'–'+instr.until+'</span>' : '')
       +'</div>';
     }).join('');
     for(let seat=0; seat<maxCap; seat++){
