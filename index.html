@@ -4936,10 +4936,16 @@ function saveAssignmentChange(podId, weekday, blockId){
   // the old error message showing even though this save just succeeded (Sept 2026, found while fixing
   // #252 above).
   f.error='';
+  // Re-assigning the same shift from the same date REPLACES that date's assignment (Oct 2026) — it
+  // used to add another row, so switching Allie ↔ Sanvi a few times left 8 rows dated the same day
+  // and, after a reload, which one counted was down to chance.
+  block.assignments=block.assignments.filter(function(a){ return toKey(a.effectiveFrom)!==toKey(effDate); });
   block.assignments.push({instructorId:draft.instructorId, effectiveFrom:effDate});
-  dbWrite('assigning instructor to shift', function(){ return supabaseClient.from('pod_shift_assignments').insert({
-    block_id:blockId, instructor_id:draft.instructorId, effective_from:draft.effectiveFrom
-  }); });
+  dbWrite('assigning instructor to shift', function(){ return supabaseClient.from('pod_shift_assignments').delete()
+    .eq('block_id', blockId).eq('effective_from', draft.effectiveFrom).then(function(r){
+      if(r.error) return r;
+      return supabaseClient.from('pod_shift_assignments').insert({ block_id:blockId, instructor_id:draft.instructorId, effective_from:draft.effectiveFrom });
+    }); });
   delete f.drafts[blockId];
   regenerateAllRecurring();
   toast(findInstructor(draft.instructorId).name+' assigned to '+findPod(podId).name+'’s '+weekday+' '+blockRangeLabel(block)+' shift, starting '+fmtShort(effDate)+'.');
