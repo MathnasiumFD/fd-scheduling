@@ -4998,7 +4998,7 @@ function ratioIdx(min){ return Math.floor(min/RATIO_STEP); }
 // dont want it to affect on-the-day availability, just permanent availability").
 function heldSpotStudents(){ return students.filter(function(s){ return s.heldUntil && !isStudentInactive(s); }); }
 function ratioDay(dateKey, includeHeld){
-  // The signature catches any booking/cancel/hold change since the arrays were last built.
+  // Cleared on every render(); the signature also catches a booking/cancel/hold made between renders.
   let seated=0, mins=0;
   sessions.forEach(function(s){ if(sessionTakesSeat(s)){ seated++; mins+=s.duration; } });
   const held=includeHeld? heldSpotStudents() : [];
@@ -6345,6 +6345,9 @@ function render(){
   const pageY=window.pageYOffset||document.documentElement.scrollTop||0;
   const prevOverlay=app.querySelector('.overlay');
   const overlayY=prevOverlay? prevOverlay.scrollTop : 0;
+  // Fresh ratio numbers every screen update, so a shift edit (times, instructor, one-off cover)
+  // shows straight away in the Availability Lookup and parents' options (Oct 2026).
+  clearRatioCache();
   app.innerHTML = renderTop() + renderTabs() + renderRole() + (state.toast? '<div class="toast">'+state.toast+'</div>':'') + renderFooter();
   if(Math.abs((window.pageYOffset||document.documentElement.scrollTop||0)-pageY)>1) window.scrollTo(0, pageY);
   const newOverlay=app.querySelector('.overlay');
