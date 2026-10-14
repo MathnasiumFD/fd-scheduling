@@ -4948,7 +4948,20 @@ function saveAssignmentChange(podId, weekday, blockId){
     }); });
   delete f.drafts[blockId];
   regenerateAllRecurring();
-  toast(findInstructor(draft.instructorId).name+' assigned to '+findPod(podId).name+'’s '+weekday+' '+blockRangeLabel(block)+' shift, starting '+fmtShort(effDate)+'.');
+  // One-off covers they're already doing elsewhere at this time on an upcoming date (Oct 2026) — the
+  // clash check above only looks at regular shifts, so say so rather than double-book them silently.
+  const coverClashes=[];
+  for(const otherPodId in podSchedule){
+    if(otherPodId===podId) continue;
+    podBlocksForDay(otherPodId, weekday).forEach(function(ob){
+      if(!(ob.start<block.end && block.start<ob.end)) return;
+      (ob.oneOffCoverage||[]).forEach(function(o){
+        if(o.instructorId===draft.instructorId && toKey(o.date)>=toKey(effDate)) coverClashes.push(fmtShort(o.date)+' ('+findPod(otherPodId).name+')');
+      });
+    });
+  }
+  toast(findInstructor(draft.instructorId).name+' assigned to '+findPod(podId).name+'’s '+weekday+' '+blockRangeLabel(block)+' shift, starting '+fmtShort(effDate)+'.'
+    +(coverClashes.length? ' Heads up: they\'re already covering another Pod at that time on '+coverClashes.join(', ')+' — sort out who covers this shift on '+(coverClashes.length===1?'that day':'those days')+'.' : ''), coverClashes.length? 12000 : undefined);
   render();
 }
 function removeAssignment(podId, weekday, blockId, effectiveFromKey){
@@ -5014,8 +5027,16 @@ function ratioDay(dateKey, includeHeld){
   const n=ratioIdx(24*60), date=new Date(dateKey);
   const capIn=new Array(n).fill(0), capOn=new Array(n).fill(0), kidsIn=new Array(n).fill(0), kidsOn=new Array(n).fill(0);
   const onShift=[]; for(let i=0;i<n;i++) onShift.push({});
+  // Permanent checks (includeHeld) use the STANDING roster — no one-off covers or one-day changes —
+  // so a one-off week doesn't skew the regular picture (Oct 2026, per Allie: Sanvi covering Pod 5 as a
+  // one-off on the Lookup's Tuesday meant her regular Pod 1 shift added nothing there). On-the-day
+  // checks use who's actually on that date.
+  const weekdayKey=WEEKDAY_KEYS[(date.getDay()+6)%7];
   pods.forEach(function(pod){
-    podShiftsOn(pod.id, date).forEach(function(sh){
+    const shifts = includeHeld
+      ? podBlocksForDay(pod.id, weekdayKey).map(function(b){ return {start:b.start, end:b.end, instructorId:blockInstructorOngoing(b, date)}; })
+      : podShiftsOn(pod.id, date);
+    shifts.forEach(function(sh){
       if(!sh.instructorId) return;
       for(let i=ratioIdx(sh.start); i<ratioIdx(sh.end) && i<n; i++) onShift[i][sh.instructorId]=true;
     });
