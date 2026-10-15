@@ -3080,7 +3080,10 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
     const monday=addDays(startMonday, w*7);
     WEEKDAY_KEYS.forEach(function(weekday, dayIdx){
       const date=addDays(monday, dayIdx);
-      if(date < new Date(toKey(simNow()))) return; // never backfill the past
+      // never backfill the past — compared as YYYY-MM-DD (Oct 2026): `new Date(toKey(now))` is UTC
+      // midnight, i.e. ~10–11am in Sydney, so comparing Dates treated TODAY as already past and a
+      // same-day schedule change ("change today too") never booked today's new session.
+      if(toKey(date) < toKey(simNow())) return;
       // Compared as YYYY-MM-DD strings, not raw Date objects — `date` here is built via local-time
       // arithmetic (addDays) while `new Date(toKey(student.startDate))` would parse as UTC midnight,
       // and in any timezone ahead of UTC that makes a same-calendar-day Date compare as "earlier"
@@ -5336,7 +5339,51 @@ function fulfillWaitlistEntry(id){
   }
   const student=findStudent(w.studentId);
   const fromLabel = w.swapWeekday? w.swapWeekday+' '+minToLabel(w.swapStart) : 'their current schedule';
-  if(!confirm('Move '+student.name+' from '+fromLabel+' to '+w.weekday+' '+minToLabel(w.start)+' now?')) return;
+  // A regular session today (Oct 2026, per Allie: "if they had a session for today, i want it to give
+  // me the option to change todays or go from next one"). Not checked in yet → ask (waitlistMoveForm).
+  // Already checked in → the change starts tomorrow, so they never end up with two sessions today.
+  const todayKey=toKey(simNow());
+  const todays=sessions.filter(function(s){ return s.studentId===student.id && s.recurring && toKey(s.date)===todayKey && (s.status==='scheduled' || s.status==='attended'); });
+  const tomorrow=addDays(new Date(todayKey), 1);
+  if(todays.some(function(s){ return s.status==='attended'; })){
+    if(!confirm('Move '+student.name+' from '+fromLabel+' to '+w.weekday+' '+minToLabel(w.start)+'?\n\nThey\'ve already checked in today, so the new time starts from '+fmtShort(tomorrow)+'.')) return;
+    doWaitlistMove(id, tomorrow);
+  } else if(todays.length){
+    state.waitlistMoveForm={id, studentName:student.name, fromLabel, toLabel:w.weekday+' '+minToLabel(w.start), todayLabel:todays.map(function(s){ return rangeLabel(s.start,s.duration); }).join(', ')};
+    render();
+  } else {
+    if(!confirm('Move '+student.name+' from '+fromLabel+' to '+w.weekday+' '+minToLabel(w.start)+' now?')) return;
+    doWaitlistMove(id, new Date(todayKey));
+  }
+}
+function closeWaitlistMoveForm(){ state.waitlistMoveForm=null; render(); }
+function confirmWaitlistMove(fromToday){
+  const f=state.waitlistMoveForm;
+  if(!f) return;
+  state.waitlistMoveForm=null;
+  const todayKey=toKey(simNow());
+  doWaitlistMove(f.id, fromToday? new Date(todayKey) : addDays(new Date(todayKey), 1));
+}
+function renderWaitlistMoveModal(){
+  const f=state.waitlistMoveForm;
+  if(!f) return '';
+  return '<div class="overlay" onclick="if(event.target===this) closeWaitlistMoveForm()"><div class="modal">'
+    +'<h3>Move '+f.studentName+' to '+f.toLabel+'</h3>'
+    +'<p>'+f.studentName+' has a session <b>today</b> ('+f.todayLabel+'). When should the change start?</p>'
+    +'<div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">'
+      +'<button class="btn primary" onclick="confirmWaitlistMove(true)">Change today too</button>'
+      +'<div class="small muted" style="margin-top:-4px">Today\'s session is replaced by the new schedule — moved to the new time if it\'s also today, otherwise dropped.</div>'
+      +'<button class="btn" onclick="confirmWaitlistMove(false)">Start from their next session</button>'
+      +'<div class="small muted" style="margin-top:-4px">Today\'s session stays as it is; the new time applies from tomorrow.</div>'
+    +'</div>'
+    +'<div style="display:flex;justify-content:flex-end;margin-top:14px"><button class="btn ghost" onclick="closeWaitlistMoveForm()">Cancel</button></div>'
+  +'</div></div>';
+}
+function doWaitlistMove(id, effectiveFrom){
+  const w=waitlist.find(function(x){ return x.id===id; });
+  if(!w || w.status!=='waiting') return;
+  const student=findStudent(w.studentId);
+  if(!student) return;
   // Swap the one slot they're giving up for the new one, keeping every other standing session of
   // theirs exactly as-is — same "current day -> desired day" pairing the swap UI has shown all along.
   let newRecurring;
@@ -5350,7 +5397,7 @@ function fulfillWaitlistEntry(id){
   } else {
     newRecurring=(student.recurring||[]).concat([{weekday:w.weekday, start:w.start}]); // no specific slot was being given up (e.g. an extra session) — just add the new one
   }
-  applyTimeChange(student, simNow(), newRecurring, 'Waitlist match', false);
+  applyTimeChange(student, effectiveFrom, newRecurring, 'Waitlist match', false);
   removeWaitlistEntry(id); // the family has their slot now — no longer waiting
 }
 
@@ -7734,6 +7781,7 @@ function renderStaff(){
   html+=renderCheckOutModal();
   html+=renderMoveModal();
   html+=renderWaitlistModal();
+  html+=renderWaitlistMoveModal();
   html+=renderClosedDayModal();
 
   return html;
