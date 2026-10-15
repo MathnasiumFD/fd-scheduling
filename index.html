@@ -5145,7 +5145,7 @@ function upcomingSlotDeparture(studentId, weekday, blockStart, blockLen){
   return null;
 }
 // "There are no waitlists on that time slot" (Allie's own wording) — a plain day+time match, same
-// granularity the waitlist itself is matched on elsewhere (waitlistOpenSeat/pickBestPodWithClaims
+// granularity the waitlist itself is matched on elsewhere (waitlistOpenSeat/waitlistEntryRoom
 // don't pin a Pod either); if anyone's already queued for it, the first real opening is already
 // spoken for, so it's not something to advertise to a brand-new inquiry.
 function weekdaySlotHasWaitlist(weekday, start){
@@ -5196,48 +5196,23 @@ function nextDateForWeekday(fromDate, weekday){
   while(WEEKDAY_KEYS[(d.getDay()+6)%7]!==weekday){ d=addDays(d,1); }
   return d;
 }
-// Same peak-headcount calculation as peakConcurrency, but can also account for seats already
-// virtually claimed by other waitlist entries in the same first-in-first-served pass (see
-// waitlistClaimsBefore) — so two families waiting for the same Pod/date don't both get told the
-// same single opening is theirs.
-function peakConcurrencyWithClaims(podId, dateKey, extra, claims){
-  const raw = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
+// Waitlist openings use the same centre-wide staff ratio as the Availability Lookup (Oct 2026, per
+// Allie: "switch to ratio") — the permanent view (regular roster, held spots counted, see ratioDay),
+// at the next real occurrence of the wanted weekday — so the waitlist and the Lookup always agree.
+// First in, first served: each waiting entry ahead in the queue that fits claims one place for its
+// window. An existing student swapping within the SAME day frees their own place if the two overlap.
+function waitlistEntryRoom(entry, claims){
+  const date=nextRegularOccurrence(entry.weekday, simNow());
+  const dateKey=toKey(date);
+  let room=ratioSeatsOpen(dateKey, entry.start, entry.duration, false, true);
+  const student=entry.studentId? findStudent(entry.studentId) : null;
+  if(student && entry.swapWeekday===entry.weekday && entry.swapStart!=null
+     && entry.swapStart<entry.start+entry.duration && entry.start<entry.swapStart+student.duration) room++;
   (claims||[]).forEach(function(c){
-    if(c.podId===podId && c.dateKey===dateKey) raw.push({start:c.start, end:c.start+c.duration});
+    if(c.dateKey===dateKey && c.start<entry.start+entry.duration && entry.start<c.start+c.duration) room--;
   });
-  if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
-  return peakConcurrencyOf(raw); // same handover forgiveness as peakConcurrency (STUDENT_OVERLAP_TOLERANCE_MIN)
+  return {room, date, dateKey};
 }
-// Same tolerated one-seat/15-minute capacity pinch as podCapacityBlocked, but also accounting for
-// other waitlist entries ahead of this one in the queue (see peakConcurrencyWithClaims).
-function podCapacityBlockedWithClaims(podId, dateKey, extra, claims){
-  const raw = sessionsForDay(podId, dateKey).map(function(s){ return {start:s.start, end:s.start+s.duration}; });
-  (claims||[]).forEach(function(c){
-    if(c.podId===podId && c.dateKey===dateKey) raw.push({start:c.start, end:c.start+c.duration});
-  });
-  if(extra) raw.push({start:extra.start, end:extra.start+extra.duration});
-  return capacityOverflowViolation(raw, podCapacity(podId));
-}
-// Same "first staffed, under-capacity Pod wins, no age consideration" logic as pickBestPod (Sept
-// 2026) — kept as a separate function only because it also has to account for other waitlist
-// entries ahead of this one in the queue that would already claim a seat (`claims`, via
-// peakConcurrencyWithClaims) before this entry ever gets to see it. Kept in sync with pickBestPod
-// deliberately; if that logic changes again, this needs the same change.
-function pickBestPodWithClaims(weekday, dateKey, start, duration, year, claims){
-  const date=new Date(dateKey);
-  for(let i=0;i<pods.length;i++){
-    const podId=pods[i].id;
-    const cov=podCoverageDetail(podId, weekday, start, duration, date);
-    if(!cov.primaryInstructorId || !cov.ok) continue;
-    if(podCapacityBlockedWithClaims(podId, dateKey, {start, duration}, claims)) continue;
-    return podId;
-  }
-  return null;
-}
-// First-in-first-served (5.17): every waiting entry strictly older (by dateAdded) than this one
-// gets to "claim" its seat first. Walks the queue oldest-first, and for each entry ahead of this
-// one that currently resolves to a real Pod, reserves that Pod/date/time so a later entry can't
-// also be told the exact same opening is theirs.
 function waitlistClaimsBefore(entry){
   const claims=[];
   const waiting=waitlist.filter(function(w){ return w.status==='waiting'; })
@@ -5245,31 +5220,19 @@ function waitlistClaimsBefore(entry){
   for(let i=0;i<waiting.length;i++){
     const w=waiting[i];
     if(entry && w.id===entry.id) break; // reached this entry's own place in the queue
-    const year = w.studentId? findStudent(w.studentId).year : w.year;
-    const dateKey = toKey(nextDateForWeekday(simNow(), w.weekday));
-    const podId = pickBestPodWithClaims(w.weekday, dateKey, w.start, w.duration, year, claims);
-    if(podId) claims.push({podId, dateKey, start:w.start, duration:w.duration, year:year});
+    const r=waitlistEntryRoom(w, claims);
+    if(r.room>0) claims.push({dateKey:r.dateKey, start:w.start, duration:w.duration});
   }
   return claims;
 }
-// Is there actually a seat for this entry right now, once everyone who's been waiting longer for
-// an overlapping slot has first claim on whatever's open? Reuses the same coverage/qualification/
-// capacity check standing bookings rely on (5.8), against the soonest upcoming occurrence of the
-// entry's weekday. An existing student's CURRENT year is used (so a promotion, 5.9, is reflected
-// automatically); a new enquiry uses whatever year was logged at the time they were added.
+// Is there a place for this entry right now, once everyone who's been waiting longer has first claim?
 function waitlistOpenSeat(entry){
-  const year = entry.studentId? findStudent(entry.studentId).year : entry.year;
-  const date = nextDateForWeekday(simNow(), entry.weekday);
-  const claims = waitlistClaimsBefore(entry);
-  const podId = pickBestPodWithClaims(entry.weekday, toKey(date), entry.start, entry.duration, year, claims);
-  return podId? {podId, date} : null;
+  const r=waitlistEntryRoom(entry, waitlistClaimsBefore(entry));
+  return r.room>0? {date:r.date} : null;
 }
-// For the panel only: would this entry have a seat if the queue were ignored? Used to tell "someone
-// who's been waiting longer has first claim on this one" apart from "nothing is open here at all."
+// For the panel only: would this entry have a place if the queue were ignored?
 function waitlistWouldFitIgnoringQueue(entry){
-  const year = entry.studentId? findStudent(entry.studentId).year : entry.year;
-  const dateKey = toKey(nextDateForWeekday(simNow(), entry.weekday));
-  return !!pickBestPodWithClaims(entry.weekday, dateKey, entry.start, entry.duration, year, []);
+  return waitlistEntryRoom(entry, []).room>0;
 }
 function openWaitlistForm(weekday, start){
   state.waitlistForm={mode:'existing', studentId:'', name:'', year:1, weekday: weekday||'Mon', start: start!=null? start : AVAIL_BLOCKS[0], duration:60, note:'', error:'', swapWeekday:'', swapStart:null};
@@ -5351,19 +5314,6 @@ function removeWaitlistEntry(id){
   const w=waitlist.find(function(x){ return x.id===id; });
   if(w) w.status='removed';
   dbWrite('removing from waitlist', function(){ return supabaseClient.from('waitlist_entries').update({status:'removed'}).eq('id', id); });
-  render();
-}
-// Front desk has decided to reach out now that a seat exists — records that the family was
-// contacted, but deliberately doesn't book anything itself: the actual booking (5.1) or new
-// enrollment (5.6) is a separate, already-built flow, so this never duplicates that logic.
-function notifyWaitlistEntry(id){
-  const w=waitlist.find(function(x){ return x.id===id; });
-  if(!w) return;
-  const seat=waitlistOpenSeat(w);
-  if(!seat){ toast('No open seat right now for that slot.'); return; }
-  w.notified=true;
-  dbWrite('marking waitlist entry notified', function(){ return supabaseClient.from('waitlist_entries').update({notified:true}).eq('id', id); });
-  toast('Contacted '+w.name+' — a seat is open '+w.weekday+' '+fmtShort(seat.date)+' '+rangeLabel(w.start,w.duration)+'. Remove them from the waitlist once booked.');
   render();
 }
 // Front desk actually applying the swap once a seat has opened, rather than just notifying and then
@@ -8088,7 +8038,7 @@ function renderWaitlistPanel(){
   let html=sectionOpen('waitlist','Waitlist',
     '<div style="display:flex;gap:6px"><span class="small muted">'+waiting.length+'</span>'
     +'<button class="btn sm" onclick="openWaitlistForm()">+ Add to waitlist</button></div>');
-  html+='<p>Families waiting for a Mon–Fri day/time that\'s currently full or unstaffed — matched on day, time, and session length, not a specific Pod, the same way a regular booking auto-picks whichever Pod fits (5.8). First in, first served: when a slot opens up, whoever\'s been waiting longest for it gets flagged first — a later entry won\'t show that same opening until the family ahead of them is booked or removed. When a seat opens for an existing student\'s swap, "Move now" applies it immediately (same as approving their own change request); for a brand-new enquiry, enrol them through the usual new-student (5.6) flow instead, then remove this entry.</p>';
+  html+='<p>Families waiting for a Mon–Fri day/time that\'s currently full or unstaffed — matched on day, time and session length, and checked against the same centre-wide staff ratio as the Availability Lookup. First in, first served: when a slot opens up, whoever\'s been waiting longest for it gets flagged first — a later entry won\'t show that same opening until the family ahead of them is booked or removed. When a seat opens for an existing student\'s swap, "Move now" applies it immediately (same as approving their own change request); for a brand-new enquiry, enrol them through the usual new-student (5.6) flow instead, then remove this entry.</p>';
   if(waiting.length===0){ html+='<div class="empty-note">Nobody currently waiting.</div>'; }
   else{
     html+='<table><tr><th>Day / time wanted</th><th>Swapping out</th><th>Name</th><th>Year</th><th>Added</th><th>Note</th><th>Status</th><th></th></tr>';
@@ -8103,7 +8053,7 @@ function renderWaitlistPanel(){
         ? w.swapWeekday+' '+minToLabel(w.swapStart)
         : (w.studentId? '<span class="small muted">—</span>' : '<span class="small muted">New enquiry</span>');
       const statusCell = seat
-        ? '<span class="badge available">Seat open — '+findPod(seat.podId).name+' '+fmtShort(seat.date)+'</span>'+(w.notified? ' <span class="small muted">(contacted)</span>' : '')
+        ? '<span class="badge available">Seat open from '+fmtShort(seat.date)+'</span>'
         : (waitlistWouldFitIgnoringQueue(w)? '<span class="small muted">Open, but someone ahead of you in line for it</span>' : '<span class="small muted">Still full</span>');
       html+='<tr><td>'+w.weekday+' '+rangeLabel(w.start,w.duration)+'</td>'
         +'<td>'+swapCell+'</td>'
@@ -8112,8 +8062,8 @@ function renderWaitlistPanel(){
         +'<td class="small muted">'+fmtShort(w.dateAdded)+'</td>'
         +'<td class="small muted">'+(w.note||'—')+'</td>'
         +'<td>'+statusCell+'</td>'
-        +'<td>'+(seat? '<button class="btn sm primary" style="margin:2px" onclick="notifyWaitlistEntry(\''+w.id+'\')">'+(w.notified?'Contact again':'Notify')+'</button>' : '')
-          +(seat && w.studentId? '<button class="btn sm primary" style="margin:2px" onclick="fulfillWaitlistEntry(\''+w.id+'\')">Move now</button>' : '')
+        // No "Notify" button (Oct 2026, per Allie: "I'll reach out to parents myself").
+        +'<td>'+(seat && w.studentId? '<button class="btn sm primary" style="margin:2px" onclick="fulfillWaitlistEntry(\''+w.id+'\')">Move now</button>' : '')
           +'<button class="btn sm ghost" style="margin:2px" onclick="removeWaitlistEntry(\''+w.id+'\')">Remove</button></td></tr>';
     });
     html+='</table>';
