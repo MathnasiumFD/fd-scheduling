@@ -776,6 +776,7 @@ function podShiftsOn(podId, date){
 // picks a qualified, available replacement for just that date via fillCoverageRequest(), which
 // records the swap in the block's own oneOffCoverage list (see shiftBlock()/blockInstructorOn()).
 var coverageRequests=[];
+var coverageOffers=[]; // instructors offering to cover an open request (Oct 2026 — see offerToCover)
 var nextCoverageId=1;
 
 // A day/time waitlist (5.17) — front desk logs demand for a Mon-Fri slot that's currently full,
@@ -7895,9 +7896,21 @@ function renderCoverageRequestsPanel(){
   const open=coverageRequests.filter(function(r){ return r.status==='open'; }).sort(function(a,b){ return new Date(a.date)-new Date(b.date); });
   if(open.length===0) return '';
   let html=sectionOpen('coverage','⚠️ Shifts needing coverage','<span class="small muted">'+open.length+'</span>');
-  html+='<p>An instructor has flagged they can\'t work one of their shifts — every qualified, available instructor was emailed the moment it was raised. Pick a replacement for just that date — their regular assignment is untouched every other day. If it\'s already been sorted out face-to-face in the centre, use "Assign directly" to record whoever agreed to cover, even if they\'re not in the suggested list. If nobody at all is available, the manager is emailed automatically so it doesn\'t sit unnoticed.</p>';
-  html+='<table><tr><th>Date</th><th>Pod / shift</th><th>Requested by</th><th>Emailed</th><th>Cover with</th><th>Assign directly</th></tr>';
+  html+='<p>An instructor has flagged they can\'t work one of their shifts — every qualified, available instructor was emailed the moment it was raised. Instructors can also <b>offer to cover</b> from their own page (even outside their usual hours): <b>Accept</b> one to give them the shift (everyone else who offered is told it\'s sorted), or <b>Decline</b> — each gets an email either way. Or pick a replacement for just that date — their regular assignment is untouched every other day. If it\'s already been sorted out face-to-face in the centre, use "Assign directly" to record whoever agreed to cover, even if they\'re not in the suggested list. If nobody at all is available, the manager is emailed automatically so it doesn\'t sit unnoticed.</p>';
+  html+='<table><tr><th>Date</th><th>Pod / shift</th><th>Requested by</th><th>Offers to cover</th><th>Emailed</th><th>Cover with</th><th>Assign directly</th></tr>';
   open.forEach(function(r){
+    // Instructors who offered to cover (Oct 2026, see offerToCover) — Accept fills the shift and
+    // declines the rest; each gets an email with the outcome.
+    const offers=pendingCoverOffers(r.id);
+    const offersCell = offers.length
+      ? offers.map(function(o){
+          const who=findInstructor(o.instructorId);
+          const clash=coverOfferClash(r, o.instructorId);
+          return '<div style="margin:2px 0"><b class="small">'+(who? who.name : '—')+'</b>'+(clash? ' <span class="small" style="color:var(--warning)">(on '+clash+')</span>' : '')
+            +'<br><button class="btn sm primary" style="margin:2px 2px 0 0" onclick="acceptCoverOffer(\''+o.id+'\')">Accept</button>'
+            +'<button class="btn sm ghost" style="margin-top:2px" onclick="declineCoverOffer(\''+o.id+'\')">Decline</button></div>';
+        }).join('')
+      : '<span class="small muted">None yet</span>';
     const pod=findPod(r.podId);
     const block=podBlocksForDay(r.podId, r.weekday).find(function(b){ return b.id===r.blockId; });
     const requester=findInstructor(r.requestedBy);
@@ -7908,6 +7921,7 @@ function renderCoverageRequestsPanel(){
     html+='<tr><td>'+fmtShort(r.date)+' <span class="small muted">('+r.weekday+')</span></td>'
       +'<td>'+pod.name+(block? ' '+rangeLabel(block.start,block.end-block.start) : '')+'</td>'
       +'<td class="small">'+requester.name+(r.note? ' <span class="muted">— '+r.note+'</span>' : '')+'</td>'
+      +'<td>'+offersCell+'</td>'
       +'<td class="small muted">'+emailedCell+'</td>';
     if(!block){ html+='<td class="small muted">Shift no longer exists</td><td class="small muted">—</td>'; }
     else{
@@ -10044,6 +10058,10 @@ function cancelCoverageRequest(id){
   const r=coverageRequests.find(function(x){ return x.id===id; });
   if(r) r.status='cancelled';
   dbWrite('cancelling coverage request', function(){ return supabaseClient.from('coverage_requests').update({status:'cancelled'}).eq('id', id); });
+  // Anyone who offered to cover hears it's no longer needed (Oct 2026). The requesting instructor
+  // can't update (or even see) other instructors' offers, so the Edge Function does it server-side.
+  pendingCoverOffers(id).forEach(function(o){ o.status='cancelled'; });
+  if(supabaseClient && currentUser) supabaseClient.functions.invoke('send-cover-offer-email', {body:{cancelRequestId:id}});
   render();
 }
 // Qualified (5.3) instructors who are also actually free that exact date — not already covering a
@@ -10125,6 +10143,7 @@ function fillCoverageRequest(requestId, instructorId){
   });
   reassignSessionsForCoverageChange(req.podId, req.weekday, dateKey);
   regenerateAllRecurring();
+  settleCoverOffers(requestId, instructorId, 'declined'); // anyone who offered hears the outcome (Oct 2026)
   toast(findInstructor(instructorId).name+' is covering '+findPod(req.podId).name+'’s '+req.weekday+' shift on '+fmtShort(req.date)+'.');
   render();
 }
@@ -10162,7 +10181,102 @@ function markCoverageUncovered(requestId){
   });
   reassignSessionsForCoverageChange(req.podId, req.weekday, dateKey);
   regenerateAllRecurring();
+  settleCoverOffers(requestId, null, 'declined');
   toast(findPod(req.podId).name+' is marked unstaffed for '+fmtShort(req.date)+' — no replacement found.'+(alreadyNotified? '' : ' Emailed '+MANAGER_EMAIL+'.'));
+  render();
+}
+
+/* ---------- instructors offering to cover (Oct 2026) ---------- */
+// Per Allie: "give my instructors the ability to cover a shift even if outside of their hours, so
+// they submit a request to cover it, multiple can do this, and I can accept or decline the cover
+// request" — "they get an email whether I accepted or declined". Any instructor (other than the one
+// who asked for cover) can offer on any open coverage request; front desk sees the offers on that
+// request and accepts one (fillCoverageRequest — which also declines everyone else) or declines one.
+// Every decided offer is emailed its outcome by the send-cover-offer-email Edge Function.
+// coverage_offers table: add_coverage_offers.sql.
+function myCoverOffer(requestId, instructorId){
+  return coverageOffers.find(function(o){ return o.requestId===requestId && o.instructorId===instructorId; }) || null;
+}
+function pendingCoverOffers(requestId){
+  return coverageOffers.filter(function(o){ return o.requestId===requestId && o.status==='pending'; })
+    .sort(function(a,b){ return a.createdAt-b.createdAt; });
+}
+// Already rostered (or covering) another Pod at an overlapping time on that date? Shown as a heads-up
+// only — front desk decides.
+function coverOfferClash(req, instructorId){
+  const block=podBlocksForDay(req.podId, req.weekday).find(function(b){ return b.id===req.blockId; });
+  if(!block) return null;
+  for(const otherPodId in podSchedule){
+    if(otherPodId===req.podId) continue;
+    const hit=podShiftsOn(otherPodId, req.date).find(function(s){ return s.instructorId===instructorId && s.start<block.end && block.start<s.end; });
+    if(hit) return findPod(otherPodId).name+' '+rangeLabel(hit.start, hit.end-hit.start);
+  }
+  return null;
+}
+function emailCoverOffers(offerIds){
+  if(!offerIds.length || !supabaseClient || !currentUser) return;
+  supabaseClient.functions.invoke('send-cover-offer-email', {body:{offerIds:offerIds}}).then(function(r){
+    const err=(r.error && (r.error.message||String(r.error))) || (r.data && r.data.error);
+    if(err) toast('The offer was saved, but the email to the instructor didn\'t send — '+err, 8000);
+  });
+}
+function offerToCover(requestId){
+  const instrId = supabaseClient? (currentUser && currentUser.instructorId) : state.instructorLoggedIn;
+  const req=coverageRequests.find(function(r){ return r.id===requestId; });
+  if(!instrId || !req || req.status!=='open') return;
+  const clash=coverOfferClash(req, instrId);
+  if(!confirm('Offer to cover '+findPod(req.podId).name+' on '+fmtShort(req.date)+'?'+(clash? '\n\nHeads up: you\'re already on '+clash+' that day.' : '')+'\n\nFront desk will accept or decline, and you\'ll get an email either way.')) return;
+  const existing=myCoverOffer(requestId, instrId);
+  if(existing){
+    existing.status='pending'; existing.createdAt=new Date();
+    dbWrite('re-offering to cover', function(){ return supabaseClient.from('coverage_offers').update({status:'pending'}).eq('id', existing.id); });
+  } else {
+    const o={id:newId()||('off'+Date.now()), requestId, instructorId:instrId, status:'pending', createdAt:new Date()};
+    coverageOffers.push(o);
+    dbWrite('offering to cover a shift', function(){ return supabaseClient.from('coverage_offers').insert({id:o.id, request_id:requestId, instructor_id:instrId, status:'pending'}); });
+  }
+  toast('Offer sent — front desk will let you know by email.');
+  render();
+}
+function withdrawCoverOffer(offerId){
+  const o=coverageOffers.find(function(x){ return x.id===offerId; });
+  if(!o || o.status!=='pending') return;
+  o.status='withdrawn';
+  dbWrite('withdrawing a cover offer', function(){ return supabaseClient.from('coverage_offers').update({status:'withdrawn'}).eq('id', offerId); });
+  toast('Offer withdrawn.');
+  render();
+}
+// Records the outcome on every still-pending offer for a request and emails them. acceptedInstrId:
+// whoever got the shift (their own offer becomes "accepted"); everyone else becomes `othersStatus`.
+function settleCoverOffers(requestId, acceptedInstrId, othersStatus){
+  const changed=[];
+  coverageOffers.forEach(function(o){
+    if(o.requestId!==requestId || o.status!=='pending') return;
+    o.status = (acceptedInstrId && o.instructorId===acceptedInstrId)? 'accepted' : othersStatus;
+    changed.push(o);
+  });
+  if(!changed.length) return;
+  dbWrite('recording cover offer outcomes', function(){
+    return Promise.all(changed.map(function(o){ return supabaseClient.from('coverage_offers').update({status:o.status, decided_at:new Date().toISOString()}).eq('id', o.id); }))
+      .then(function(rs){ const bad=rs.find(function(r){ return r.error; }); if(!bad) emailCoverOffers(changed.map(function(o){ return o.id; })); return bad||{error:null}; });
+  });
+}
+function acceptCoverOffer(offerId){
+  const o=coverageOffers.find(function(x){ return x.id===offerId; });
+  if(!o || o.status!=='pending') return;
+  const req=coverageRequests.find(function(r){ return r.id===o.requestId; });
+  const others=pendingCoverOffers(o.requestId).length-1;
+  if(!confirm(findInstructor(o.instructorId).name+' covers '+findPod(req.podId).name+' on '+fmtShort(req.date)+'?\n\nThey\'ll get a confirmation email'+(others>0? ', and the '+others+' other'+(others===1?'':'s')+' who offered will be told it\'s sorted.' : '.'))) return;
+  fillCoverageRequest(o.requestId, o.instructorId); // also settles every offer on this request
+}
+function declineCoverOffer(offerId){
+  const o=coverageOffers.find(function(x){ return x.id===offerId; });
+  if(!o || o.status!=='pending') return;
+  if(!confirm('Decline '+findInstructor(o.instructorId).name+'\'s offer? They\'ll get an email letting them know.')) return;
+  o.status='declined';
+  dbWrite('declining a cover offer', function(){ return supabaseClient.from('coverage_offers').update({status:'declined', decided_at:new Date().toISOString()}).eq('id', o.id)
+    .then(function(r){ if(!r.error) emailCoverOffers([o.id]); return r; }); });
+  toast('Offer declined — '+findInstructor(o.instructorId).name+' will get an email.');
   render();
 }
 
@@ -10358,16 +10472,28 @@ function renderInstructor(){
 
   const openForMe=openCoverageRequestsSortedForInstructor(instr.id);
   if(openForMe.length>0){
-    html+='<div class="card"><h2>Shifts needing coverage</h2><p>Every currently open coverage request across the centre — the ones during your own usual hours are listed first, since those are the ones you could most plausibly help with. Front desk still makes the actual assignment; this is visibility only, so let them know if you\'re able to step in.</p>';
-    html+='<table><tr><th>Date</th><th>Pod / shift</th><th>Requested by</th><th></th></tr>'
+    // "Offer to cover" (Oct 2026) — any shift, even outside their usual hours; front desk accepts or
+    // declines and they're emailed either way (see offerToCover).
+    html+='<div class="card"><h2>Shifts needing coverage</h2><p>Shifts other instructors can\'t make. Can you help? Tap <b>Offer to cover</b> — even if it\'s outside your usual hours. Several people can offer; front desk picks one and you\'ll get an email either way.</p>';
+    html+='<table><tr><th>Date</th><th>Pod / shift</th><th>Requested by</th><th></th><th></th></tr>'
       +openForMe.map(function(x){
         const r=x.request;
         const pod=findPod(r.podId);
         const block=podBlocksForDay(r.podId, r.weekday).find(function(b){ return b.id===r.blockId; });
         const requester=findInstructor(r.requestedBy);
-        return '<tr><td>'+fmtShort(r.date)+'</td><td class="small">'+pod.name+(block? ' '+rangeLabel(block.start,block.end-block.start) : '')+'</td>'
-          +'<td class="small">'+(requester? requester.name : '—')+(r.requestedBy===instr.id? ' <span class="small muted">(you)</span>' : '')+'</td>'
-          +'<td>'+(x.withinOwnAvailability? '<span class="badge available">During your hours</span>' : '<span class="small muted">Outside your hours</span>')+'</td></tr>';
+        const mine=r.requestedBy===instr.id;
+        const offer=myCoverOffer(r.id, instr.id);
+        const clash=mine? null : coverOfferClash(r, instr.id);
+        let action='';
+        if(mine) action='<span class="small muted">Your request</span>';
+        else if(offer && offer.status==='pending') action='<span class="badge soon">Offer sent</span> <button class="btn sm ghost" onclick="withdrawCoverOffer(\''+offer.id+'\')">Withdraw</button>';
+        else if(offer && offer.status==='declined') action='<span class="small muted">Thanks — not needed this time</span>';
+        else action='<button class="btn sm primary" onclick="offerToCover(\''+r.id+'\')">Offer to cover</button>';
+        return '<tr><td>'+fmtShort(r.date)+'</td><td class="small">'+pod.name+(block? ' '+rangeLabel(block.start,block.end-block.start) : '')
+            +(clash? '<div class="small" style="color:var(--warning)">You\'re on '+clash+' then</div>' : '')+'</td>'
+          +'<td class="small">'+(requester? requester.name : '—')+(mine? ' <span class="small muted">(you)</span>' : '')+'</td>'
+          +'<td>'+(x.withinOwnAvailability? '<span class="badge available">During your hours</span>' : '<span class="small muted">Outside your hours</span>')+'</td>'
+          +'<td>'+action+'</td></tr>';
       }).join('')
       +'</table></div>';
   }
@@ -11301,7 +11427,7 @@ var DATA_GROUP_TABLES={
   parents:['parents'],
   sessions:['sessions'],
   credits:['credits'],
-  coverageRequests:['coverage_requests','coverage_request_notified_instructors'],
+  coverageRequests:['coverage_requests','coverage_request_notified_instructors','coverage_offers'],
   waitlist:['waitlist_entries'],
   closedDays:['closed_days'],
   enrollmentRequests:['enrollment_requests','enrollment_request_recurring','enrollment_request_previous_recurring'],
@@ -11720,8 +11846,10 @@ function fetchCoverageRequestsGroup(){
   return Promise.all([
     fetchTablePaginated('coverage_requests','id,pod_id,block_id,weekday,the_date,requested_by,note,status,filled_by,manager_notified'),
     fetchTablePaginated('coverage_request_notified_instructors','coverage_request_id,instructor_id'),
+    fetchTablePaginated('coverage_offers','id,request_id,instructor_id,status,created_at'),
   ]).then(function(t){
-    const [covReqRows,covNotifRows]=t;
+    const [covReqRows,covNotifRows,offerRows]=t;
+    coverageOffers=offerRows.map(function(o){ return {id:o.id, requestId:o.request_id, instructorId:o.instructor_id, status:o.status, createdAt:new Date(o.created_at)}; });
     coverageRequests=covReqRows.map(function(r){ return {
       id:r.id, podId:r.pod_id, blockId:r.block_id, weekday:r.weekday, date:new Date(r.the_date), requestedBy:r.requested_by,
       note:r.note||'', status:r.status, filledBy:r.filled_by, managerNotified:r.manager_notified,
