@@ -2601,14 +2601,15 @@ function applyTimeChange(student, effectiveFrom, recurring, note, selfService){
     if(toKey(s.date) < effKey) return;
     s.status='cancelled';
     movedCount++;
-    dbWrite('cancelling a session for a schedule change', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id); });
-    if(s.creditId){
-      const cr=findCredit(s.creditId);
-      if(cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow())){
-        cr.status='available'; cr.redeemedSessionId=null;
-        dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', cr.id); });
-      }
-    }
+    const cr=s.creditId? findCredit(s.creditId) : null;
+    const restore = cr && cr.status==='redeemed' && toKey(cr.expiryDate)>=toKey(simNow());
+    if(restore){ cr.status='available'; cr.redeemedSessionId=null; }
+    // Session first, then its credit (Oct 2026) — a parent can only return a credit once the session
+    // is cancelled (lock_parent_credit_updates.sql), and parents use this for their own changes.
+    dbWrite('cancelling a session for a schedule change', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', s.id).then(function(r){
+      if(r.error || !restore) return r;
+      return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', cr.id);
+    }); });
   });
   dbWrite('scheduling a time change', function(){
     return supabaseClient.from('student_plan_changes').delete().eq('student_id', student.id).eq('effective_from', effKey).then(function(){
@@ -4616,19 +4617,21 @@ function cancelMakeUp(creditId){
   const credit=findCredit(creditId);
   const sess=findSession(credit.redeemedSessionId);
   sess.status='cancelled';
-  dbWrite('cancelling a make-up session', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
   const now=simNow();
-  if(new Date(toKey(now)) > new Date(toKey(credit.expiryDate))){
-    credit.status='expired';
-    credit.redeemedSessionId=null;
-    dbWrite('expiring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'expired', redeemed_session_id:null}).eq('id', credit.id); });
-    toast('That credit\'s 3-month window (from the originally missed session) has already passed, so it could not be restored.');
-  } else {
-    credit.status='available';
-    credit.redeemedSessionId=null;
-    dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', credit.id); });
-    toast('Make-up cancelled — the credit is available to rebook.');
-  }
+  const expired = new Date(toKey(now)) > new Date(toKey(credit.expiryDate));
+  credit.status = expired? 'expired' : 'available';
+  credit.redeemedSessionId=null;
+  // One ordered write — session cancelled FIRST, then the credit returned (Oct 2026): the database
+  // only lets a parent return a credit once its make-up session is cancelled
+  // (lock_parent_credit_updates.sql), so the two can't race each other.
+  dbWrite('cancelling a make-up session and returning its credit', function(){
+    return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id).then(function(r){
+      if(r.error) return r;
+      return supabaseClient.from('credits').update({status:credit.status, redeemed_session_id:null}).eq('id', credit.id);
+    });
+  });
+  if(expired) toast('That credit\'s 3-month window (from the originally missed session) has already passed, so it could not be restored.');
+  else toast('Make-up cancelled — the credit is available to rebook.');
 }
 
 // Front-desk "Re-book" (Sept 2026, per Allie: give the Booked-credits section a way to change a
