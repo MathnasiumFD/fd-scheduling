@@ -3783,13 +3783,27 @@ function nearestRegularDateKey(studentId, aroundDateKey, maxDays){
 }
 function openAddCreditForm(studentId){
   const issued=toKey(simNow());
-  state.addCreditForm={studentId: studentId||'', issuedDate:issued, expiryDate:toKey(addMonths(simNow(),3)), note:'', error:''};
+  state.addCreditForm={studentId: studentId||'', issuedDate:issued, expiryDate:toKey(addMonths(simNow(),3)), note:'', quantity:1, carriedOver:false, error:''};
+  render();
+}
+// Bulk carry-over (Oct 2026, per Allie: "some kids are carrying 3 or more from previous dates that i
+// cant remember, to just update them as a today thing but have multiples") — dated today, so the
+// regular-day check doesn't apply, and they expire 3 months from today like any other credit.
+function setAddCreditCarriedOver(on){
+  const f=state.addCreditForm;
+  f.carriedOver=!!on;
+  if(on){
+    f.issuedDate=toKey(simNow()); f.expiryDate=toKey(addMonths(simNow(),3));
+    if(!f.note) f.note='Carried over from before MATHQ';
+  }
+  f.error='';
   render();
 }
 function closeAddCreditForm(){ state.addCreditForm=null; render(); }
 function setAddCreditField(field, value){
   const f=state.addCreditForm;
-  if(field==='issuedDate' && f.studentId && value && !isStudentRegularDate(f.studentId, value)){
+  if(field==='quantity'){ f.quantity=Math.max(1, Math.min(10, parseInt(value,10)||1)); f.error=''; render(); return; }
+  if(field==='issuedDate' && f.studentId && value && !f.carriedOver && !isStudentRegularDate(f.studentId, value)){
     const daysLabel=studentRegularDaysLabel(f.studentId, value);
     f.error=findStudent(f.studentId).name+' only attends '+(daysLabel||'no regular days')+' as of that date — pick a date that falls on one of those days.';
     render();
@@ -3800,7 +3814,7 @@ function setAddCreditField(field, value){
   // Keep expiry in sync with the standard 3-month rule as the issued date changes — staff can
   // still override it afterward for a migrated record that doesn't fit the rule exactly.
   if(field==='issuedDate' && value){ f.expiryDate=toKey(addMonths(new Date(value),3)); }
-  if(field==='studentId' && value && f.issuedDate && !isStudentRegularDate(value, f.issuedDate)){
+  if(field==='studentId' && value && f.issuedDate && !f.carriedOver && !isStudentRegularDate(value, f.issuedDate)){
     f.issuedDate=nearestRegularDateKey(value, f.issuedDate, 90);
     f.expiryDate=toKey(addMonths(new Date(f.issuedDate),3));
   }
@@ -3811,20 +3825,24 @@ function saveAddCredit(){
   if(!f.studentId){ f.error='Choose a student.'; render(); return; }
   if(!f.issuedDate){ f.error='Enter the date the make-up is owed from.'; render(); return; }
   if(!f.expiryDate){ f.error='Enter an expiry date.'; render(); return; }
-  if(!isStudentRegularDate(f.studentId, f.issuedDate)){
+  if(!f.carriedOver && !isStudentRegularDate(f.studentId, f.issuedDate)){
     const daysLabel=studentRegularDaysLabel(f.studentId, f.issuedDate);
     f.error=findStudent(f.studentId).name+' only attends '+(daysLabel||'no regular days')+' as of that date.';
     render();
     return;
   }
   const student=findStudent(f.studentId);
-  const c={id:newId()||('c'+(nextCreditId++)), studentId:f.studentId, issuedDate:new Date(f.issuedDate), expiryDate:new Date(f.expiryDate), status:'available', redeemedSessionId:null, warningSent:false, source:'manual', note:f.note};
-  credits.push(c);
-  dbWrite('adding a manual credit', function(){ return supabaseClient.from('credits').insert({
+  const qty=Math.max(1, Math.min(10, f.quantity||1)); // several at once (Oct 2026)
+  const made=[];
+  for(let i=0;i<qty;i++){
+    const c={id:newId()||('c'+(nextCreditId++)), studentId:f.studentId, issuedDate:new Date(f.issuedDate), expiryDate:new Date(f.expiryDate), status:'available', redeemedSessionId:null, warningSent:false, source:'manual', note:f.note};
+    credits.push(c); made.push(c);
+  }
+  dbWrite('adding '+(qty===1? 'a manual credit' : qty+' manual credits'), function(){ return supabaseClient.from('credits').insert(made.map(function(c){ return {
     id:c.id, student_id:c.studentId, issued_date:toKey(c.issuedDate), expiry_date:toKey(c.expiryDate),
     status:c.status, redeemed_session_id:c.redeemedSessionId, warning_sent:c.warningSent, source:c.source, note:c.note, minutes:c.minutes||null
-  }); });
-  toast('Make-up credit added for '+student.name+' — expires '+fmtShort(c.expiryDate)+'.');
+  }; })); });
+  toast((qty===1? 'Make-up credit' : qty+' make-up credits')+' added for '+student.name+' — expire'+(qty===1?'s':'')+' '+fmtShort(made[0].expiryDate)+'.');
   state.addCreditForm=null;
   render();
 }
@@ -9828,15 +9846,24 @@ function renderAddCreditModal(){
   // Sept 2026, per Allie: only let the missed-session date land on a day the student actually
   // attends — a plain date input can't grey out individual days, so this names their regular days
   // right under the field instead, and setAddCreditField() rejects anything else on change.
+  // How many + "carried over" (Oct 2026) — for families carrying several credits from old dates nobody
+  // remembers: added as of today, all at once.
+  html+='<div class="row2"><div><label>How many credits</label><input type="number" min="1" max="10" value="'+(f.quantity||1)+'" onchange="setAddCreditField(\'quantity\',this.value)" style="max-width:100px"/></div>'
+    +'<div><label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;margin-top:26px"><input type="checkbox" style="width:auto;margin:0" '+(f.carriedOver?'checked':'')+' onchange="setAddCreditCarriedOver(this.checked)"/> Carried over — date unknown (add as of today)</label></div></div>';
   const regularDaysLabel=f.studentId? studentRegularDaysLabel(f.studentId, f.issuedDate) : null;
+  if(f.carriedOver){
+    html+='<div class="row2"><div><label>Owed from</label><div class="small" style="padding:8px 0">Today ('+fmtShort(new Date(f.issuedDate))+')</div></div>'
+      +'<div><label>Expires</label><input type="date" value="'+f.expiryDate+'" onchange="setAddCreditField(\'expiryDate\',this.value)"/></div></div>';
+  } else {
   html+='<div class="row2"><div><label>Owed from (missed session date)</label><input type="date" value="'+f.issuedDate+'" onchange="setAddCreditField(\'issuedDate\',this.value)"/>'
       +(f.studentId? '<div class="small muted" style="margin-top:2px">'+(regularDaysLabel? findStudent(f.studentId).name+' attends '+regularDaysLabel : 'No regular days on file for '+findStudent(f.studentId).name+' — any date is fine')+'</div>' : '')
     +'</div>'
     +'<div><label>Expires</label><input type="date" value="'+f.expiryDate+'" onchange="setAddCreditField(\'expiryDate\',this.value)"/></div></div>';
+  }
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. carried over from the paper log" value="'+f.note+'" oninput="setAddCreditField(\'note\',this.value)"/>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
     +'<button class="btn ghost" onclick="closeAddCreditForm()">Cancel</button>'
-    +'<button class="btn primary" onclick="saveAddCredit()">Add credit</button>'
+    +'<button class="btn primary" onclick="saveAddCredit()">Add '+((f.quantity||1)>1? f.quantity+' credits' : 'credit')+'</button>'
   +'</div>';
   html+='</div></div>';
   return html;
