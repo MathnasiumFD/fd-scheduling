@@ -7915,8 +7915,13 @@ function renderDayOverrideModal(){
 
 function renderCoverageRequestsPanel(){
   const open=coverageRequests.filter(function(r){ return r.status==='open'; }).sort(function(a,b){ return new Date(a.date)-new Date(b.date); });
-  if(open.length===0) return '';
-  let html=sectionOpen('coverage','⚠️ Shifts needing coverage','<span class="small muted">'+open.length+'</span>');
+  // Always shown now (Oct 2026), so front desk can mark a shift as needing cover on an instructor's behalf.
+  const addBtn='<button class="btn sm primary" onclick="openStaffCoverageForm()">+ Mark a shift as needing cover</button>';
+  if(open.length===0){
+    return sectionOpen('coverage','Shifts needing coverage','<div style="display:flex;gap:6px;align-items:center"><span class="small muted">0</span>'+addBtn+'</div>')
+      +'<div class="empty-note">No shifts need cover right now.</div></div>'+renderCoverageRequestModal();
+  }
+  let html=sectionOpen('coverage','⚠️ Shifts needing coverage','<div style="display:flex;gap:6px;align-items:center"><span class="small muted">'+open.length+'</span>'+addBtn+'</div>');
   html+='<p>An instructor has flagged they can\'t work one of their shifts — every qualified, available instructor was emailed the moment it was raised. Instructors can also <b>offer to cover</b> from their own page (even outside their usual hours): <b>Accept</b> one to give them the shift (everyone else who offered is told it\'s sorted), or <b>Decline</b> — each gets an email either way. Or pick a replacement for just that date — their regular assignment is untouched every other day. If it\'s already been sorted out face-to-face in the centre, use "Assign directly" to record whoever agreed to cover, even if they\'re not in the suggested list. If nobody at all is available, the manager is emailed automatically so it doesn\'t sit unnoticed.</p>';
   html+='<table><tr><th>Date</th><th>Pod / shift</th><th>Requested by</th><th>Offers to cover</th><th>Emailed</th><th>Cover with</th><th>Assign directly</th></tr>';
   open.forEach(function(r){
@@ -7961,6 +7966,7 @@ function renderCoverageRequestsPanel(){
     html+='</tr>';
   });
   html+='</table></div>';
+  html+=renderCoverageRequestModal(); // front desk's own 'mark as needing cover' form (Oct 2026)
   return html;
 }
 
@@ -10080,7 +10086,9 @@ function submitCoverageRequest(){
   const notifyMsg = notify.length
     ? ' Emailed '+notify.length+' available instructor'+(notify.length===1?'':'s')+' ('+notify.map(function(i){ return i.name; }).join(', ')+').'
     : ' Nobody is currently available — emailed '+MANAGER_EMAIL+' so it doesn\'t sit unnoticed.';
-  toast('Coverage requested for '+fmtShort(d)+' — front desk will pick it up.'+notifyMsg);
+  toast(f.staffMode
+    ? 'Marked as needing cover: '+findPod(f.podId).name+' on '+fmtShort(d)+' ('+findInstructor(f.instructorId).name+'\'s shift).'+notifyMsg
+    : 'Coverage requested for '+fmtShort(d)+' — front desk will pick it up.'+notifyMsg);
   state.coverageRequestForm=null;
   render();
 }
@@ -10554,9 +10562,57 @@ function renderInstructor(){
   return html;
 }
 
+// Front desk raising cover on an instructor's behalf (Oct 2026, per Allie: "if they notify me in the
+// centre, or something comes up i need to be able to request coverage in their behest") — pick the
+// date, then which of that day's shifts; it then behaves exactly as if that instructor had asked
+// (offers, emails, Accept/Decline). Only regular shift blocks (not a one-day Schedule-grid change).
+function openStaffCoverageForm(){
+  state.coverageRequestForm={staffMode:true, date:toKey(simNow()), shiftKey:'', note:'', error:''};
+  render();
+}
+function staffCoverageShiftOptions(dateKey){
+  const date=new Date(dateKey), weekday=WEEKDAY_KEYS[(date.getDay()+6)%7], opts=[];
+  pods.forEach(function(pod){
+    if(dayOverrideFor(pod.id, dateKey)) return;
+    podBlocksForDay(pod.id, weekday).forEach(function(b){
+      const who=blockInstructorOn(b, date);
+      if(!who) return;
+      const taken=coverageRequests.some(function(r){ return r.blockId===b.id && toKey(r.date)===dateKey && r.status==='open'; });
+      opts.push({key:pod.id+'|'+b.id, podId:pod.id, blockId:b.id, weekday:weekday, instructorId:who, taken:taken,
+        label:pod.name+' '+rangeLabel(b.start,b.end-b.start)+' — '+(findInstructor(who)? findInstructor(who).name : '?')+(taken? ' (already needs cover)' : '')});
+    });
+  });
+  return opts;
+}
+function submitStaffCoverageRequest(){
+  const f=state.coverageRequestForm;
+  const opt=staffCoverageShiftOptions(f.date).find(function(o){ return o.key===f.shiftKey; });
+  if(!opt){ f.error='Choose the shift that needs cover.'; render(); return; }
+  if(opt.taken){ f.error='That shift already has an open coverage request.'; render(); return; }
+  f.podId=opt.podId; f.blockId=opt.blockId; f.weekday=opt.weekday; f.instructorId=opt.instructorId;
+  submitCoverageRequest();
+}
 function renderCoverageRequestModal(){
   const f=state.coverageRequestForm;
   if(!f) return '';
+  if(f.staffMode){
+    const opts=staffCoverageShiftOptions(f.date);
+    let h='<div class="overlay" onclick="if(event.target===this) closeCoverageRequestForm()"><div class="modal">';
+    h+='<h3>Mark a shift as needing cover</h3>';
+    h+='<p>For when an instructor tells you in person, or something comes up. It works just like them asking: available instructors are emailed, anyone can offer to cover, and you accept or decline. Their regular shift is unchanged every other week.</p>';
+    if(f.error) h+='<div class="banner danger">'+f.error+'</div>';
+    h+='<label>Date</label><input type="date" value="'+f.date+'" min="'+toKey(simNow())+'" onchange="setCoverageRequestField(\'date\',this.value); state.coverageRequestForm.shiftKey=\'\';"/>';
+    h+='<label>Shift</label>'+(opts.length
+      ? '<select onchange="setCoverageRequestField(\'shiftKey\',this.value)"><option value="">Choose a shift…</option>'
+        +opts.map(function(o){ return '<option value="'+o.key+'"'+(o.key===f.shiftKey?' selected':'')+(o.taken?' disabled':'')+'>'+o.label+'</option>'; }).join('')+'</select>'
+      : '<div class="small muted" style="padding:6px 0">No rostered shifts on that day.</div>');
+    h+='<label>Note (optional)</label><input type="text" placeholder="e.g. unwell — called in" value="'+f.note+'" oninput="setCoverageRequestField(\'note\',this.value)"/>';
+    h+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">'
+      +'<button class="btn ghost" onclick="closeCoverageRequestForm()">Cancel</button>'
+      +'<button class="btn primary" onclick="submitStaffCoverageRequest()">Request cover</button>'
+    +'</div></div></div>';
+    return h;
+  }
   const pod=findPod(f.podId);
   let html='<div class="overlay" onclick="if(event.target===this) closeCoverageRequestForm()"><div class="modal">';
   html+='<h3>Request coverage — '+pod.name+' '+f.weekday+'</h3>';
