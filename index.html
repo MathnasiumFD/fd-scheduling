@@ -2083,7 +2083,7 @@ function movePodSession(sessionId, newPodId){
     return {ok:false, error:newPod.name+' is already full at that time ('+cap+'/'+cap+') — pick another Pod.'};
   }
   const oldPod=findPod(sess.podId);
-  const cov=podCoverageDetail(newPodId, weekday, sess.start, sess.duration, sess.date); // tolerant of a short unattended gap, same as everywhere else (UNATTENDED_TOLERANCE_MIN)
+  const cov=sessionMinderFor(newPodId, weekday, sess.start, sess.duration, sess.date); // floor move first (Oct 2026), else the roster — tolerant of a short unattended gap, same as everywhere else (UNATTENDED_TOLERANCE_MIN)
   sess.podId=newPodId;
   sess.instructorId=cov.primaryInstructorId;
   sess.instructorId2=cov.secondaryInstructorId;
@@ -4038,10 +4038,13 @@ function applyCheckIn(sess, arrival, exitTime, deferWrite){
   sess.actualStart=arrival;
   sess.actualEnd=exitTime;
   sess.status='attended';
+  // A floor move on this Pod today (Oct 2026, see podFloorAssignments) — the kid is minded by that person.
+  const floor=sess.podId && !sess.online? floorAssignmentFor(sess.podId, toKey(sess.date)) : null;
+  if(floor){ sess.instructorId=floor.instructorId; sess.instructorId2=null; sess.handoff=null; }
   const write=function(){
-    return supabaseClient.from('sessions').update({
+    return supabaseClient.from('sessions').update(Object.assign({
       check_in_offset:sess.checkInOffset, actual_start_min:sess.actualStart, actual_end_min:sess.actualEnd, status:sess.status
-    }).eq('id', sess.id).then(function(r){ if(!r || !r.error) notifyParentOfCheckIn(sess.id, sess.actualStart, sess.actualEnd); return r; });
+    }, floor? {instructor_id:sess.instructorId, instructor_id_2:null, handoff_min:null} : {})).eq('id', sess.id).then(function(r){ if(!r || !r.error) notifyParentOfCheckIn(sess.id, sess.actualStart, sess.actualEnd); return r; });
   };
   if(deferWrite) return write;
   dbWrite('checking in', write);
@@ -6839,7 +6842,9 @@ function podInstructorLabel(podId, dayKey){
   if(!blocks.length) return null;
   const nowMin=nowMinutesOfDay();
   const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
-  const instrId=block.instructorId;
+  // A floor move today (Oct 2026) — show who's actually minding the kids, with their own times.
+  const fl=floorAssignmentFor(podId, dayKey);
+  const instrId=fl? fl.instructorId : block.instructorId;
   if(!instrId) return null;
   // Oct 2026, per Allie ("whos here right now instructor times are weird" — right instructor, wrong
   // end time): availability is when someone COULD work, not their shift, so an instructor available
@@ -7002,48 +7007,37 @@ function renderQuickMoveModal(){
   return html;
 }
 
-// Quick same-day-only coverage change, launched by clicking a Pod's header on the live "Who's here
-// right now" board just above (Sept 2026, per Allie: "I need a quick way to assign an instructor to
-// a pod, even if they're technically assigned to a different one" — then, once a first pass wired
-// this into the PERMANENT weekly Pod Assignment editor instead, corrected to: "I dont want it to be
-// a permanent change, just a quick on the day change - maybe by clicking on th epod number under
-// whos here right now"). Deliberately reuses the exact same oneOffCoverage mechanism a filled shift
-// coverage request writes into (fillCoverageRequest) rather than the dated `assignments` history a
-// permanent change uses — so it only ever affects today, the regular weekly assignment underneath is
-// left alone, and no formal coverageRequests record needs to exist first. The instructor list is
-// every active instructor, unrestricted by availability or an existing assignment elsewhere — same
-// "front desk is trusted" philosophy as assignCoverageManually() — since the whole point is
-// overriding a clash on the spot, not hunting through who's technically free.
-// Sentinel "Cover with" value meaning "explicitly no instructor" (Sept 2026, per Allie: "in whos
-// here right now i need the option to select 'no instructor' for a pod") — distinct from the plain
-// '' placeholder value (nothing chosen yet), so the form can tell "hasn't picked" apart from "picked
-// nobody, on purpose." Stored as a real NULL oneOffCoverage.instructorId, exactly the same shape
-// pod_day_overrides already uses for "explicitly Unassigned for this one date" — podCoverageDetail()
-// already treats a block segment with no instructorId as an unattended gap (see its own `segs`
-// filter), so marking a Pod unstaffed this way needs no changes to any capacity/coverage math at all.
+// Launched by clicking a Pod's header on the live "Who's here right now" board (Sept 2026 as a
+// same-day roster swap; Oct 2026 changed to a floor move only — see below). "No instructor" =
+// nobody minding that Pod right now.
 var NO_INSTRUCTOR_VALUE='__no_instructor__';
+// Floor moves (Oct 2026, per Allie: "moving staff around in the Who's here right now table should
+// not impact at all the scheduled time slots for those people. It is just for front desk purposes.
+// The only change the instructors should see is which kids are currently assigned to them"). Clicking a
+// Pod's header on the board picks who is MINDING that Pod's kids today — stored on its own
+// (pod_floor_assignments, add_pod_floor_assignments.sql), never in the roster: shifts, the 2-week
+// shift lists, calendar feeds, coverage and availability are untouched. What it does change: the
+// board's name for that Pod, which kids show on each instructor's "My Pod today" (see
+// instructorPodIdsToday), and the instructor on those kids' sessions today (so the person minding
+// them can check them out). instructorId null = nobody minding that Pod right now.
+var podFloorAssignments=[];
+function floorAssignmentFor(podId, dateKey){
+  return podFloorAssignments.find(function(f){ return f.podId===podId && f.dateKey===dateKey; }) || null;
+}
+// Who a session in this Pod belongs to: a floor move for that date wins, else the roster.
+function sessionMinderFor(podId, weekday, start, duration, date){
+  const fl=floorAssignmentFor(podId, toKey(date));
+  if(fl) return {primaryInstructorId:fl.instructorId||null, secondaryInstructorId:null, handoffAt:null, ok:true};
+  return podCoverageDetail(podId, weekday, start, duration, date);
+}
 function openQuickCoverageForm(podId){
-  const today=simNow();
-  // A one-off day override set from the Today tab's Schedule grid replaces this Pod's weekly blocks
-  // entirely for today (see podCoverageDetail), so a quick swap written into a block underneath it
-  // would silently do nothing. Edit the override itself instead — same editor that grid opens
-  // (Oct 2026, alongside making this board read podShiftsOn).
-  if(dayOverrideFor(podId, toKey(today))){ openDayOverrideForm(podId, toKey(today)); return; }
-  const weekday=WEEKDAY_KEYS[(today.getDay()+6)%7];
-  const blocks=podBlocksForDay(podId, weekday);
-  if(!blocks.length){ toast('No shift is scheduled for '+findPod(podId).name+' today.'); render(); return; }
+  const todayKey=toKey(simNow());
+  const fl=floorAssignmentFor(podId, todayKey);
+  const rostered=podShiftsOn(podId, simNow());
   const nowMin=nowMinutesOfDay();
-  // Prefer whichever shift block actually covers right now; if the click lands outside every
-  // block's hours (e.g. someone lingering past the end of their shift), fall back to the day's last
-  // block so there's still something sensible to change.
-  const block = blocks.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || blocks[blocks.length-1];
-  const todayOverride=(block.oneOffCoverage||[]).find(function(o){ return toKey(o.date)===toKey(today); });
-  const currentId=blockInstructorOn(block, today);
-  // An existing "explicitly no instructor" override for today pre-selects "No instructor" itself,
-  // rather than falling through to the plain '' placeholder — currentId alone can't tell an existing
-  // null override apart from no override at all, since both resolve to null/undefined the same way.
-  const preselected = (todayOverride && !todayOverride.instructorId)? NO_INSTRUCTOR_VALUE : (currentId||'');
-  state.quickCoverageForm={podId:podId, weekday:weekday, blockId:block.id, instructorId:preselected, error:''};
+  const cur=rostered.find(function(b){ return nowMin>=b.start && nowMin<b.end; }) || rostered[rostered.length-1];
+  const preselected = fl? (fl.instructorId||NO_INSTRUCTOR_VALUE) : ((cur && cur.instructorId)||'');
+  state.quickCoverageForm={podId:podId, instructorId:preselected, error:''};
   render();
 }
 function closeQuickCoverageForm(){ state.quickCoverageForm=null; render(); }
@@ -7052,58 +7046,33 @@ function setQuickCoverageField(field, value){
   state.quickCoverageForm.error='';
   render();
 }
+function reseatPodSessionsToday(podId){
+  const today=simNow(), todayKey=toKey(today), weekday=WEEKDAY_KEYS[(today.getDay()+6)%7];
+  reassignSessionsForCoverageChange(podId, weekday, todayKey);
+}
 function saveQuickCoverage(){
   const f=state.quickCoverageForm;
-  if(!f.instructorId){ f.error='Choose an instructor, or "No instructor" to mark this Pod unstaffed for today.'; render(); return; }
-  const block=podBlocksForDay(f.podId, f.weekday).find(function(b){ return b.id===f.blockId; });
-  const today=simNow();
-  const todayKey=toKey(today);
-  const isNoInstructor=f.instructorId===NO_INSTRUCTOR_VALUE;
-  const instr=isNoInstructor? null : findInstructor(f.instructorId);
-  const savedInstructorId=isNoInstructor? null : f.instructorId;
-  block.oneOffCoverage=(block.oneOffCoverage||[]).filter(function(o){ return toKey(o.date)!==todayKey; });
-  block.oneOffCoverage.push({date:new Date(today), instructorId:savedInstructorId});
-  dbWrite('recording a same-day coverage change', function(){
-    return supabaseClient.from('pod_shift_one_off_coverage').delete().eq('block_id', block.id).eq('the_date', todayKey).then(function(){
-      return supabaseClient.from('pod_shift_one_off_coverage').insert({block_id:block.id, the_date:todayKey, instructor_id:savedInstructorId});
-    });
-  });
-  regenerateAllRecurring();
-  // Sept 2026, root cause of "sometimes my instructors can't move a kid to a different pod": this
-  // quick same-day swap changes who the LIVE board says covers the Pod right now, but any session
-  // already checked in (or otherwise already booked) before the swap still has the OLD instructor's
-  // id sitting on its own row — nothing used to touch it. The sessions RLS write policy gates an
-  // instructor's UPDATE on that session's own stored instructor_id/instructor_id_2, not on live
-  // coverage, so the new covering instructor was silently refused trying to move or check out a kid
-  // whose session was still tagged with whoever covered it before this swap. Same single-date
-  // resync saveDayOverride()/fillCoverageRequest() already rely on for exactly this reason.
-  reassignSessionsForCoverageChange(f.podId, f.weekday, todayKey);
-  toast(isNoInstructor
-    ? findPod(f.podId).name+' is marked unstaffed for today only — its regular schedule is unchanged.'
-    : instr.name+' is covering '+findPod(f.podId).name+' for today only — their regular schedule is unchanged.');
+  if(!f.instructorId){ f.error='Choose an instructor, or "No instructor".'; render(); return; }
+  const todayKey=toKey(simNow());
+  const isNone=f.instructorId===NO_INSTRUCTOR_VALUE;
+  const instrId=isNone? null : f.instructorId;
+  podFloorAssignments=podFloorAssignments.filter(function(x){ return !(x.podId===f.podId && x.dateKey===todayKey); });
+  podFloorAssignments.push({podId:f.podId, dateKey:todayKey, instructorId:instrId});
+  dbWrite('moving who is minding a Pod today', function(){ return supabaseClient.from('pod_floor_assignments').upsert({pod_id:f.podId, the_date:todayKey, instructor_id:instrId, updated_at:new Date().toISOString()}, {onConflict:'pod_id,the_date'}); });
+  reseatPodSessionsToday(f.podId);
+  toast(isNone
+    ? findPod(f.podId).name+' has nobody minding it right now. Nobody\'s shifts have changed.'
+    : findInstructor(instrId).name+' is minding '+findPod(f.podId).name+'\'s kids today. Nobody\'s shifts have changed.');
   state.quickCoverageForm=null;
   render();
 }
-// Undoes a same-day change made in error, falling back to whoever's actually assigned to the shift
-// on its regular dated schedule — a plain removal from oneOffCoverage rather than pushing a fresh
-// entry, so blockInstructorOn() resolves straight through to the underlying assignment again.
 function clearQuickCoverage(){
   const f=state.quickCoverageForm;
-  const block=podBlocksForDay(f.podId, f.weekday).find(function(b){ return b.id===f.blockId; });
   const todayKey=toKey(simNow());
-  const hadOverride=(block.oneOffCoverage||[]).some(function(o){ return toKey(o.date)===todayKey; });
-  if(!hadOverride){ state.quickCoverageForm=null; render(); return; }
-  block.oneOffCoverage=(block.oneOffCoverage||[]).filter(function(o){ return toKey(o.date)!==todayKey; });
-  dbWrite('clearing a same-day coverage change', function(){
-    return supabaseClient.from('pod_shift_one_off_coverage').delete().eq('block_id', block.id).eq('the_date', todayKey);
-  });
-  regenerateAllRecurring();
-  // Same resync on the way back to normal, for the same reason as saveQuickCoverage() above —
-  // reverting the override is itself a coverage change and can just as easily leave an
-  // already-booked session's stored instructor_id pointing at whoever covered it during the
-  // override instead of the regular instructor now back in charge.
-  reassignSessionsForCoverageChange(f.podId, f.weekday, todayKey);
-  toast(findPod(f.podId).name+'’s regular schedule is back in effect for today.');
+  podFloorAssignments=podFloorAssignments.filter(function(x){ return !(x.podId===f.podId && x.dateKey===todayKey); });
+  dbWrite('clearing a floor move', function(){ return supabaseClient.from('pod_floor_assignments').delete().eq('pod_id', f.podId).eq('the_date', todayKey); });
+  reseatPodSessionsToday(f.podId);
+  toast(findPod(f.podId).name+' is back with its rostered instructor.');
   state.quickCoverageForm=null;
   render();
 }
@@ -7111,17 +7080,18 @@ function renderQuickCoverageModal(){
   const f=state.quickCoverageForm;
   if(!f) return '';
   const pod=findPod(f.podId);
-  const block=podBlocksForDay(f.podId, f.weekday).find(function(b){ return b.id===f.blockId; });
-  const today=simNow();
-  const currentId=block? blockInstructorOn(block, today) : null;
-  const hasOverride=!!block && (block.oneOffCoverage||[]).some(function(o){ return toKey(o.date)===toKey(today); });
+  const todayKey=toKey(simNow());
+  const fl=floorAssignmentFor(f.podId, todayKey);
+  const rosteredNames=podShiftsOn(f.podId, simNow()).filter(function(s){ return s.instructorId; })
+    .map(function(s){ return findInstructor(s.instructorId).name+' '+rangeLabel(s.start, s.end-s.start); });
   let html='<div class="overlay" onclick="if(event.target===this) closeQuickCoverageForm()"><div class="modal">';
-  html+='<h3>Quick coverage — '+pod.name+' today</h3>';
-  html+='<p>Puts someone else on this shift for today only'+(block? ' ('+rangeLabel(block.start,block.end-block.start)+')' : '')+' — the regular weekly assignment is untouched, and this reverts on its own tomorrow. Pick anyone; they don\'t need to already be free at this time.</p>';
+  html+='<h3>Who\'s minding '+pod.name+' today</h3>';
+  html+='<p>For the floor only: this moves '+pod.name+'\'s kids to someone else for today. <b>Nobody\'s shifts change</b>, and neither do calendars or availability. Instructors just see which kids are theirs. To change who is actually rostered, use the Schedule grid or coverage.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
-  html+='<div class="small" style="margin-bottom:8px">Currently: <b>'+(currentId? findInstructor(currentId).name : 'Unassigned')+'</b>'+(hasOverride? ' <span class="small muted">(today\'s one-off change)</span>' : '')+'</div>';
+  html+='<div class="small" style="margin-bottom:8px">Rostered: <b>'+(rosteredNames.length? rosteredNames.join(', ') : 'nobody')+'</b>'
+    +(fl? '<br>Minding now: <b>'+(fl.instructorId? findInstructor(fl.instructorId).name : 'No instructor')+'</b> <span class="muted">(moved today)</span>' : '')+'</div>';
   html+='<div class="row2" style="align-items:flex-end">'
-    +'<div><label>Cover with</label><select onchange="setQuickCoverageField(\'instructorId\',this.value)">'
+    +'<div><label>Minded by</label><select onchange="setQuickCoverageField(\'instructorId\',this.value)">'
       +'<option value="">Choose…</option>'
       +'<option value="'+NO_INSTRUCTOR_VALUE+'"'+(f.instructorId===NO_INSTRUCTOR_VALUE?' selected':'')+'>No instructor</option>'
       +instructors.filter(function(i){ return i.active!==false; }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(i){
@@ -7131,7 +7101,7 @@ function renderQuickCoverageModal(){
     +'<button class="btn sm primary" onclick="saveQuickCoverage()">Save</button>'
   +'</div>';
   html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:space-between">'
-    +(hasOverride? '<button class="btn sm ghost" onclick="clearQuickCoverage()">Revert to regular schedule</button>' : '<span></span>')
+    +(fl? '<button class="btn sm ghost" onclick="clearQuickCoverage()">Back to the rostered instructor</button>' : '<span></span>')
     +'<button class="btn ghost" onclick="closeQuickCoverageForm()">Close</button>'
   +'</div>';
   html+='</div></div>';
@@ -10005,7 +9975,12 @@ function instructorPodIdsToday(instructorId){
   const today=simNow();
   // podShiftsOn (Oct 2026) — a one-off day change from the Today tab's Schedule grid counts too, both
   // ways: putting them on a Pod for today, or taking them off one.
+  // A floor move today (Oct 2026) decides instead, either way: a Pod moved to them counts, a Pod of
+  // theirs moved to someone else doesn't. Their shifts themselves are unchanged.
+  const todayKey=toKey(today);
   return pods.filter(function(p){
+    const fl=floorAssignmentFor(p.id, todayKey);
+    if(fl) return fl.instructorId===instructorId;
     return podShiftsOn(p.id, today).some(function(s){ return s.instructorId===instructorId; });
   }).map(function(p){ return p.id; });
 }
@@ -10156,7 +10131,7 @@ function reassignSessionsForCoverageChange(podId, weekday, dateKey){
   const date=new Date(dateKey);
   sessions.filter(function(s){ return s.podId===podId && !s.online && toKey(s.date)===dateKey && s.status!=='cancelled'; })
     .forEach(function(s){
-      const cov=podCoverageDetail(podId, weekday, s.start, s.duration, date);
+      const cov=sessionMinderFor(podId, weekday, s.start, s.duration, date); // a floor move wins (Oct 2026)
       if(cov.primaryInstructorId===s.instructorId && (cov.secondaryInstructorId||null)===(s.instructorId2||null) && (cov.handoffAt||null)===(s.handoff||null)) return; // nothing actually changed for this session
       s.instructorId=cov.primaryInstructorId; s.instructorId2=cov.secondaryInstructorId; s.handoff=cov.handoffAt;
       dbWrite('updating coverage on an already-scheduled session', function(){ return supabaseClient.from('sessions').update({
@@ -11508,7 +11483,7 @@ function logOut(){
 var DATA_GROUP_TABLES={
   instructors:['instructors','instructor_avail_rules','instructor_one_offs'],
   pods:['pods','pod_shift_blocks','pod_shift_assignments','pod_shift_one_off_coverage'],
-  podDayOverrides:['pod_day_overrides'],
+  podDayOverrides:['pod_day_overrides','pod_floor_assignments'],
   students:['students','student_recurring_slots','student_holds','student_pod_assignments','student_plan_changes','student_plan_change_recurring','student_guardians'],
   parents:['parents'],
   sessions:['sessions'],
@@ -11737,10 +11712,14 @@ function fetchPodsGroup(){
 }
 
 function fetchPodDayOverridesGroup(){
-  return fetchTablePaginated('pod_day_overrides','id,pod_id,the_date,instructor_id,start_min,end_min').then(function(dayOverrideRows){
-    podDayOverrides=dayOverrideRows.map(function(r){
+  return Promise.all([
+    fetchTablePaginated('pod_day_overrides','id,pod_id,the_date,instructor_id,start_min,end_min'),
+    fetchTablePaginated('pod_floor_assignments','pod_id,the_date,instructor_id'), // floor moves (Oct 2026)
+  ]).then(function(t){
+    podDayOverrides=t[0].map(function(r){
       return {id:r.id, podId:r.pod_id, date:new Date(r.the_date), instructorId:r.instructor_id, start:r.start_min, end:r.end_min};
     });
+    podFloorAssignments=t[1].map(function(r){ return {podId:r.pod_id, dateKey:r.the_date, instructorId:r.instructor_id||null}; });
   });
 }
 
