@@ -2559,6 +2559,9 @@ function applyStopEnrollment(student, effectiveFrom, note){
   sessions.forEach(function(s){
     if(s.studentId!==student.id || s.status!=='scheduled') return;
     if(toKey(s.date) < effKey) return;
+    // Make-ups are kept (Oct 2026, per Allie: kids who finish can still use their remaining make-up
+    // credits afterwards) — a make-up booked after the last regular day still goes ahead.
+    if(s.creditId && !s.recurring) return;
     deletedCount++;
     if(s.recurring){
       deleteIds.push(s.id);
@@ -2582,7 +2585,11 @@ function applyStopEnrollment(student, effectiveFrom, note){
     });
   });
   regenerateAllRecurring();
-  toast(student.name+' scheduled to stop attending from '+fmtShort(effectiveFrom)+(deletedCount? ' — '+deletedCount+' upcoming session(s) cleared (standing ones removed, any one-off bookings kept as cancelled).' : '.')+(note? ' Parent\'s note: '+note : ''));
+  const leftCredits=credits.filter(function(c){ return c.studentId===student.id && creditDisplayStatus(c)!=='expired' && (c.status==='available' || (c.status==='redeemed' && c.redeemedSessionId)); });
+  const unused=leftCredits.filter(function(c){ return c.status==='available'; }).length;
+  toast(student.name+' scheduled to stop attending from '+fmtShort(effectiveFrom)+(deletedCount? ' — '+deletedCount+' upcoming session(s) cleared (standing ones removed, any one-off bookings kept as cancelled).' : '.')
+    +(unused? ' They still have '+unused+' unused make-up credit'+(unused===1?'':'s')+' — those can still be booked after their last day, until they expire.' : '')
+    +(note? ' Parent\'s note: '+note : ''), unused? 9000 : undefined);
   return change;
 }
 
@@ -8719,11 +8726,22 @@ function renderNewParentModal(){
 // they're still the main parent of a child who's still enrolled — move the child first.
 var parentDeleteInFlight={};
 function parentActiveMainChildren(p){ return students.filter(function(s){ return s.parentId===p.id && !isStudentInactive(s); }); }
+// A finished child's make-ups still to come (Oct 2026, per Allie: "hold on to student and parent
+// profiles until sessions booked") — unused, unexpired credits plus booked sessions from today on.
+function studentMakeUpsLeft(s){
+  const todayKey=toKey(simNow());
+  const unused=credits.filter(function(c){ return c.studentId===s.id && c.status==='available' && toKey(c.expiryDate)>=todayKey; }).length;
+  const booked=sessions.filter(function(x){ return x.studentId===s.id && x.status==='scheduled' && toKey(x.date)>=todayKey; }).length;
+  return unused+booked;
+}
+function parentChildrenWithMakeUpsLeft(p){ return students.filter(function(s){ return s.parentId===p.id && isStudentInactive(s) && studentMakeUpsLeft(s)>0; }); }
 function deleteParent(parentId){
   const p=findParent(parentId);
   if(!p || parentDeleteInFlight[parentId]) return;
   const active=parentActiveMainChildren(p);
   if(active.length){ toast(p.name+' is still the main parent of '+active.map(function(s){ return s.name; }).join(', ')+'. Change the parent on '+(active.length===1? 'that child' : 'those children')+' (Edit details) first.', 8000); return; }
+  const owed=parentChildrenWithMakeUpsLeft(p);
+  if(owed.length){ toast('Not yet — '+owed.map(function(s){ return s.name+' has '+studentMakeUpsLeft(s)+' make-up'+(studentMakeUpsLeft(s)===1?'':'s')+' left'; }).join(', ')+'. Keep '+p.name+' until they\'re used or expire.', 8000); return; }
   const linked=studentGuardians.filter(function(g){ return g.parentId===p.id; }).map(function(g){ const s=findStudent(g.studentId); return s? s.name : null; }).filter(Boolean);
   const finished=students.filter(function(s){ return s.parentId===p.id; }).map(function(s){ return s.name; });
   if(!confirm('Delete '+p.name+' ('+p.email+')?\n\n'
@@ -8749,7 +8767,9 @@ function deleteParent(parentId){
   });
 }
 function parentRowHtml(p){
-  const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); return s? s.name+(s.parentId!==p.id? ' <span class="muted">(as 2nd parent)</span>' : '') : null; }).filter(Boolean);
+  const kids=(p.studentIds||[]).map(function(sid){ const s=findStudent(sid); if(!s) return null;
+    const left=isStudentInactive(s)? studentMakeUpsLeft(s) : 0;
+    return s.name+(s.parentId!==p.id? ' <span class="muted">(as 2nd parent)</span>' : '')+(left? ' <span class="badge soon">'+left+' make-up'+(left===1?'':'s')+' left</span>' : ''); }).filter(Boolean);
   const loginCell = loginStatusCellHtml(p.authUserId,
     '<button class="btn sm ghost" onclick="inviteLogin(\''+p.email+'\',\'parent\',\''+p.id+'\',\''+p.name.replace(/'/g,"\\'")+'\')">Invite login</button>',
     resendInviteButtonHtml(p.email, 'parent', p.id, p.name));
@@ -9565,7 +9585,7 @@ function creditReportRowHtml(c){
   // completed) — those are tied to a real session and shouldn't be deleted out from under it
   // (Sept 2026, per Allie: "not the redeemed ones").
   const removable = !c.redeemedSessionId;
-  return '<tr><td>'+student.name+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+(c.status==='available'? ' <span class="small muted">'+creditMinutesLeft(c)+' min'+(creditPartlyUsed(c)? ' left' : '')+'</span>' : '')+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
+  return '<tr><td>'+student.name+(isStudentInactive(student)? ' <span class="badge stopping">Finished '+fmtShort(student.stoppedFrom)+'</span>' : '')+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+(c.status==='available'? ' <span class="small muted">'+creditMinutesLeft(c)+' min'+(creditPartlyUsed(c)? ' left' : '')+'</span>' : '')+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
     +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')
     +(c.status==='available' && creditMinutesLeft(c)>=TOPUP_MIN? '<button class="btn sm ghost" onclick="openTopUpPicker(\''+c.id+'\')" title="Use 30 minutes of this credit to extend one of their booked sessions">+30 min</button> ' : '')
     // A booked make-up session can itself be extended from another of the child's credits.
@@ -10798,7 +10818,9 @@ function renderParent(){
       +'<div style="margin-left:auto;display:flex;flex-direction:column;gap:4px;align-items:flex-end">'
         // View-only second parent (Oct 2026, see parentCanManage) — the database refuses their
         // changes anyway; this just doesn't offer buttons that can't work.
-        +(!canManage? '<span class="small muted" style="text-align:right">View only — please contact the centre<br>to make changes for '+student.name+'.</span>'
+        // Finished (Oct 2026) — no holds or schedule changes, just the make-ups they have left.
+        +(isStudentInactive(student)? '<span class="small muted" style="text-align:right">Finished '+fmtShort(student.stoppedFrom)+'.<br>You can still book any make-up credits below until they expire.</span>'
+        : !canManage? '<span class="small muted" style="text-align:right">View only — please contact the centre<br>to make changes for '+student.name+'.</span>'
         : '<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>'
         +(openHoldCount>0? '<span class="small muted">'+openHoldCount+' hold request'+(openHoldCount===1?'':'s')+' pending</span>' : '')
         +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Change regular day/time</a>')
