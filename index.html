@@ -2681,11 +2681,33 @@ function closeHoldRequestForm(){ state.holdRequestForm=null; render(); }
 // (openHoldForm) is unaffected — they can still line up anything further ahead themselves.
 var HOLD_REQUEST_MAX_MONTHS_AHEAD=3;
 function latestHoldRequestStart(){ return addMonths(simNow(), HOLD_REQUEST_MAX_MONTHS_AHEAD); }
+// How many holds a parent can request (Oct 2026, per Allie: "I want parents to not be allowed to place
+// every single holiday on hold") — in any 6-month period, per child: one hold over 2 weeks and up to
+// two of 2 weeks or less. Counts the child's holds on file (whoever placed them) plus pending hold
+// requests. Front desk's own hold form isn't limited.
+var HOLD_LONG_DAYS=14, HOLD_LIMIT_LONG=1, HOLD_LIMIT_SHORT=2, HOLD_LIMIT_WINDOW_MONTHS=6;
+var HOLD_LIMIT_MESSAGE='Maximum hold period request exceeded. Please contact the centre directly at fivedock@mathnasium.com.au';
+function holdLengthDays(startKey, endKey){ return Math.round((new Date(endKey)-new Date(startKey))/86400000)+1; }
+function holdRequestExceedsLimit(studentId, startKey, endKey){
+  const student=findStudent(studentId);
+  const holds=(student.holds||[]).map(function(h){ return {start:toKey(h.start), end:toKey(h.end)}; })
+    .concat(enrollmentRequests.filter(function(r){ return r.studentId===studentId && r.type==='hold' && r.status==='open'; })
+      .map(function(r){ return {start:toKey(r.start), end:toKey(r.end)}; }))
+    .concat([{start:startKey, end:endKey}]);
+  // Every 6-month window starting at one of the holds' start dates (covers every rolling window that matters).
+  return holds.some(function(w){
+    const from=w.start, to=toKey(addMonths(new Date(w.start), HOLD_LIMIT_WINDOW_MONTHS));
+    const inWin=holds.filter(function(h){ return h.start>=from && h.start<to; });
+    const longs=inWin.filter(function(h){ return holdLengthDays(h.start, h.end)>HOLD_LONG_DAYS; }).length;
+    return longs>HOLD_LIMIT_LONG || inWin.length-longs>HOLD_LIMIT_SHORT;
+  });
+}
 // As with the cancellation form, a start date inside the 7-day notice window is no longer a hard
 // stop — the banner below just lights up live so it's never a surprise (Sept 2026, per Allie).
 function setHoldRequestField(field, value){
   state.holdRequestForm[field]=value;
   state.holdRequestForm.error='';
+  state.holdRequestForm.limitHit=false;
   if(field==='start'){ state.holdRequestForm.lateNotice = !!(value && !monthNoticeOk(new Date(value))); }
   render();
 }
@@ -2697,6 +2719,7 @@ function submitHoldRequest(){
     f.error='Holds can only be requested up to '+HOLD_REQUEST_MAX_MONTHS_AHEAD+' months ahead — please choose a start date on or before '+fmtShort(latestHoldRequestStart())+', or contact the centre.';
     render(); return;
   }
+  if(holdRequestExceedsLimit(f.studentId, f.start, f.end)){ f.limitHit=true; render(); return; }
   const start=new Date(f.start);
   // A hold requested inside the 7-day billing-notice window still goes through — front desk just
   // can't get a billing credit applied to this cycle in time, so make-up sessions are granted
@@ -11044,8 +11067,11 @@ function renderHoldRequestModal(){
   html+='<p>Our team will review your request and confirm it with you before any changes are made.</p>'
     +'<p>Hold requests must be submitted at least 7 days before your next monthly payment cycle. All monthly payment cycles are processed on the 1st of each month.</p>';
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  // Hold limit (Oct 2026) — shown live as soon as the dates picked would go over it, and on Send.
+  if(f.limitHit || (f.start && f.end && f.end>=f.start && holdRequestExceedsLimit(f.studentId, f.start, f.end)))
+    html+='<div class="banner danger">'+HOLD_LIMIT_MESSAGE.replace('fivedock@mathnasium.com.au','<a href="mailto:fivedock@mathnasium.com.au">fivedock@mathnasium.com.au</a>')+'</div>';
   if(f.lateNotice) html+='<div class="banner warn">Your hold can still be placed for these dates, however a credit cannot be applied as the request was made less than 7 days before the 1st of the month. Make-up sessions will be added for eligible sessions missed during the hold.</div>';
-  html+='<p class="small muted">Holds can be requested up to '+HOLD_REQUEST_MAX_MONTHS_AHEAD+' months ahead.</p>';
+  html+='<p class="small muted">Holds can be requested up to '+HOLD_REQUEST_MAX_MONTHS_AHEAD+' months ahead. In any 6 months, each child can have one hold longer than 2 weeks and up to two shorter ones.</p>';
   html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.start+'" max="'+toKey(latestHoldRequestStart())+'" onchange="setHoldRequestField(\'start\',this.value)"/></div>'
     +'<div><label>End date</label><input type="date" value="'+f.end+'" onchange="setHoldRequestField(\'end\',this.value)"/></div></div>';
   html+='<label>Note (optional)</label><input type="text" placeholder="e.g. family vacation" value="'+f.note+'" oninput="setHoldRequestField(\'note\',this.value)"/>';
