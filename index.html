@@ -818,7 +818,7 @@ function nextClosedDayOccurrence(c, from){
 // newly marked closed so nobody has to hunt down and cancel those sessions by hand.
 function cancelSessionsOnClosedDate(date){
   const dateKey=toKey(date);
-  const affected=sessions.filter(function(s){ return toKey(s.date)===dateKey && s.status==='scheduled'; });
+  const affected=sessionsOnDate(dateKey).filter(function(s){ return s.status==='scheduled'; });
   affected.forEach(function(sess){
     sess.status='cancelled';
     dbWrite('cancelling a session for a centre closure', function(){ return supabaseClient.from('sessions').update({status:'cancelled'}).eq('id', sess.id); });
@@ -1722,13 +1722,28 @@ function findStaffMember(id){ return staffMembers.find(s=>s.id===id); }
 function sessionTakesSeat(s){ return s.status!=='cancelled' && s.status!=='excused' && s.status!=='no-show'; }
 // Sessions occupying a Pod that day (see sessionTakesSeat) — capacity belongs to the Pod as a whole,
 // not to whichever instructor happens to be covering it at a given moment.
+// Sessions filed by date (Oct 2026, per Allie: "its slow ... when you check kids into the centre") —
+// with ~10,000 sessions on file, every "which sessions are on this day" question used to scan all of
+// them (hundreds of times per redraw). The index is rebuilt whenever the sessions array is replaced,
+// grows or shrinks, or a session is patched in from live sync (markSessionsChanged). A session's own
+// date never changes after it's created, so status/Pod/instructor edits don't need a rebuild.
+var sessionDayIndex={arr:null, len:-1, map:null};
+function markSessionsChanged(){ sessionDayIndex.arr=null; ratioSigMemo=null; }
+function sessionsOnDate(dateKey){
+  if(sessionDayIndex.arr!==sessions || sessionDayIndex.len!==sessions.length){
+    const map={};
+    for(let i=0;i<sessions.length;i++){ const s=sessions[i]; const k=toKey(s.date); (map[k]||(map[k]=[])).push(s); }
+    sessionDayIndex={arr:sessions, len:sessions.length, map:map};
+  }
+  return sessionDayIndex.map[dateKey]||[];
+}
 function sessionsForDay(podId, dateKey){
-  return sessions.filter(s=> s.podId===podId && toKey(s.date)===dateKey && sessionTakesSeat(s));
+  return sessionsOnDate(dateKey).filter(s=> s.podId===podId && sessionTakesSeat(s));
 }
 // Sessions a given INSTRUCTOR is personally involved in that day, across any Pod — used for their
 // own "my schedule" view, not for capacity math.
 function sessionsInvolvingInstructor(instructorId, dateKey){
-  return sessions.filter(s=> (s.instructorId===instructorId || s.instructorId2===instructorId) && toKey(s.date)===dateKey && s.status!=='cancelled');
+  return sessionsOnDate(dateKey).filter(s=> (s.instructorId===instructorId || s.instructorId2===instructorId) && s.status!=='cancelled');
 }
 
 // A student's attendance HISTORY — every past session on file for them, most recent first,
@@ -1877,16 +1892,16 @@ function podCapacityBlocked(podId, dateKey, extra){
 // An instructor's own physical (non-online) sessions that day — the same headcount that already
 // counts toward whichever Pod(s) they're covering, just keyed by instructor instead of Pod.
 function instructorPhysicalSessionsForDay(instructorId, dateKey){
-  return sessions.filter(function(s){
-    return (s.instructorId===instructorId || s.instructorId2===instructorId) && toKey(s.date)===dateKey && sessionTakesSeat(s) && !s.online;
+  return sessionsOnDate(dateKey).filter(function(s){
+    return (s.instructorId===instructorId || s.instructorId2===instructorId) && sessionTakesSeat(s) && !s.online;
   });
 }
 // An instructor's own Online-group sessions that day. Online sessions are never split across a
 // handoff (instructorId2/handoff stay null) — one instructor mans a given online student the whole
 // session, same as every other online student sitting in their group at that moment.
 function instructorOnlineSessionsForDay(instructorId, dateKey){
-  return sessions.filter(function(s){
-    return s.instructorId===instructorId && toKey(s.date)===dateKey && sessionTakesSeat(s) && !!s.online;
+  return sessionsOnDate(dateKey).filter(function(s){
+    return s.instructorId===instructorId && sessionTakesSeat(s) && !!s.online;
   });
 }
 // Peak simultaneous COMBINED (physical + online) headcount instructor X is personally minding at
@@ -2142,9 +2157,9 @@ function setSessionLocation(sessionId, value){
 
 function studentOverlapClash(studentId, dateKey, start, duration, excludeSessionId){
   const end=start+duration;
-  return sessions.some(function(s){
+  return sessionsOnDate(dateKey).some(function(s){
     return s.studentId===studentId && s.status!=='cancelled' && s.id!==excludeSessionId
-      && toKey(s.date)===dateKey && s.start<end && start<s.start+s.duration;
+      && s.start<end && start<s.start+s.duration;
   });
 }
 
@@ -3134,7 +3149,7 @@ function generateRecurringSessions(student, weeksAhead, deferredSessions){
       // as this occurrence — otherwise it was booked straight back in (Oct 2026, per Allie: "some
       // kids cancelled their session earlier today, but they re-appeared"). Other cancels (Pod
       // move, schedule edit, plan change) are meant to be re-booked, so they don't count.
-      const dup=sessions.find(function(s){ return s.studentId===student.id && toKey(s.date)===dateKey && s.start===slot.start && (s.status!=='cancelled' || s.parentCancelled || s.oneOffCancel); });
+      const dup=sessionsOnDate(dateKey).find(function(s){ return s.studentId===student.id && s.start===slot.start && (s.status!=='cancelled' || s.parentCancelled || s.oneOffCancel); });
       if(dup){
         // Already exists — normally nothing to do. The one exception: a previously-unassigned
         // occurrence (see below) is always worth trying again, since regenerateAllRecurring() runs
@@ -4102,7 +4117,7 @@ function confirmCheckIn(){
   } else {
     toast(findStudent(sess.studentId).name+' checked in — running '+minToLabel(sess.actualStart)+'–'+minToLabel(sess.actualEnd)+'.');
   }
-  render();
+  // toast() already redraws — a second render() here doubled the wait on every check-in (Oct 2026).
 }
 
 // Puts a cancelled / away ("Issue Make-up Credit") / "Not in Today" session back to booked, same
@@ -4288,7 +4303,7 @@ function setActualStart(sessionId, v){
 // today" panel and the check-out picker so the two always agree on who's still around.
 function checkedInTodayStillPresent(){
   const todayKey=toKey(simNow());
-  return sessions.filter(function(s){ return s.status==='attended' && toKey(s.date)===todayKey && s.actualEnd!=null && !s.checkedOut; });
+  return sessionsOnDate(todayKey).filter(function(s){ return s.status==='attended' && s.actualEnd!=null && !s.checkedOut; });
 }
 
 // Explicit "Check out" action (5.24) — separate from just editing the exit-time estimate above,
@@ -5067,7 +5082,17 @@ function unassignedPeakInWindow(dateKey, winStart, winEnd){
 // front desk to seat.
 var RATIO_STEP=5;
 var ratioDayCache={};
-function clearRatioCache(){ ratioDayCache={}; }
+function clearRatioCache(){ ratioDayCache={}; ratioSigMemo=null; }
+// The "has anything changed" signature, worked out once per redraw rather than on every call (Oct
+// 2026 speed fix — it walks every session, and was being recomputed ~100 times per redraw).
+var ratioSigMemo=null, ratioSigArr=null, ratioSigLen=-1;
+function ratioDataSig(){
+  if(ratioSigMemo!==null && ratioSigArr===sessions && ratioSigLen===sessions.length) return ratioSigMemo;
+  let seated=0, mins=0;
+  sessions.forEach(function(s){ if(sessionTakesSeat(s)){ seated++; mins+=s.duration; } });
+  ratioSigArr=sessions; ratioSigLen=sessions.length;
+  return (ratioSigMemo=sessions.length+'|'+seated+'|'+mins+'|'+podDayOverrides.length);
+}
 function ratioIdx(min){ return Math.floor(min/RATIO_STEP); }
 // Per-RATIO_STEP arrays for one date: in-person / online capacity (from who's on shift) and
 // headcount (from sessions taking a seat). includeHeld (permanent-availability checks only — the
@@ -5076,11 +5101,9 @@ function ratioIdx(min){ return Math.floor(min/RATIO_STEP); }
 // dont want it to affect on-the-day availability, just permanent availability").
 function heldSpotStudents(){ return students.filter(function(s){ return s.heldUntil && !isStudentInactive(s); }); }
 function ratioDay(dateKey, includeHeld){
-  // Cleared on every render(); the signature also catches a booking/cancel/hold made between renders.
-  let seated=0, mins=0;
-  sessions.forEach(function(s){ if(sessionTakesSeat(s)){ seated++; mins+=s.duration; } });
+  // Cleared on every render(); the signature (worked out once per render) catches anything else.
   const held=includeHeld? heldSpotStudents() : [];
-  const sig=sessions.length+'|'+seated+'|'+mins+'|'+podDayOverrides.length+'|'+held.map(function(s){ return s.id+s.recurring.length; }).join(',');
+  const sig=ratioDataSig()+'|'+held.map(function(s){ return s.id+s.recurring.length; }).join(',');
   const cacheKey=dateKey+(includeHeld?'|held':'');
   if(ratioDayCache[cacheKey] && ratioDayCache[cacheKey].sig===sig) return ratioDayCache[cacheKey];
   const n=ratioIdx(24*60), date=new Date(dateKey);
@@ -5107,8 +5130,8 @@ function ratioDay(dateKey, includeHeld){
       capOn[i]+=Math.max(0, cap-CAPACITY);
     });
   }
-  sessions.forEach(function(s){
-    if(toKey(s.date)!==dateKey || !sessionTakesSeat(s)) return;
+  sessionsOnDate(dateKey).forEach(function(s){
+    if(!sessionTakesSeat(s)) return;
     const arr=s.online? kidsOn : kidsIn;
     for(let i=ratioIdx(s.start); i<ratioIdx(s.start+s.duration) && i<n; i++) arr[i]++;
   });
@@ -5399,7 +5422,7 @@ function fulfillWaitlistEntry(id){
   // me the option to change todays or go from next one"). Not checked in yet → ask (waitlistMoveForm).
   // Already checked in → the change starts tomorrow, so they never end up with two sessions today.
   const todayKey=toKey(simNow());
-  const todays=sessions.filter(function(s){ return s.studentId===student.id && s.recurring && toKey(s.date)===todayKey && (s.status==='scheduled' || s.status==='attended'); });
+  const todays=sessionsOnDate(todayKey).filter(function(s){ return s.studentId===student.id && s.recurring && (s.status==='scheduled' || s.status==='attended'); });
   const tomorrow=addDays(new Date(todayKey), 1);
   if(todays.some(function(s){ return s.status==='attended'; })){
     if(!confirm('Move '+student.name+' from '+fromLabel+' to '+w.weekday+' '+minToLabel(w.start)+'?\n\nThey\'ve already checked in today, so the new time starts from '+fmtShort(tomorrow)+'.')) return;
@@ -6668,8 +6691,8 @@ function setExpectedHeadcountWeek(offset){
 function checkedInNamesByPod(dayKey){
   const live = dayKey===toKey(simNow());
   const byPod={};
-  sessions.forEach(function(s){
-    if(s.status!=='attended' || !s.podId || toKey(s.date)!==dayKey) return;
+  sessionsOnDate(dayKey).forEach(function(s){
+    if(s.status!=='attended' || !s.podId) return;
     if(live && s.checkedOut) return;
     const student=findStudent(s.studentId);
     if(!student) return;
@@ -6787,8 +6810,8 @@ function liveOccupancyGroups(dayKey){
   const live = dayKey===toKey(simNow());
   const weekday=WEEKDAY_KEYS[(new Date(dayKey).getDay()+6)%7];
   const byPod={}, byOnlineInstr={};
-  sessions.forEach(function(s){
-    if(s.status!=='attended' || toKey(s.date)!==dayKey) return;
+  sessionsOnDate(dayKey).forEach(function(s){
+    if(s.status!=='attended') return;
     if(live && s.checkedOut) return;
     const student=findStudent(s.studentId);
     if(!student) return;
@@ -7183,7 +7206,7 @@ function regularSeatingRows(weekday){
     const plan=studentPlanOn(student.id, date);
     const slot=(plan.recurring||[]).find(function(r){ return r.weekday===weekday; });
     if(!slot) return;
-    const sameSlot=sessions.filter(function(s){ return s.studentId===student.id && toKey(s.date)===dayKey && s.start===slot.start; });
+    const sameSlot=sessionsOnDate(dayKey).filter(function(s){ return s.studentId===student.id && s.start===slot.start; });
     const live=sameSlot.find(function(s){ return s.status!=='cancelled'; }) || null;
     const cancelled=live? null : (sameSlot[0]||null);
     // Where they sit: the real session if there is one, otherwise their standing pin (what the next
@@ -7349,8 +7372,8 @@ function notComingSessionsForDay(dayKey){
   if(dayKey<toKey(simNow())) return [];
   const date=new Date(dayKey);
   const weekday=WEEKDAY_KEYS[(date.getDay()+6)%7];
-  const list=sessions.filter(function(s){
-    if(toKey(s.date)!==dayKey || sessionTakesSeat(s)) return false;
+  const list=sessionsOnDate(dayKey).filter(function(s){
+    if(sessionTakesSeat(s)) return false;
     const student=findStudent(s.studentId);
     if(!student || isStudentInactive(student) || isStudentOnHold(s.studentId, date)) return false;
     if(studentOverlapClash(s.studentId, dayKey, s.start, s.duration, s.id)) return false;
@@ -7396,7 +7419,7 @@ function notComingCardHtml(dayKey){
 // list reads top-to-bottom as "who's here/coming first". Student name is now only a tie-break for
 // two sessions landing at the exact same time.
 function scheduleListForDay(dayKey){
-  return sessions.filter(function(s){ return toKey(s.date)===dayKey && s.status!=='cancelled'; })
+  return sessionsOnDate(dayKey).filter(function(s){ return s.status!=='cancelled'; })
     .slice()
     .sort(function(a,b){
       const aTime=(a.status==='attended' && a.actualStart!=null)? a.actualStart : a.start;
@@ -7478,7 +7501,7 @@ function setPermanentSessionLocation(sessionId, weekday, dayKey, value){
 // directly — on hold, cancelled just that once, or not started yet (Oct 2026, the standing roster in
 // regularSeatingRows shows them too). If they do have one, it's the session-based move above.
 function setPermanentStudentLocation(studentId, weekday, dayKey, start, value){
-  const live=sessions.find(function(s){ return s.studentId===studentId && toKey(s.date)===dayKey && s.start===start && s.status!=='cancelled'; });
+  const live=sessionsOnDate(dayKey).find(function(s){ return s.studentId===studentId && s.start===start && s.status!=='cancelled'; });
   if(live){ setPermanentSessionLocation(live.id, weekday, dayKey, value); return; }
   const student=findStudent(studentId);
   const isOnline=String(value).indexOf('online:')===0;
@@ -8018,7 +8041,7 @@ function renderCheckedInPanel(){
   // Everyone who's come in today, including those already checked out (Oct 2026, per Allie: "a
   // counter of how many kids have come to the centre today") — counted once per child.
   const todayKey=toKey(simNow());
-  const cameToday=new Set(sessions.filter(function(s){ return s.status==='attended' && toKey(s.date)===todayKey; }).map(function(s){ return s.studentId; })).size;
+  const cameToday=new Set(sessionsOnDate(todayKey).filter(function(s){ return s.status==='attended'; }).map(function(s){ return s.studentId; })).size;
   let html=sectionOpen('checkedin','Checked in today',
     '<span class="small muted">'+todays.length+' student'+(todays.length===1?'':'s')+' · '+cameToday+' total today</span>');
   // Relocated here, at the very top of the section (Sept 2026, per Allie: "move who's here right
@@ -8179,7 +8202,7 @@ function renderFirstDayPanel(){
   let html='<div class="banner info" style="flex-direction:column;align-items:stretch">';
   html+='<div style="display:flex;align-items:center;gap:8px"><b>🌟 First day today</b></div>';
   html+='<div class="small" style="margin-top:4px">'+starting.map(function(s){
-    const sess=sessions.find(function(x){ return x.studentId===s.id && toKey(x.date)===todayKey && x.status!=='cancelled'; });
+    const sess=sessionsOnDate(todayKey).find(function(x){ return x.studentId===s.id && x.status!=='cancelled'; });
     const detail = sess
       ? rangeLabel(sess.start, sess.duration)+' · '+(sess.online? 'Online' : (sess.podId? findPod(sess.podId).name : 'Unassigned'))+(sess.instructorId? ' with '+findInstructor(sess.instructorId).name : '')
       : 'no session booked today';
@@ -10179,7 +10202,7 @@ function openCoverageRequestsSortedForInstructor(instructorId){
 // got overwritten back to false the moment data next reloaded, with no error ever shown.
 function reassignSessionsForCoverageChange(podId, weekday, dateKey){
   const date=new Date(dateKey);
-  sessions.filter(function(s){ return s.podId===podId && !s.online && toKey(s.date)===dateKey && s.status!=='cancelled'; })
+  sessionsOnDate(dateKey).filter(function(s){ return s.podId===podId && !s.online && s.status!=='cancelled'; })
     .forEach(function(s){
       const cov=sessionMinderFor(podId, weekday, s.start, s.duration, date); // a floor move wins (Oct 2026)
       if(cov.primaryInstructorId===s.instructorId && (cov.secondaryInstructorId||null)===(s.instructorId2||null) && (cov.handoffAt||null)===(s.handoff||null)) return; // nothing actually changed for this session
@@ -11570,10 +11593,37 @@ function scheduleLiveSync(tableName){
     loadDataGroups(Object.keys(groups)).then(renderUnlessEditing).catch(function(err){ console.error('Live sync refresh failed', err); });
   }, 500);
 }
+// A changed session is patched straight in from the live-sync message itself (Oct 2026, per Allie:
+// "its slow ... when you check kids into the centre") — every check-in used to make every open
+// screen re-download all ~10,000 sessions. Front desk / instructor logins only; a parent's view merges
+// in extra occupancy data, so it still reloads the group (they rarely see others' changes anyway).
+var liveRenderTimer=null;
+function applyLiveSessionChange(payload){
+  if(!currentUser || currentUser.role==='parent' || !payload) return false;
+  const ev=payload.eventType;
+  if(ev==='DELETE'){
+    const id=payload.old && payload.old.id;
+    if(!id) return false;
+    sessions=sessions.filter(function(s){ return s.id!==id; });
+  } else if(ev==='INSERT' || ev==='UPDATE'){
+    const row=payload.new;
+    if(!row || !row.id || !row.the_date) return false;
+    const fresh=sessionFromRow(row);
+    const existing=sessions.find(function(s){ return s.id===row.id; });
+    if(existing) Object.assign(existing, fresh); else sessions.push(fresh);
+  } else return false;
+  markSessionsChanged();
+  if(liveRenderTimer) clearTimeout(liveRenderTimer);
+  liveRenderTimer=setTimeout(function(){ liveRenderTimer=null; renderUnlessEditing(); }, 300);
+  return true;
+}
 function subscribeToLiveUpdates(){
   let channel=supabaseClient.channel('live-updates');
   LIVE_SYNC_TABLES.forEach(function(t){
-    channel=channel.on('postgres_changes', {event:'*', schema:'public', table:t}, function(){ scheduleLiveSync(t); });
+    channel=channel.on('postgres_changes', {event:'*', schema:'public', table:t}, function(payload){
+      if(t==='sessions' && applyLiveSessionChange(payload)) return;
+      scheduleLiveSync(t);
+    });
   });
   // Logged rather than silent — Realtime depends on several things lining up (the table actually
   // being in the supabase_realtime publication, the project's Realtime feature, the connecting
@@ -11839,7 +11889,13 @@ function fetchSessionsGroup(){
   const mySeq=nextGroupSeq('sessions');
   return fetchTablePaginated('sessions','id,student_id,pod_id,instructor_id,instructor_id_2,handoff_min,the_date,start_min,duration,status,actual_start_min,actual_end_min,check_in_offset,checked_out,booked_by,is_recurring,credit_id,online,term_break,created_at,extra_min,extra_credit_id,parent_cancelled,one_off_cancel').then(function(sessionRows){
     if(!isLatestGroupSeq('sessions', mySeq)) return; // a newer sessions refresh was dispatched after this one — this response is now stale, discard it rather than clobber fresher state (task #246)
-    sessions=sessionRows.map(function(r){ return {
+    sessions=sessionRows.map(sessionFromRow);
+    return fetchParentOccupancyIfNeeded();
+  });
+}
+// One database sessions row -> the app's session object (shared by the full load and by live-sync
+// patches of a single changed row — see applyLiveSessionChange).
+function sessionFromRow(r){ return {
       id:r.id, studentId:r.student_id, podId:r.pod_id, instructorId:r.instructor_id, instructorId2:r.instructor_id_2,
       handoff:r.handoff_min, date:new Date(r.the_date), start:r.start_min, duration:r.duration, status:r.status,
       actualStart:r.actual_start_min, actualEnd: r.actual_end_min==null? null : Math.min(r.actual_end_min, CENTER_CLOSE), checkInOffset:r.check_in_offset, checkedOut:r.checked_out||false, // finish never shown past close (Oct 2026)
@@ -11851,10 +11907,7 @@ function fetchSessionsGroup(){
       // rows on file for the same student+date — createdAt lets holdMonthlyBreakdown() trust only the
       // most recently written row per date instead of every stale duplicate.
       createdAt:r.created_at? new Date(r.created_at) : null,
-    }; });
-    return fetchParentOccupancyIfNeeded();
-  });
-}
+    }; }
 
 // A parent's own read of `sessions` above (parent_read_own_children_sessions) is deliberately
 // scoped to just their own kids — nobody else's family should be visible to them at all. But every
