@@ -2653,7 +2653,7 @@ function approveEnrollmentRequest(id){
   // cancellation (no credit) for those later sessions even though the hold as a whole started late
   // (Sept 2026, per Allie: "any sessions that fall in the period of sufficient notice should just
   // be automatically cancelled").
-  if(req.type==='hold'){ applyHold(student, req.start, req.end, req.note, true); }
+  if(req.type==='hold'){ applyHold(student, req.start, req.end, req.note, true, req.createdAt||null); } // notice judged from when it was submitted (Oct 2026)
   else if(req.type==='time_change'){ applyTimeChange(student, req.effectiveFrom, req.requestedRecurring||[], req.note); }
   else { applyStopEnrollment(student, req.effectiveFrom, req.note); }
   req.status='approved';
@@ -6125,7 +6125,10 @@ function holdLateNoticeSessions(studentId, startKey, endKey){
 // September into November can straddle both: September sessions (this cycle's billing already
 // locked in) get a make-up credit, while November sessions (plenty of notice by now) just get a
 // plain cancellation — exactly like an ordinary, well-notified hold.
-function applyHold(student, start, end, note, grantMakeupCredits){
+// noticeFrom (Oct 2026, per Allie: "it needs to be done from when they were entered, not when they
+// are approved") — for an approved parent request, notice is judged from when they SUBMITTED it, so
+// a request sent in time stays in time however long it waits for approval. Defaults to today.
+function applyHold(student, start, end, note, grantMakeupCredits, noticeFrom){
   const hold={id:newId()||('hold'+(nextSessionId++)), start:start, end:end, note:(note||'').trim(), creditsIssued:0};
   student.holds=student.holds||[];
   student.holds.push(hold);
@@ -6147,7 +6150,7 @@ function applyHold(student, start, end, note, grantMakeupCredits){
         credit.status='available'; credit.redeemedSessionId=null;
         dbWrite('restoring a make-up credit', function(){ return supabaseClient.from('credits').update({status:'available', redeemed_session_id:null}).eq('id', credit.id); });
       }
-    } else if(grantMakeupCredits && !monthNoticeOk(s.date)){
+    } else if(grantMakeupCredits && !monthNoticeOk(s.date, noticeFrom)){
       // Named to this specific missed session's own date, not the hold's overall start–end range —
       // a hold that straddles a late-notice month and a well-notified one only issues credits for
       // sessions in the former, so the note should point at the actual session, not the whole hold.
@@ -7988,8 +7991,11 @@ function renderEnrollmentRequestsPanel(){
     // is the closest safe equivalent, since only staff logins can actually write a schedule change).
     const readyToApprove = r.type==='time_change' && (r.requestedRecurring||[]).length>0
       && r.requestedRecurring.every(function(rec){ return standingSlotHasAvailability(rec.weekday, rec.start, student.duration, student.year); });
+    // Notice is judged from when the parent sent it (Oct 2026 — see applyHold's noticeFrom).
+    const holdLate = r.type==='hold' && r.createdAt && !monthNoticeOk(r.start, r.createdAt);
     const detail = r.type==='hold'
       ? 'Hold: '+fmtShort(r.start)+'–'+fmtShort(r.end)
+        +(r.createdAt? '<div class="small muted">Sent '+fmtShort(r.createdAt)+' — '+(holdLate? '<span style="color:var(--warning)">late notice: sessions without enough notice become make-up credits</span>' : 'enough notice, sessions just cancelled')+'</div>' : '')
       : r.type==='time_change'
       ? timeChangeSwapDetail(r)+' from '+fmtShort(r.effectiveFrom)+(readyToApprove? ' <span class="badge available">All times open — ready to approve</span>' : '')
       : '<span class="badge full">Cancel enrolment</span> from '+fmtShort(r.effectiveFrom);
