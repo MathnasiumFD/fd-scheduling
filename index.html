@@ -2293,7 +2293,19 @@ function creditDisplayStatus(c){
   return 'available';
 }
 
-function toast(msg, ms){ state.toast=msg; render(); setTimeout(function(){ state.toast=null; render(); }, ms||3400); }
+// The message just disappears when it times out (Nov 2026) — it used to redraw the whole page again.
+// A newer message keeps its own full time on screen instead of being cleared by an older one's timer.
+var toastSeq=0;
+function toast(msg, ms){
+  const mine=++toastSeq;
+  state.toast=msg; render();
+  setTimeout(function(){
+    if(mine!==toastSeq) return;
+    state.toast=null;
+    const el=document.querySelector('#app .toast');
+    if(el) el.remove();
+  }, ms||3400);
+}
 
 /* ---------- standing weekly schedule (pre-booking) ---------- */
 // Front-desk-only "hold": the student keeps their standing recurring pattern (it isn't touched),
@@ -3957,8 +3969,7 @@ function checkInSearchCandidates(query){
   const q=String(query||'').trim().toLowerCase();
   if(!q) return [];
   const todayKey=toKey(simNow());
-  return sessions.filter(function(s){
-    if(toKey(s.date)!==todayKey) return false;
+  return sessionsOnDate(todayKey).filter(function(s){
     if(s.status==='attended' && s.checkedOut) return false;
     if(s.status!=='attended' && s.status!=='scheduled') return false;
     const student=findStudent(s.studentId);
@@ -3972,7 +3983,13 @@ function checkInSearchCandidates(query){
     return a.name.localeCompare(b.name, undefined, {sensitivity:'base'});
   }).slice(0,8);
 }
-function setCheckInSearchQuery(v){ state.checkInSearchQuery=v; render(); }
+// Typing only redraws the results under the box (Nov 2026, per Allie: still "a little slow" with two
+// laptops checking kids in) — it used to rebuild the whole page on every letter.
+function setCheckInSearchQuery(v){
+  state.checkInSearchQuery=v;
+  const box=document.getElementById('checkInSearchResults');
+  if(box) box.innerHTML=checkInSearchResultsHtml(v); else render();
+}
 // Picking a suggestion goes straight to whichever modal actually applies right now — Check-in
 // (Pod + arrival time) if they haven't arrived yet, Check-out (exit time) if they're already here —
 // instead of making front desk scroll the Schedule list or Pod seating section to find that same row.
@@ -3985,9 +4002,15 @@ function selectCheckInSearchResult(sessionId){
 }
 function renderCheckInSearchPanel(){
   const q=state.checkInSearchQuery||'';
-  const results=checkInSearchCandidates(q);
   let html='<div class="card" style="margin-bottom:12px">';
   html+='<input type="text" placeholder="Check a student in or out — start typing their name…" value="'+q.replace(/"/g,'&quot;')+'" oninput="setCheckInSearchQuery(this.value)" style="margin-bottom:0"/>';
+  html+='<div id="checkInSearchResults">'+checkInSearchResultsHtml(q)+'</div>';
+  html+='</div>';
+  return html;
+}
+function checkInSearchResultsHtml(q){
+  const results=checkInSearchCandidates(q);
+  let html='';
   if(q.trim()){
     if(results.length){
       html+='<div style="margin-top:8px;display:flex;flex-direction:column;gap:4px">'
@@ -4017,7 +4040,6 @@ function renderCheckInSearchPanel(){
       html+='<div class="empty-note" style="margin-top:8px;padding-bottom:0">No match among today\'s students still to arrive or already checked in.</div>';
     }
   }
-  html+='</div>';
   return html;
 }
 
@@ -6418,6 +6440,21 @@ function renderPastHoldsPanel(){
 // by its position among the other text fields in the same modal, since these forms don't carry
 // individual ids — and restore focus/cursor there. A plain click, dropdown change, or button press
 // has nothing focused that this applies to, so it's a no-op the rest of the time.
+// Speed log (Nov 2026, per Allie: "still a little slow ... two laptops") — front desk logins send one
+// summary line every 5 minutes they're in use: how many redraws, average and slowest time, and how
+// many sessions are loaded. No student or family details. Table: client_perf_log.
+var perfStats={n:0, total:0, max:0, slow:0};
+function notePerf(ms){
+  perfStats.n++; perfStats.total+=ms; if(ms>perfStats.max) perfStats.max=ms; if(ms>150) perfStats.slow++;
+}
+function flushPerf(){
+  if(!supabaseClient || !currentUser || currentUser.role!=='staff' || !perfStats.n) return;
+  const row={role:currentUser.role, device:(navigator.userAgent||'').slice(0,120), renders:perfStats.n,
+    avg_ms:Math.round(perfStats.total/perfStats.n), max_ms:Math.round(perfStats.max), slow_renders:perfStats.slow, sessions:sessions.length};
+  perfStats={n:0, total:0, max:0, slow:0};
+  supabaseClient.from('client_perf_log').insert(row).then(function(){}, function(){});
+}
+if(typeof window!=='undefined') setInterval(flushPerf, 300000);
 function render(){
   const app=document.getElementById('app');
   const active = (typeof document!=='undefined') ? document.activeElement : null;
@@ -6454,7 +6491,9 @@ function render(){
   // Fresh ratio numbers every screen update, so a shift edit (times, instructor, one-off cover)
   // shows straight away in the Availability Lookup and parents' options (Oct 2026).
   clearRatioCache();
+  const perfStart=performance.now();
   app.innerHTML = renderTop() + renderTabs() + renderRole() + (state.toast? '<div class="toast">'+state.toast+'</div>':'') + renderFooter();
+  notePerf(performance.now()-perfStart);
   if(Math.abs((window.pageYOffset||document.documentElement.scrollTop||0)-pageY)>1) window.scrollTo(0, pageY);
   const newOverlay=app.querySelector('.overlay');
   if(newOverlay && prevOverlay && overlayY) newOverlay.scrollTop=overlayY;
