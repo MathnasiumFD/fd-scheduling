@@ -10868,7 +10868,7 @@ function renderParent(){
   html+='<div class="card"><div class="card-head"><h2>Welcome, '+parent.name+'</h2><button class="btn sm ghost" onclick="'+(supabaseClient?'logOut()':'parentLogout()')+'">Log out</button></div>'
     +'<p>This is your MATHQ hub for your child’s sessions — see what’s upcoming, request a permanent day/time change, cancel a session, or book a make-up using our live availability calendar.</p>'
     +'<p>You’ll only ever see times that are actually available to book — never other families’ bookings or private centre information.</p>'
-    +'<p>Please make all cancellations, schedule-change requests and make-up bookings here rather than by phone, email or text. Cancellations, make-up bookings and permanent day/time changes all update instantly — holds and cancelling enrolment are the only requests our team reviews first.</p>'
+    +'<p>Please make all cancellations, schedule-change requests and make-up bookings here rather than by phone, email or text. Cancellations, make-up bookings and permanent day/time changes all update instantly — holds are the only requests our team reviews first. To cancel enrolment, please contact the centre.</p>'
     +'<p>Quick, easy, all in one place.</p></div>';
 
   parent.studentIds.forEach(function(sid){
@@ -10910,7 +10910,9 @@ function renderParent(){
         : '<a href="#" class="small" onclick="openHoldRequestForm(\''+sid+'\');return false;">Request a hold</a>'
         +(openHoldCount>0? '<span class="small muted">'+openHoldCount+' hold request'+(openHoldCount===1?'':'s')+' pending</span>' : '')
         +(pendingTimeChange? '<span class="small muted">Schedule change request pending</span>' : '<a href="#" class="small" onclick="openTimeChangeRequestForm(\''+sid+'\');return false;">Change regular day/time</a>')
-        +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : '<a href="#" class="small" onclick="openCancelRequestForm(\''+sid+'\');return false;">Request to cancel enrolment</a>'))
+        // No "Request to cancel enrolment" link (Nov 2026, per Allie) — parents contact the centre;
+        // the database also refuses a parent's cancel request. One already sent still shows as pending.
+        +(pendingCancel? '<span class="small muted">Cancellation request pending</span>' : ''))
       +'</div></div>';
 
     // -- This child's own waitlist entries (5.17, parent self-service Sept 2026) — a parent can see
