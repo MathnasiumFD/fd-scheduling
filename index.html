@@ -984,6 +984,122 @@ function setTermBreakAvailLen(v){ state.termBreakAvailLen=Number(v); render(); }
 // "in summer tab, I need an availability table as well"). No Online row and no click-to-waitlist —
 // summer hours don't run Online sessions, and a full column here just means "no morning slots left
 // for that day," not something front desk maintains its own waitlist queue against.
+/* ---------- instructors' summer-hours availability (Nov 2026) ---------- */
+// Per Allie: "add a tab to the instructors view so they can update their summer availabilities" —
+// a weekly pattern (which weekdays they can usually do that period's morning hours) plus any dates
+// they're away, per summer/term-break period. Front desk sees it in the summer roster dropdowns.
+// Table: instructor_summer_availability (add_instructor_summer_availability.sql).
+var summerAvail=[];
+function escapeHtml(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function summerAvailFor(instructorId, termBreakId){
+  return summerAvail.find(function(a){ return a.instructorId===instructorId && a.termBreakId===termBreakId; }) || null;
+}
+function upcomingTermBreaks(){
+  const todayKey=toKey(simNow());
+  return termBreaks.filter(function(t){ return toKey(t.endDate)>=todayKey; })
+    .sort(function(a,b){ return toKey(a.startDate).localeCompare(toKey(b.startDate)); });
+}
+// The dates in a period that fall on one weekday (Mon–Fri only, closures skipped).
+function termBreakDatesOnWeekday(t, weekday){
+  const out=[];
+  for(let d=new Date(toKey(t.startDate)); toKey(d)<=toKey(t.endDate); d=addDays(d,1)){
+    if(WEEKDAY_KEYS[(d.getDay()+6)%7]===weekday && !isClosedDate(d)) out.push(toKey(d));
+  }
+  return out;
+}
+function summerDraft(instrId, t){
+  state.summerDrafts=state.summerDrafts||{};
+  const k=instrId+'|'+t.id;
+  if(!state.summerDrafts[k]){
+    const saved=summerAvailFor(instrId, t.id);
+    state.summerDrafts[k]={weekdays:saved? saved.weekdays.slice() : [], awayDates:saved? saved.awayDates.slice() : [], note:saved? saved.note : '', newAway:''};
+  }
+  return state.summerDrafts[k];
+}
+function toggleSummerWeekday(instrId, tbId, wd, on){
+  const t=termBreaks.find(function(x){ return x.id===tbId; }); const d=summerDraft(instrId, t);
+  d.weekdays=d.weekdays.filter(function(x){ return x!==wd; }); if(on) d.weekdays.push(wd);
+  d.weekdays.sort(function(a,b){ return WEEKDAY_KEYS.indexOf(a)-WEEKDAY_KEYS.indexOf(b); });
+  render();
+}
+function setSummerDraftField(instrId, tbId, field, value){
+  const t=termBreaks.find(function(x){ return x.id===tbId; }); summerDraft(instrId, t)[field]=value;
+}
+function addSummerAwayDate(instrId, tbId){
+  const t=termBreaks.find(function(x){ return x.id===tbId; }); const d=summerDraft(instrId, t);
+  const k=d.newAway;
+  if(!k){ toast('Pick a date first.'); return; }
+  if(k<toKey(t.startDate) || k>toKey(t.endDate)){ toast('That date isn\'t during '+t.label+' ('+fmtShort(t.startDate)+'–'+fmtShort(t.endDate)+').', 6000); return; }
+  if(d.awayDates.indexOf(k)===-1) d.awayDates.push(k);
+  d.awayDates.sort(); d.newAway='';
+  render();
+}
+function removeSummerAwayDate(instrId, tbId, k){
+  const t=termBreaks.find(function(x){ return x.id===tbId; }); const d=summerDraft(instrId, t);
+  d.awayDates=d.awayDates.filter(function(x){ return x!==k; });
+  render();
+}
+function saveSummerAvailability(instrId, tbId){
+  const t=termBreaks.find(function(x){ return x.id===tbId; }); const d=summerDraft(instrId, t);
+  const row={instructorId:instrId, termBreakId:tbId, weekdays:d.weekdays.slice(), awayDates:d.awayDates.slice(), note:(d.note||'').trim(), updatedAt:new Date()};
+  summerAvail=summerAvail.filter(function(a){ return !(a.instructorId===instrId && a.termBreakId===tbId); });
+  summerAvail.push(row);
+  dbWrite('saving summer availability', function(){ return supabaseClient.from('instructor_summer_availability').upsert({
+    instructor_id:instrId, term_break_id:tbId, weekdays:row.weekdays, away_dates:row.awayDates, note:row.note, updated_at:row.updatedAt.toISOString()
+  }, {onConflict:'instructor_id,term_break_id'}); });
+  delete state.summerDrafts[instrId+'|'+tbId];
+  toast('Summer availability saved for '+t.label+' — front desk can see it now.');
+}
+function renderInstructorSummerTab(instr){
+  const list=upcomingTermBreaks();
+  let html='';
+  if(!list.length) return '<div class="card"><h2>Summer hours</h2><div class="empty-note">No summer hours are set up yet. Front desk will add them — check back closer to the holidays.</div></div>';
+  list.forEach(function(t){
+    const saved=summerAvailFor(instr.id, t.id), d=summerDraft(instr.id, t);
+    const changed=!saved || JSON.stringify([d.weekdays,d.awayDates,(d.note||'').trim()])!==JSON.stringify([saved.weekdays,saved.awayDates,saved.note]);
+    html+='<div class="card"><div class="card-head" style="flex-wrap:wrap;row-gap:4px"><h2 style="margin:0">'+t.label+'</h2>'
+      +'<span class="small muted">'+fmtShort(t.startDate)+'–'+fmtShort(t.endDate)+' · '+minToLabel(t.morningStart)+'–'+minToLabel(t.morningEnd)+'</span>'
+      +(saved? '<span class="badge available" style="margin-left:auto">Sent '+fmtShort(saved.updatedAt||new Date())+'</span>' : '<span class="badge soon" style="margin-left:auto">Not sent yet</span>')+'</div>';
+    html+='<p class="small muted">Tick the weekdays you can usually work during these summer hours, and add any dates you\'re away. Front desk uses this to set the summer roster.</p>';
+    html+='<label>Days I can usually work</label><div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:6px">'
+      +WEEKDAY_KEYS.map(function(wd){ return '<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0;cursor:pointer"><input type="checkbox" style="width:auto;margin:0" '+(d.weekdays.indexOf(wd)>-1?'checked':'')+' onchange="toggleSummerWeekday(\''+instr.id+'\',\''+t.id+'\',\''+wd+'\',this.checked)"/> '+wd+'</label>'; }).join('')
+      +'</div>';
+    html+='<label>Dates I\'m away</label>'
+      +(d.awayDates.length? '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">'+d.awayDates.map(function(k){ return '<span class="pill" style="display:inline-flex;align-items:center;gap:6px">'+fmtShort(new Date(k))+' <a href="#" title="Remove" onclick="removeSummerAwayDate(\''+instr.id+'\',\''+t.id+'\',\''+k+'\');return false;">×</a></span>'; }).join('')+'</div>' : '<div class="small muted" style="margin-bottom:6px">None</div>')
+      +'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap"><input type="date" min="'+toKey(t.startDate)+'" max="'+toKey(t.endDate)+'" value="'+(d.newAway||'')+'" onchange="setSummerDraftField(\''+instr.id+'\',\''+t.id+'\',\'newAway\',this.value)" style="max-width:180px;margin:0"/>'
+      +'<button class="btn sm ghost" onclick="addSummerAwayDate(\''+instr.id+'\',\''+t.id+'\')">+ Add date</button></div>';
+    html+='<label>Note for front desk (optional)</label><input type="text" placeholder="e.g. can only do mornings until 11 on Fridays" value="'+escapeHtml(d.note)+'" oninput="setSummerDraftField(\''+instr.id+'\',\''+t.id+'\',\'note\',this.value)"/>';
+    html+='<div style="display:flex;justify-content:flex-end;margin-top:10px"><button class="btn primary" '+(changed?'':'disabled')+' onclick="saveSummerAvailability(\''+instr.id+'\',\''+t.id+'\')">'+(saved? 'Save changes' : 'Send to front desk')+'</button></div>';
+    html+='</div>';
+  });
+  return html;
+}
+// One instructor's summer availability on a weekday, for the front desk roster dropdown.
+function summerAvailLabel(instrId, t, wd){
+  const a=summerAvailFor(instrId, t.id);
+  if(!a) return {rank:1, text:'no reply yet'};
+  if(a.weekdays.indexOf(wd)===-1) return {rank:2, text:'not available'};
+  const away=a.awayDates.filter(function(k){ return termBreakDatesOnWeekday(t, wd).indexOf(k)>-1; });
+  return {rank:0, text:'available'+(away.length? ' — away '+away.map(function(k){ return new Date(k).toLocaleDateString('en-AU',{day:'numeric',month:'short'}); }).join(', ') : '')};
+}
+// Front desk: everyone's summer availability for one period, at a glance (Nov 2026).
+function renderSummerAvailSummary(t){
+  const act=instructors.filter(function(i){ return i.active!==false; }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); });
+  if(!act.length) return '';
+  const replied=act.filter(function(i){ return summerAvailFor(i.id, t.id); });
+  let html='<details style="margin-top:10px"'+(state.summerSummaryOpen&&state.summerSummaryOpen[t.id]?' open':'')+' ontoggle="state.summerSummaryOpen=state.summerSummaryOpen||{};state.summerSummaryOpen[\''+t.id+'\']=this.open"><summary style="cursor:pointer"><b>Instructors\' summer availability</b> <span class="small muted">— '+replied.length+' of '+act.length+' have replied</span></summary>';
+  html+='<div style="overflow-x:auto"><table><tr><th>Instructor</th>'+WEEKDAY_KEYS.map(function(wd){ return '<th>'+wd+'</th>'; }).join('')+'<th>Away</th><th>Note</th></tr>';
+  act.forEach(function(i){
+    const a=summerAvailFor(i.id, t.id);
+    html+='<tr><td>'+i.name+'</td>';
+    if(!a){ html+='<td colspan="'+(WEEKDAY_KEYS.length+2)+'" class="small muted">No reply yet</td></tr>'; return; }
+    html+=WEEKDAY_KEYS.map(function(wd){ return '<td>'+(a.weekdays.indexOf(wd)>-1? '<span style="color:#15803d;font-weight:600">✓</span>' : '<span class="muted">—</span>')+'</td>'; }).join('')
+      +'<td class="small">'+(a.awayDates.length? a.awayDates.map(function(k){ return new Date(k).toLocaleDateString('en-AU',{day:'numeric',month:'short'}); }).join(', ') : '—')+'</td>'
+      +'<td class="small">'+(a.note? escapeHtml(a.note) : '—')+'</td></tr>';
+  });
+  html+='</table></div></details>';
+  return html;
+}
 function renderTermBreakAvailability(termBreak){
   const sessionLen=state.termBreakAvailLen||AVAIL_MIN_SESSION_LEN;
   const blocks=[];
@@ -7688,12 +7804,18 @@ function renderTermBreaksPanel(){
       pods.forEach(function(pod){
         html+='<tr><td><b>'+pod.name+'</b></td>'+WEEKDAY_KEYS.map(function(wd){
           const current=termBreakCoverageFor(t, pod.id, wd)||'';
-          return '<td><select onchange="setTermBreakCoverage(\''+t.id+'\',\''+pod.id+'\',\''+wd+'\',this.value)"><option value=""'+(!current?' selected':'')+'>—</option>'
-            +instructors.filter(function(i){ return i.active!==false; }).slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).map(function(i){ return '<option value="'+i.id+'"'+(i.id===current?' selected':'')+'>'+i.name+'</option>'; }).join('')
+          // Available instructors first (Nov 2026), each labelled with what they told us.
+          const opts=instructors.filter(function(i){ return i.active!==false; }).map(function(i){ return {i:i, a:summerAvailLabel(i.id, t, wd)}; })
+            .sort(function(x,y){ return x.a.rank-y.a.rank || x.i.name.localeCompare(y.i.name); });
+          const curOpt=opts.find(function(o){ return o.i.id===current; });
+          const warn=curOpt && curOpt.a.rank===2;
+          return '<td><select'+(warn?' style="border-color:#d97706;background:#fff7ed" title="'+curOpt.i.name+' said they\'re not available '+wd+'s"':'')+' onchange="setTermBreakCoverage(\''+t.id+'\',\''+pod.id+'\',\''+wd+'\',this.value)"><option value=""'+(!current?' selected':'')+'>—</option>'
+            +opts.map(function(o){ return '<option value="'+o.i.id+'"'+(o.i.id===current?' selected':'')+'>'+(o.a.rank===0?'✓ ':'')+o.i.name+' ('+o.a.text+')</option>'; }).join('')
           +'</select></td>';
         }).join('')+'</tr>';
       });
       html+='</table></div>';
+      html+=renderSummerAvailSummary(t);
       html+=renderTermBreakAvailability(t);
       html+='</div>';
     });
@@ -10487,9 +10609,13 @@ function renderInstructor(){
     +'<p>You can only see and manage your own availability — not other instructors\'.</p></div>';
   // Two tabs (Oct 2026, per Allie): My shifts (today's Pod, the next 2 weeks, one-off shifts,
   // coverage) and Availability (ongoing + one-off availability changes).
-  const tab=state.instructorTab==='availability'? 'availability' : 'shifts';
+  // Nov 2026: a third tab, Summer, for their summer-hours availability.
+  const tab=(state.instructorTab==='availability'||state.instructorTab==='summer')? state.instructorTab : 'shifts';
+  const summerPending=upcomingTermBreaks().filter(function(t){ return !summerAvailFor(instr.id, t.id); }).length;
   html+='<div class="subtabs"><button class="subtab'+(tab==='shifts'?' active':'')+'" onclick="setInstructorTab(\'shifts\')">My shifts</button>'
-    +'<button class="subtab'+(tab==='availability'?' active':'')+'" onclick="setInstructorTab(\'availability\')">Availability</button></div>';
+    +'<button class="subtab'+(tab==='availability'?' active':'')+'" onclick="setInstructorTab(\'availability\')">Availability</button>'
+    +'<button class="subtab'+(tab==='summer'?' active':'')+'" onclick="setInstructorTab(\'summer\')">Summer'+(summerPending?' <span class="badge soon" style="margin-left:4px">'+summerPending+'</span>':'')+'</button></div>';
+  if(tab==='summer') return html+renderInstructorSummerTab(instr);
   if(tab==='availability'){
     html+=renderAvailabilityManager(instr, 'My availability', 'Your usual weekly hours. Use an ongoing change for something that applies from a date onwards, or a one-off change for a single day.');
     html+=renderAvailRuleModal();
@@ -11612,7 +11738,7 @@ var DATA_GROUP_TABLES={
   staffMembers:['staff_members','staff_one_offs'],
   staffRosteredShifts:['staff_rostered_shifts'],
   staffAttendance:['staff_attendance'],
-  termBreaks:['term_breaks','term_break_coverage'],
+  termBreaks:['term_breaks','term_break_coverage','instructor_summer_availability'],
 };
 var TABLE_TO_GROUP={};
 Object.keys(DATA_GROUP_TABLES).forEach(function(g){ DATA_GROUP_TABLES[g].forEach(function(t){ TABLE_TO_GROUP[t]=g; }); });
@@ -12092,8 +12218,10 @@ function fetchTermBreaksGroup(){
   return Promise.all([
     fetchTablePaginated('term_breaks','id,label,start_date,end_date,morning_start,morning_end,visible_to_parents'),
     fetchTablePaginated('term_break_coverage','term_break_id,pod_id,weekday,instructor_id'),
+    fetchTablePaginated('instructor_summer_availability','instructor_id,term_break_id,weekdays,away_dates,note,updated_at'), // Nov 2026
   ]).then(function(t){
-    const [termBreakRows,termBreakCoverRows]=t;
+    const [termBreakRows,termBreakCoverRows,summerRows]=t;
+    summerAvail=summerRows.map(function(r){ return {instructorId:r.instructor_id, termBreakId:r.term_break_id, weekdays:r.weekdays||[], awayDates:r.away_dates||[], note:r.note||'', updatedAt:r.updated_at? new Date(r.updated_at) : null}; });
     termBreaks=termBreakRows.map(function(r){
       const coverage={};
       termBreakCoverRows.filter(function(c){ return c.term_break_id===r.id; }).forEach(function(c){
