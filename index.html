@@ -4037,6 +4037,57 @@ function removeCredit(id){
   render();
 }
 
+/* ---------- extend a make-up credit's expiry (Nov 2026, front desk only) ---------- */
+// Per Allie: "the option as front desk to extend the validity of a makeup credit". Works on an
+// available, expiring-soon or already-expired credit (an expired one becomes usable again), and on
+// a booked one in case that booking is later cancelled. The expiry warning email is reset so the
+// parent gets a fresh reminder before the new date.
+function openExtendCredit(id){
+  const c=findCredit(id); if(!c) return;
+  const base=toKey(c.expiryDate)>toKey(simNow())? c.expiryDate : simNow();
+  state.extendCreditForm={id:id, date:toKey(addMonths(base,1)), error:''};
+  render();
+}
+function closeExtendCredit(){ state.extendCreditForm=null; render(); }
+function setExtendCreditDate(k){ if(state.extendCreditForm){ state.extendCreditForm.date=k; state.extendCreditForm.error=''; render(); } }
+function extendCreditBy(months, days){
+  const f=state.extendCreditForm; const c=f&&findCredit(f.id); if(!c) return;
+  const base=toKey(c.expiryDate)>toKey(simNow())? c.expiryDate : simNow();
+  setExtendCreditDate(toKey(addDays(addMonths(base,months||0),days||0)));
+}
+function saveExtendCredit(){
+  const f=state.extendCreditForm; const c=f&&findCredit(f.id); if(!c) return;
+  if(!f.date){ f.error='Pick a new expiry date.'; render(); return; }
+  if(f.date<=toKey(simNow())){ f.error='The new date needs to be after today.'; render(); return; }
+  if(f.date<=toKey(c.expiryDate)){ f.error='That\'s not later than the current expiry ('+fmtShort(c.expiryDate)+').'; render(); return; }
+  c.expiryDate=new Date(f.date);
+  if(c.status==='expired') c.status='available';
+  c.warningSent=false;
+  const st=c.status;
+  dbWrite('extending a make-up credit', function(){ return supabaseClient.from('credits').update({expiry_date:f.date, status:st, warning_sent:false}).eq('id', c.id); });
+  const student=findStudent(c.studentId);
+  state.extendCreditForm=null;
+  toast((student? student.name+'\'s' : 'The')+' make-up credit now expires '+fmtShort(c.expiryDate)+'.');
+  render();
+}
+function renderExtendCreditModal(){
+  const f=state.extendCreditForm; if(!f) return '';
+  const c=findCredit(f.id); if(!c){ state.extendCreditForm=null; return ''; }
+  const student=findStudent(c.studentId);
+  let html='<div class="overlay" onclick="if(event.target===this) closeExtendCredit()"><div class="modal">';
+  html+='<h3>Extend make-up credit — '+(student? student.name : '')+'</h3>';
+  html+='<p class="small muted">Issued '+fmtShort(c.issuedDate)+' · currently '+(creditDisplayStatus(c)==='expired'? 'expired on ' : 'expires ')+fmtShort(c.expiryDate)+'.'+(creditDisplayStatus(c)==='expired'? ' Extending it makes it available to book again.' : '')+'</p>';
+  if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
+  html+='<label>New expiry date</label><input type="date" min="'+toKey(addDays(simNow(),1))+'" value="'+f.date+'" onchange="setExtendCreditDate(this.value)"/>';
+  html+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"><span class="small muted" style="align-self:center">Quick:</span>'
+    +'<button class="btn sm ghost" onclick="extendCreditBy(0,14)">+2 weeks</button>'
+    +'<button class="btn sm ghost" onclick="extendCreditBy(1,0)">+1 month</button>'
+    +'<button class="btn sm ghost" onclick="extendCreditBy(3,0)">+3 months</button></div>';
+  html+='<div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end"><button class="btn ghost" onclick="closeExtendCredit()">Cancel</button><button class="btn primary" onclick="saveExtendCredit()">Extend</button></div>';
+  html+='</div></div>';
+  return html;
+}
+
 /* ---------- attendance log (front desk only) ---------- */
 function openAttendanceLog(studentId){ state.attendanceLogFor=studentId; render(); }
 function closeAttendanceLog(){ state.attendanceLogFor=null; render(); }
@@ -9802,7 +9853,8 @@ function creditReportRowHtml(c){
     // A booked make-up session can itself be extended from another of the child's credits.
     +(rebookable? (function(){ const s=findSession(c.redeemedSessionId); if(!s || s.status!=='scheduled') return '';
         if(s.extraMin) return '<button class="btn sm ghost" onclick="removeTopUp(\''+s.id+'\')" title="Take the extra 30 minutes off and return them to the make-up credit">− 30 min</button> ';
-        return topUpCreditFor(s.studentId, s.date)? '<button class="btn sm ghost" onclick="addTopUp(\''+s.id+'\')" title="Add 30 minutes to the end of this make-up session, using another of their make-up credits">+30 min</button> ' : ''; })() : '')+(rebookable? '<button class="btn sm ghost" onclick="rebookMakeUp(\''+c.id+'\')">Re-book</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
+        return topUpCreditFor(s.studentId, s.date)? '<button class="btn sm ghost" onclick="addTopUp(\''+s.id+'\')" title="Add 30 minutes to the end of this make-up session, using another of their make-up credits">+30 min</button> ' : ''; })() : '')+(rebookable? '<button class="btn sm ghost" onclick="rebookMakeUp(\''+c.id+'\')">Re-book</button> ' : '')
+    +(st!=='completed'? '<button class="btn sm ghost" onclick="openExtendCredit(\''+c.id+'\')" title="Give this credit a later expiry date">Extend</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
 }
 // Still actionable — available now, or expiring soon (both cases front desk might need to chase a
 // family to actually use before it lapses). Everything else (already booked into a make-up session,
@@ -9848,6 +9900,7 @@ function renderCreditsReport(){
   }
   html+='</div>';
   html+=renderAddCreditModal();
+  html+=renderExtendCreditModal();
   html+=renderTopUpPickerModal();
   return html;
 }
