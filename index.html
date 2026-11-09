@@ -1048,28 +1048,31 @@ function saveSummerAvailability(instrId, tbId){
     instructor_id:instrId, term_break_id:tbId, weekdays:row.weekdays, away_dates:row.awayDates, note:row.note, updated_at:row.updatedAt.toISOString()
   }, {onConflict:'instructor_id,term_break_id'}); });
   delete state.summerDrafts[instrId+'|'+tbId];
-  toast('Summer availability saved for '+t.label+' — front desk can see it now.');
+  toast('Summer availability saved for '+t.label+(state.staffAvailManagerFor===instrId? '.' :' — front desk can see it now.'));
 }
-function renderInstructorSummerTab(instr){
+function renderInstructorSummerTab(instr, byStaff){
+  // byStaff: front desk filling it in for them from Adjust availability (Nov 2026) — same data.
+  const nm=instr.name.split(" ")[0];
+  const W=byStaff? {can:"Days "+nm+" can usually work", away:"Dates "+nm+" is away", intro:"Tick the weekdays "+nm+" can usually work during these summer hours, and add any dates they're away. This is the same form "+nm+" sees in their own Summer tab.", note:"Note (optional)", send:"Save", sent:"Saved ", notSent:"No reply yet"} : {can:"Days I can usually work", away:"Dates I'm away", intro:"Tick the weekdays you can usually work during these summer hours, and add any dates you're away. Front desk uses this to set the summer roster.", note:"Note for front desk (optional)", send:"Send to front desk", sent:"Sent ", notSent:"Not sent yet"};
   const list=upcomingTermBreaks();
   let html='';
-  if(!list.length) return '<div class="card"><h2>Summer hours</h2><div class="empty-note">No summer hours are set up yet. Front desk will add them — check back closer to the holidays.</div></div>';
+  if(!list.length) return '<div class="card"><h2>Summer hours</h2><div class="empty-note">'+(byStaff? 'No upcoming summer hours yet — add a period under Settings → Summer / term break hours first.' : 'No summer hours are set up yet. Front desk will add them — check back closer to the holidays.')+'</div></div>';
   list.forEach(function(t){
     const saved=summerAvailFor(instr.id, t.id), d=summerDraft(instr.id, t);
     const changed=!saved || JSON.stringify([d.weekdays,d.awayDates,(d.note||'').trim()])!==JSON.stringify([saved.weekdays,saved.awayDates,saved.note]);
     html+='<div class="card"><div class="card-head" style="flex-wrap:wrap;row-gap:4px"><h2 style="margin:0">'+t.label+'</h2>'
       +'<span class="small muted">'+fmtShort(t.startDate)+'–'+fmtShort(t.endDate)+' · '+minToLabel(t.morningStart)+'–'+minToLabel(t.morningEnd)+'</span>'
-      +(saved? '<span class="badge available" style="margin-left:auto">Sent '+fmtShort(saved.updatedAt||new Date())+'</span>' : '<span class="badge soon" style="margin-left:auto">Not sent yet</span>')+'</div>';
-    html+='<p class="small muted">Tick the weekdays you can usually work during these summer hours, and add any dates you\'re away. Front desk uses this to set the summer roster.</p>';
-    html+='<label>Days I can usually work</label><div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:6px">'
+      +(saved? '<span class="badge available" style="margin-left:auto">'+W.sent+fmtShort(saved.updatedAt||new Date())+'</span>' : '<span class="badge soon" style="margin-left:auto">'+W.notSent+'</span>')+'</div>';
+    html+='<p class="small muted">'+W.intro+'</p>';
+    html+='<label>'+W.can+'</label><div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:6px">'
       +WEEKDAY_KEYS.map(function(wd){ return '<label style="display:flex;align-items:center;gap:5px;font-weight:400;margin:0;cursor:pointer"><input type="checkbox" style="width:auto;margin:0" '+(d.weekdays.indexOf(wd)>-1?'checked':'')+' onchange="toggleSummerWeekday(\''+instr.id+'\',\''+t.id+'\',\''+wd+'\',this.checked)"/> '+wd+'</label>'; }).join('')
       +'</div>';
-    html+='<label>Dates I\'m away</label>'
+    html+='<label>'+W.away+'</label>'
       +(d.awayDates.length? '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">'+d.awayDates.map(function(k){ return '<span class="pill" style="display:inline-flex;align-items:center;gap:6px">'+fmtShort(new Date(k))+' <a href="#" title="Remove" onclick="removeSummerAwayDate(\''+instr.id+'\',\''+t.id+'\',\''+k+'\');return false;">×</a></span>'; }).join('')+'</div>' : '<div class="small muted" style="margin-bottom:6px">None</div>')
       +'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap"><input type="date" min="'+toKey(t.startDate)+'" max="'+toKey(t.endDate)+'" value="'+(d.newAway||'')+'" onchange="setSummerDraftField(\''+instr.id+'\',\''+t.id+'\',\'newAway\',this.value)" style="max-width:180px;margin:0"/>'
       +'<button class="btn sm ghost" onclick="addSummerAwayDate(\''+instr.id+'\',\''+t.id+'\')">+ Add date</button></div>';
-    html+='<label>Note for front desk (optional)</label><input type="text" placeholder="e.g. can only do mornings until 11 on Fridays" value="'+escapeHtml(d.note)+'" oninput="setSummerDraftField(\''+instr.id+'\',\''+t.id+'\',\'note\',this.value)"/>';
-    html+='<div style="display:flex;justify-content:flex-end;margin-top:10px"><button class="btn primary" '+(changed?'':'disabled')+' onclick="saveSummerAvailability(\''+instr.id+'\',\''+t.id+'\')">'+(saved? 'Save changes' : 'Send to front desk')+'</button></div>';
+    html+='<label>'+W.note+'</label><input type="text" placeholder="e.g. can only do mornings until 11 on Fridays" value="'+escapeHtml(d.note)+'" oninput="setSummerDraftField(\''+instr.id+'\',\''+t.id+'\',\'note\',this.value)"/>';
+    html+='<div style="display:flex;justify-content:flex-end;margin-top:10px"><button class="btn primary" '+(changed?'':'disabled')+' onclick="saveSummerAvailability(\''+instr.id+'\',\''+t.id+'\')">'+(saved? 'Save changes' : W.send)+'</button></div>';
     html+='</div>';
   });
   return html;
@@ -10894,7 +10897,7 @@ function renderAvailabilityManager(instr, heading, intro){
   html+='</div>';
   return html;
 }
-function openStaffAvailManager(instrId){ state.staffAvailManagerFor=instrId; render(); }
+function openStaffAvailManager(instrId){ state.staffAvailManagerFor=instrId; state.staffAvailTab='hours'; render(); }
 function closeStaffAvailManager(){ state.staffAvailManagerFor=null; render(); }
 function renderStaffAvailManagerModal(){
   const instrId=state.staffAvailManagerFor;
@@ -10902,6 +10905,11 @@ function renderStaffAvailManagerModal(){
   const instr=findInstructor(instrId);
   let html='<div class="overlay" onclick="if(event.target===this) closeStaffAvailManager()"><div class="modal" style="max-width:640px">';
   html+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><h3 style="margin:0">Adjust availability</h3><button class="btn sm ghost" onclick="closeStaffAvailManager()">Close</button></div>';
+  // Tabs (Nov 2026, per Allie: "a summer tab in adjust availability for staff"): Hours | Summer.
+  const sTab=state.staffAvailTab==='summer'? 'summer' : 'hours';
+  html+='<div class="subtabs"><button class="subtab'+(sTab==='hours'?' active':'')+'" onclick="state.staffAvailTab=\'hours\';render()">Hours</button>'
+    +'<button class="subtab'+(sTab==='summer'?' active':'')+'" onclick="state.staffAvailTab=\'summer\';render()">Summer</button></div>';
+  if(sTab==='summer'){ html+=renderInstructorSummerTab(instr, true)+'</div></div>'; return html; }
   html+=renderAvailabilityManager(instr, instr.name+'’s hours', 'Front desk can adjust '+instr.name+'\'s working hours here — as an ongoing change starting from a date, or a one-off change to a single day (e.g. an appointment or time off). These are the same hours '+instr.name+' would set from their own login.');
   html+='</div></div>';
   html+=renderAvailRuleModal();
