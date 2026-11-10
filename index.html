@@ -283,9 +283,9 @@ var CENTRES = {
   fivedock: { name:'Five Dock Maths Learning Centre', short:'Five Dock', email:'fivedock@mathnasium.com.au',
     supabaseUrl:'https://irtydpjjrscmtctoeffc.supabase.co', supabaseKey:'sb_publishable_rcmZZ2KIplqWI1nGeuLlMg_tusxf0KG',
     siteUrl:'https://fd-scheduling.vercel.app/' },
-  miranda:  { name:'Miranda Maths Learning Centre', short:'Miranda', email:'', // front desk email: still to come
+  miranda:  { name:'Miranda Maths Learning Centre', short:'Miranda', email:'miranda@mathnasium.com.au',
     supabaseUrl:'https://syymogvhmyiegyvewjdb.supabase.co', supabaseKey:'sb_publishable_8kWGsMs2KLAKI0s8fMglMw_GNtDZMJE',
-    siteUrl:'' } // filled in once the Miranda Vercel site exists
+    siteUrl:'https://miranda-scheduling.vercel.app/' }
 };
 var CENTRE_ID = (typeof window!=='undefined' && window.location && /miranda/i.test(window.location.hostname))? 'miranda' : 'fivedock';
 var CENTRE = CENTRES[CENTRE_ID];
