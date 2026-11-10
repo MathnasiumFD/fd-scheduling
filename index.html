@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Five Dock — Scheduling</title>
+<title>Scheduling</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Plus+Jakarta+Sans:wght@700;800&display=swap" rel="stylesheet">
@@ -275,13 +275,30 @@ var AUTH_LINK_ERROR = (function(){
   return m? m[1] : null;
 })();
 
-var SUPABASE_URL = 'https://irtydpjjrscmtctoeffc.supabase.co';
-var SUPABASE_ANON_KEY = 'sb_publishable_rcmZZ2KIplqWI1nGeuLlMg_tusxf0KG';
+// ---------- which centre this site is (Nov 2026) ----------
+// One copy of the app serves both centres. Each runs on its own website and its own Supabase project
+// (separate data, logins and families). The Miranda site's address contains "miranda"; anything else
+// is Five Dock. Publishable keys are safe to ship in the page (RLS protects the data).
+var CENTRES = {
+  fivedock: { name:'Five Dock Maths Learning Centre', short:'Five Dock', email:'fivedock@mathnasium.com.au',
+    supabaseUrl:'https://irtydpjjrscmtctoeffc.supabase.co', supabaseKey:'sb_publishable_rcmZZ2KIplqWI1nGeuLlMg_tusxf0KG',
+    siteUrl:'https://fd-scheduling.vercel.app/' },
+  miranda:  { name:'Miranda Maths Learning Centre', short:'Miranda', email:'', // front desk email: still to come
+    supabaseUrl:'https://syymogvhmyiegyvewjdb.supabase.co', supabaseKey:'sb_publishable_8kWGsMs2KLAKI0s8fMglMw_GNtDZMJE',
+    siteUrl:'' } // filled in once the Miranda Vercel site exists
+};
+var CENTRE_ID = (typeof window!=='undefined' && window.location && /miranda/i.test(window.location.hostname))? 'miranda' : 'fivedock';
+var CENTRE = CENTRES[CENTRE_ID];
+if(!CENTRE.siteUrl && typeof window!=='undefined' && window.location && /^https?:$/.test(window.location.protocol)) CENTRE.siteUrl = window.location.origin + '/';
+if(typeof document!=='undefined') document.title = CENTRE.name + ' — Scheduling';
+
+var SUPABASE_URL = CENTRE.supabaseUrl;
+var SUPABASE_ANON_KEY = CENTRE.supabaseKey;
 var supabaseClient = (typeof window !== 'undefined' && window.supabase)
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
   : null;
 var currentUser = null; // {role, instructorId, parentId} — set once login resolves
-var SITE_URL = 'https://fd-scheduling.vercel.app/'; // update if the production Vercel URL ever changes — used as the redirect target for invite/password-reset emails
+var SITE_URL = CENTRE.siteUrl; // per centre (see CENTRES above) — update if the production Vercel URL ever changes — used as the redirect target for invite/password-reset emails
 
 
 // A real UUID when live (so a newly-created record's local id already matches what Postgres will
@@ -2830,7 +2847,7 @@ function latestHoldRequestStart(){ return addMonths(simNow(), HOLD_REQUEST_MAX_M
 // of any length in any 6-month period. Counts the child's holds on file (whoever placed them) plus
 // pending hold requests. Front desk's own hold form isn't limited.
 var HOLD_LIMIT_PER_WINDOW=1, HOLD_LIMIT_WINDOW_MONTHS=6;
-var HOLD_LIMIT_MESSAGE='Maximum hold period request exceeded. Please contact the centre directly at fivedock@mathnasium.com.au';
+var HOLD_LIMIT_MESSAGE='Maximum hold period request exceeded. Please contact the centre directly'+(CENTRE.email? ' at '+CENTRE.email : '')+'.';
 function holdRequestExceedsLimit(studentId, startKey, endKey){
   const student=findStudent(studentId);
   const holds=(student.holds||[]).map(function(h){ return {start:toKey(h.start), end:toKey(h.end)}; })
@@ -6729,7 +6746,7 @@ function renderTop(){
       +(state.offsetDays!==0? '<button class="btn sm ghost" onclick="resetClock()">Reset</button>':'')
     +'</div>';
   return '<div class="top">'
-    +'<div><div class="brand-logo mathq-logo"><img src="'+MATHQ_LOGO+'" alt="MATHQ — Scheduling Hub"/></div></div>'
+    +'<div><div class="brand-logo mathq-logo"><img src="'+MATHQ_LOGO+'" alt="MATHQ — Scheduling Hub"/></div><div class="small muted" style="margin-top:2px">'+CENTRE.name+'</div></div>'
     +clockControls
   +'</div>';
 }
@@ -9289,7 +9306,7 @@ function renderNewStaffModal(){
 function renderFrontStaffPanel(){
   let html=sectionOpen('frontStaff','Front Desk Staff',
     '<button class="btn sm primary" onclick="openNewStaffForm()">+ Add staff member</button>');
-  html+='<p>Everyone here gets the same full front-desk access as you — this is just a named list (rather than one shared, anonymous login) so it\'s clear who\'s who, e.g. yourself and "Five Dock Front Staff".</p>';
+  html+='<p>Everyone here gets the same full front-desk access as you — this is just a named list (rather than one shared, anonymous login) so it\'s clear who\'s who, e.g. yourself and "'+CENTRE.short+' Front Staff".</p>';
   html+='<table><tr><th>Name</th><th>Email</th><th>Login</th><th></th></tr>';
   staffMembers.slice().sort(function(a,b){ return a.name.localeCompare(b.name); }).forEach(function(s){
     const loginCell = loginStatusCellHtml(s.authUserId,
@@ -11321,7 +11338,7 @@ function renderHoldRequestModal(){
   if(f.error) html+='<div class="banner danger">'+f.error+'</div>';
   // Hold limit (Oct 2026) — shown live as soon as the dates picked would go over it, and on Send.
   if(f.limitHit || (f.start && f.end && f.end>=f.start && holdRequestExceedsLimit(f.studentId, f.start, f.end)))
-    html+='<div class="banner danger">'+HOLD_LIMIT_MESSAGE.replace('fivedock@mathnasium.com.au','<a href="mailto:fivedock@mathnasium.com.au">fivedock@mathnasium.com.au</a>')+'</div>';
+    html+='<div class="banner danger">'+(CENTRE.email? HOLD_LIMIT_MESSAGE.replace(CENTRE.email,'<a href="mailto:'+CENTRE.email+'">'+CENTRE.email+'</a>') : HOLD_LIMIT_MESSAGE)+'</div>';
   if(f.lateNotice) html+='<div class="banner warn">Your hold can still be placed for these dates, however a credit cannot be applied as the request was made less than 7 days before the 1st of the month. Make-up sessions will be added for eligible sessions missed during the hold.</div>';
   html+='<p class="small muted">Holds can be requested up to '+HOLD_REQUEST_MAX_MONTHS_AHEAD+' months ahead. Each child can have one hold in any 6 months.</p>';
   html+='<div class="row2"><div><label>Start date</label><input type="date" value="'+f.start+'" max="'+toKey(latestHoldRequestStart())+'" onchange="setHoldRequestField(\'start\',this.value)"/></div>'
