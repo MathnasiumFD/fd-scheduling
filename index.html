@@ -123,6 +123,34 @@
   td{ padding:8px; border-bottom:1px solid var(--border); vertical-align:top; }
   tr:last-child td{ border-bottom:none; }
 
+  /* Make-up credits list (Nov 2026): search + filters, one row per child, ⋯ menu per credit. */
+  .credit-toolbar{ display:flex; gap:8px; flex-wrap:wrap; margin:8px 0 6px; }
+  .credit-toolbar input{ flex:1 1 220px; margin:0; }
+  .credit-toolbar select{ flex:0 0 auto; width:auto; margin:0; }
+  .credit-chips{ display:flex; gap:6px; flex-wrap:wrap; margin-bottom:6px; }
+  .chip-btn{ border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:999px; padding:4px 11px; font-size:.75rem; cursor:pointer; font-family:inherit; }
+  .chip-btn .n{ color:var(--text-muted); font-weight:700; margin-left:2px; }
+  .chip-btn.on{ background:var(--info-bg); border-color:var(--info); color:var(--info); font-weight:700; }
+  .chip-btn.on .n{ color:var(--info); }
+  tr.credit-kid{ cursor:pointer; }
+  tr.credit-kid:hover td{ background:var(--muted-bg); }
+  tr.credit-kid td{ vertical-align:middle; }
+  tr.credit-kid .chev{ display:inline-block; width:12px; color:var(--text-muted); }
+  tr.credit-kid.open td{ border-bottom:none; }
+  tr.credit-kid-detail > td{ padding:0 0 10px 22px; }
+  tr.credit-kid-detail table{ background:var(--muted-bg); border-radius:8px; }
+  td.credit-actions{ white-space:nowrap; text-align:right; }
+  .row-menu{ display:inline-block; position:relative; margin-left:4px; vertical-align:middle; }
+  .row-menu > summary{ list-style:none; cursor:pointer; padding:2px 8px; border:1px solid var(--border); border-radius:6px; font-weight:700; line-height:1.2; background:var(--surface); }
+  .row-menu > summary::-webkit-details-marker{ display:none; }
+  .row-menu-list{ position:absolute; right:0; top:calc(100% + 4px); z-index:20; background:var(--surface); border:1px solid var(--border); border-radius:8px; box-shadow:var(--shadow); min-width:220px; padding:4px; text-align:left; }
+  .row-menu-list button{ display:block; width:100%; text-align:left; background:none; border:none; padding:7px 10px; border-radius:6px; font-size:.8rem; cursor:pointer; color:var(--text); font-family:inherit; }
+  .row-menu-list button:hover{ background:var(--muted-bg); }
+  .row-menu-list button.danger{ color:var(--danger); }
+  .inline-help{ display:inline; }
+  .inline-help > summary{ display:inline; font-size:inherit; cursor:pointer; color:var(--info); text-decoration:underline; }
+  .inline-help[open]{ display:block; margin-top:6px; }
+
   .badge{ display:inline-block; padding:2px 9px; border-radius:999px; font-size:.7rem; font-weight:700; }
   .badge.available{ background:var(--success-bg); color:var(--success); }
   .badge.soon{ background:var(--warning-bg); color:var(--warning); }
@@ -9830,90 +9858,172 @@ function renderRecurringModal(){
 }
 
 
-// Shared row-builder for both the active and the settled make-up-credits tables below — identical
-// column layout either way, only which credits get fed in differs (Sept 2026, per Allie: "can we
-// split makeup credits into two sections, so that when they are booked or expired, they go to a
-// different section" — booked/completed/expired credits pile up over time and were drowning out the
-// still-actionable ones in a single flat table sorted only by expiry date).
-function creditReportRowHtml(c){
-  const st=creditDisplayStatus(c);
-  const student=findStudent(c.studentId);
-  const badge={available:'<span class="badge available">Available</span>',soon:'<span class="badge soon">Expiring soon</span>',expired:'<span class="badge expired">Expired</span>',booked:'<span class="badge booked">Booked</span>',completed:'<span class="badge completed">Completed</span>'}[st] || st;
-  let detail='—';
-  if(c.redeemedSessionId){
-    const sess=findSession(c.redeemedSessionId);
-    if(sess) detail=fmtShort(sess.date)+' '+rangeLabel(sess.start,sess.duration)+' · '+(findPod(sess.podId)?findPod(sess.podId).name+' · ':'')+(sess.instructorId? findInstructor(sess.instructorId).name : '—');
-  }
-  const sourceLabel = c.source==='manual'? 'Manual'+(c.note? ' <span class="small muted">— '+c.note+'</span>' : '')
+// Make-up credits list, tidied up (Nov 2026, per Allie: "the makeup credits list is a little...
+// messy. how can we make it easier to use?"). With ~150 live credits across ~80 children it had
+// become one long row-per-credit table. Now:
+//   - one row per child (count, minutes, next expiry) that opens to show that child's credits;
+//   - a search box (child or parent name) that narrows all three credit sections at once;
+//   - quick filters (All / Expiring soon / Manual / Automatic) with counts;
+//   - sorted by soonest expiry by default (or date missed, or name);
+//   - each credit keeps one main button (Book, or Re-book once booked) — the rest sit in a ⋯ menu;
+//   - the long explanation is tucked behind "How credits work".
+// Booked and Completed & expired keep their own sections, in the same grouped layout.
+function creditView(){
+  if(!state.creditView) state.creditView={q:'', filter:'all', sort:'expiry', open:{}};
+  return state.creditView;
+}
+function setCreditQuery(v){ creditView().q=v; render(); }
+function setCreditFilter(f){ creditView().filter=f; render(); }
+function setCreditSort(s){ creditView().sort=s; render(); }
+function toggleCreditKid(key){ const v=creditView(); v.open[key]=!v.open[key]; render(); }
+// A ⋯ menu closes when you click anywhere else.
+if(typeof document!=='undefined') document.addEventListener('click', function(e){
+  document.querySelectorAll('details.row-menu[open]').forEach(function(d){ if(!d.contains(e.target)) d.removeAttribute('open'); });
+});
+function creditSourceLabel(c){
+  return c.source==='manual'? 'Manual'+(c.note? ' <span class="small muted">— '+escapeHtml(c.note)+'</span>' : '')
     : c.source==='excused-absence'? 'Excused absence'
     : c.source==='parent-cancel'? 'Parent cancel'
     : c.source==='closure'? 'Centre closure'
     : 'No-show';
-  // Every credit gets a Remove button now, whatever its source or status (Sept 2026, per Allie).
-  // Manually assigning a make-up (Sept 2026, per Allie: "I need a button to manually assign
-  // make-up sessions") — offered for any available credit, not just manually-added ones, since a
-  // parent might call in about ANY kind of make-up (a no-show credit, an excused absence, etc.)
-  // and ask front desk to just book it for them rather than doing it themselves online.
-  // A credit already part-used for +30 top-ups (Oct 2026) can only be topped up further, not booked whole.
+}
+// Does this credit's child (or one of the child's parents) match the search box?
+function creditMatchesQuery(c, q){
+  if(!q) return true;
+  const s=findStudent(c.studentId);
+  if(!s) return false;
+  const names=[s.name];
+  [s.parentId].concat(guardianLinksFor(s.id).map(function(g){ return g.parentId; })).forEach(function(pid){ const p=pid && findParent(pid); if(p) names.push(p.name); });
+  return names.some(function(n){ return String(n||'').toLowerCase().indexOf(q)>=0; });
+}
+function creditPassesFilter(c, f){
+  if(f==='soon') return creditDisplayStatus(c)==='soon';
+  if(f==='manual') return c.source==='manual';
+  if(f==='auto') return c.source!=='manual';
+  return true;
+}
+// One credit's own row (inside its child's group). Main action stays a visible button; everything
+// else goes in the ⋯ menu. Same rules as before for which actions each credit gets:
+//  - Book: available and not part-used for +30 top-ups (a part-used one can only top up further).
+//  - Re-book / ±30 min on the session: booked but not happened yet.
+//  - Extend: anything not completed. Remove: anything not tied to a session (booked/completed).
+function creditReportRowHtml(c){
+  const st=creditDisplayStatus(c);
+  const badge={available:'<span class="badge available">Available</span>',soon:'<span class="badge soon">Expiring soon</span>',expired:'<span class="badge expired">Expired</span>',booked:'<span class="badge booked">Booked</span>',completed:'<span class="badge completed">Completed</span>'}[st] || st;
+  let detail='—';
+  if(c.redeemedSessionId){
+    const sess=findSession(c.redeemedSessionId);
+    if(sess) detail=fmtShort(sess.date)+' '+rangeLabel(sess.start,sess.duration)+' · '+(findPod(sess.podId)?findPod(sess.podId).name+' · ':'')+(sess.instructorId && findInstructor(sess.instructorId)? findInstructor(sess.instructorId).name : '—');
+  }
   const bookable = c.status==='available' && !creditPartlyUsed(c);
-  // Re-book (Sept 2026, per Allie: give the Booked section its own "still pending" place with a way
-  // to change the date/time) — only for a make-up that's booked but hasn't happened yet; one that's
-  // already completed is history, not something to move.
   const rebookable = st==='booked';
-  // Remove button on every credit EXCEPT ones already redeemed against a session (booked or
-  // completed) — those are tied to a real session and shouldn't be deleted out from under it
-  // (Sept 2026, per Allie: "not the redeemed ones").
   const removable = !c.redeemedSessionId;
-  return '<tr><td>'+student.name+(isStudentInactive(student)? ' <span class="badge stopping">Finished '+fmtShort(student.stoppedFrom)+'</span>' : '')+'</td><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+(c.status==='available'? ' <span class="small muted">'+creditMinutesLeft(c)+' min'+(creditPartlyUsed(c)? ' left' : '')+'</span>' : '')+'</td><td class="small">'+sourceLabel+'</td><td class="small">'+detail+'</td>'
-    +'<td>'+(bookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button> ' : '')
-    +(c.status==='available' && creditMinutesLeft(c)>=TOPUP_MIN? '<button class="btn sm ghost" onclick="openTopUpPicker(\''+c.id+'\')" title="Use 30 minutes of this credit to extend one of their booked sessions">+30 min</button> ' : '')
-    // A booked make-up session can itself be extended from another of the child's credits.
-    +(rebookable? (function(){ const s=findSession(c.redeemedSessionId); if(!s || s.status!=='scheduled') return '';
-        if(s.extraMin) return '<button class="btn sm ghost" onclick="removeTopUp(\''+s.id+'\')" title="Take the extra 30 minutes off and return them to the make-up credit">− 30 min</button> ';
-        return topUpCreditFor(s.studentId, s.date)? '<button class="btn sm ghost" onclick="addTopUp(\''+s.id+'\')" title="Add 30 minutes to the end of this make-up session, using another of their make-up credits">+30 min</button> ' : ''; })() : '')+(rebookable? '<button class="btn sm ghost" onclick="rebookMakeUp(\''+c.id+'\')">Re-book</button> ' : '')
-    +(st!=='completed'? '<button class="btn sm ghost" onclick="openExtendCredit(\''+c.id+'\')" title="Give this credit a later expiry date">Extend</button> ' : '')+(removable? '<button class="btn sm ghost" onclick="removeCredit(\''+c.id+'\')">Remove</button>' : '')+'</td></tr>';
+  let main='';
+  if(bookable) main='<button class="btn sm primary" onclick="openBookingForCredit(\''+c.id+'\')">Book</button>';
+  else if(rebookable) main='<button class="btn sm primary" onclick="rebookMakeUp(\''+c.id+'\')">Re-book</button>';
+  const more=[];
+  if(c.status==='available' && creditMinutesLeft(c)>=TOPUP_MIN) more.push('<button onclick="openTopUpPicker(\''+c.id+'\')">+30 min on a booked session</button>');
+  if(rebookable){
+    const s=findSession(c.redeemedSessionId);
+    if(s && s.status==='scheduled'){
+      if(s.extraMin) more.push('<button onclick="removeTopUp(\''+s.id+'\')">− 30 min (give back to credit)</button>');
+      else if(topUpCreditFor(s.studentId, s.date)) more.push('<button onclick="addTopUp(\''+s.id+'\')">+30 min on this make-up</button>');
+    }
+  }
+  if(st!=='completed') more.push('<button onclick="openExtendCredit(\''+c.id+'\')">Extend expiry date</button>');
+  if(removable) more.push('<button class="danger" onclick="removeCredit(\''+c.id+'\')">Remove credit</button>');
+  const menu = more.length? '<details class="row-menu"><summary title="More actions">⋯</summary><div class="row-menu-list">'+more.join('')+'</div></details>' : '';
+  return '<tr><td>'+fmtShort(c.issuedDate)+'</td><td>'+fmtShort(c.expiryDate)+'</td><td>'+badge+(c.status==='available'? ' <span class="small muted">'+creditMinutesLeft(c)+' min'+(creditPartlyUsed(c)? ' left' : '')+'</span>' : '')+'</td><td class="small">'+creditSourceLabel(c)+'</td><td class="small">'+detail+'</td>'
+    +'<td class="credit-actions">'+main+menu+'</td></tr>';
 }
 // Still actionable — available now, or expiring soon (both cases front desk might need to chase a
-// family to actually use before it lapses). Everything else (already booked into a make-up session,
-// that make-up completed, or lapsed unused) has nothing left to DO here, so it moves to one of the
-// two sections below instead of cluttering this one.
+// family to actually use before it lapses).
 function activeCredits(){
   return credits.filter(function(c){ const st=creditDisplayStatus(c); return st==='available' || st==='soon'; });
 }
-// Booked but still pending — a make-up session exists and hasn't happened yet. Kept separate from
-// completed/expired (Sept 2026, per Allie: "one section for booked and another for
-// completed/expired") because a still-pending booking is the one settled state front desk might
-// still need to act on — e.g. re-book it to a different date/time — where completed/expired ones
-// are pure history.
+// Booked but still pending — a make-up session exists and hasn't happened yet (can still Re-book).
 function bookedCredits(){
   return credits.filter(function(c){ return creditDisplayStatus(c)==='booked'; });
 }
 function settledCredits(){
   return credits.filter(function(c){ const st=creditDisplayStatus(c); return st!=='available' && st!=='soon' && st!=='booked'; });
 }
-// Sept 2026, per Allie: "beside ordering them by date missed, within each day, can they be ordered
-// alphabetically" — "date missed" is the Issued column (the date the missed session actually fell
-// on), not the Expires column these lists were previously keyed off. Sorts by issuedDate first
-// (ascending, or descending for the settled/history section, same convention as before), then breaks
-// ties on the same day alphabetically by student name so a busy closure/absence day doesn't just
-// land in whatever order credits happened to be created.
-function sortCreditsByDateMissed(list, descending){
-  return list.slice().sort(function(a,b){
-    const diff = descending? (b.issuedDate-a.issuedDate) : (a.issuedDate-b.issuedDate);
-    if(diff!==0) return diff;
-    const an=(findStudent(a.studentId)||{}).name||'', bn=(findStudent(b.studentId)||{}).name||'';
-    return an.localeCompare(bn);
+function studentNameOf(id){ return (findStudent(id)||{}).name||''; }
+// Groups credits by child and orders both the children and each child's credits.
+//  sort 'expiry' — soonest expiry first; 'missed' — earliest missed session first (ties by name, as
+//  before); 'name' — A–Z. `newestFirst` flips the date orders (used for the history section).
+function groupCreditsByStudent(list, sort, newestFirst){
+  const dir=newestFirst? -1 : 1;
+  const keyOf = sort==='missed'? function(c){ return +c.issuedDate; } : function(c){ return +c.expiryDate; };
+  const groups={}, order=[];
+  list.forEach(function(c){ if(!groups[c.studentId]){ groups[c.studentId]={studentId:c.studentId, credits:[]}; order.push(c.studentId); } groups[c.studentId].credits.push(c); });
+  const out=order.map(function(id){ const g=groups[id];
+    g.credits.sort(function(a,b){ return dir*(keyOf(a)-keyOf(b)) || (a.issuedDate-b.issuedDate); });
+    g.key=keyOf(g.credits[0]); g.name=studentNameOf(id); return g; });
+  out.sort(function(a,b){
+    if(sort!=='name'){ const d=dir*(a.key-b.key); if(d) return d; }
+    return a.name.localeCompare(b.name);
   });
+  return out;
+}
+// One section's grouped table. `section` keeps open/closed state separate per section.
+function creditGroupsTableHtml(section, groups){
+  const v=creditView();
+  const autoOpen = !!v.q.trim() && groups.length<=3;
+  let html='<table class="credit-groups"><tr><th>Student</th><th>Credits</th><th>Next expiry</th><th></th></tr>';
+  groups.forEach(function(g){
+    const student=findStudent(g.studentId)||{name:'(unknown student)'};
+    const k=section+':'+g.studentId;
+    const open = autoOpen || !!v.open[k];
+    const live=g.credits.filter(function(c){ const st=creditDisplayStatus(c); return st==='available' || st==='soon'; });
+    const mins=live.reduce(function(t,c){ return t+creditMinutesLeft(c); }, 0);
+    const soonN=g.credits.filter(function(c){ return creditDisplayStatus(c)==='soon'; }).length;
+    const next=live.length? live.reduce(function(m,c){ return c.expiryDate<m? c.expiryDate : m; }, live[0].expiryDate) : null;
+    const summary=g.credits.length+' credit'+(g.credits.length===1?'':'s')+(live.length? ' · '+mins+' min' : '');
+    // Book from the child's row = their soonest-expiring bookable credit.
+    const firstBookable=live.slice().sort(function(a,b){ return a.expiryDate-b.expiryDate; }).find(function(c){ return c.status==='available' && !creditPartlyUsed(c); });
+    html+='<tr class="credit-kid'+(open?' open':'')+'" onclick="if(!event.target.closest(\'button,details\')) toggleCreditKid(\''+k+'\')">'
+      +'<td><span class="chev">'+(open?'▾':'▸')+'</span> <b>'+escapeHtml(student.name)+'</b>'+(student.id && isStudentInactive(student)? ' <span class="badge stopping">Finished '+fmtShort(student.stoppedFrom)+'</span>' : '')+'</td>'
+      +'<td>'+summary+(soonN? ' <span class="badge soon">'+soonN+' expiring soon</span>' : '')+'</td>'
+      +'<td>'+(next? fmtShort(next) : '—')+'</td>'
+      +'<td class="credit-actions">'+(section==='active' && firstBookable? '<button class="btn sm primary" onclick="openBookingForCredit(\''+firstBookable.id+'\')" title="Books their soonest-expiring credit">Book</button>' : '')+'</td></tr>';
+    if(open){
+      html+='<tr class="credit-kid-detail"><td colspan="4"><table><tr><th>Missed session</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
+      g.credits.forEach(function(c){ html+=creditReportRowHtml(c); });
+      html+='</table></td></tr>';
+    }
+  });
+  html+='</table>';
+  return html;
+}
+function creditsToolbarHtml(base){
+  const v=creditView();
+  const chips=[['all','All'],['soon','Expiring soon'],['manual','Manual'],['auto','Absence / cancel / closure']];
+  let html='<div class="credit-toolbar">'
+    +'<input type="search" placeholder="Search by child or parent name…" value="'+escapeHtml(v.q)+'" oninput="setCreditQuery(this.value)"/>'
+    +'<select onchange="setCreditSort(this.value)" title="Sort order">'
+      +[['expiry','Sort: expires soonest'],['missed','Sort: date missed'],['name','Sort: name A–Z']].map(function(o){ return '<option value="'+o[0]+'"'+(v.sort===o[0]?' selected':'')+'>'+o[1]+'</option>'; }).join('')
+    +'</select></div><div class="credit-chips">';
+  chips.forEach(function(ch){
+    const n=base.filter(function(c){ return creditPassesFilter(c, ch[0]); }).length;
+    html+='<button class="chip-btn'+(v.filter===ch[0]?' on':'')+'" onclick="setCreditFilter(\''+ch[0]+'\')">'+ch[1]+' <span class="n">'+n+'</span></button>';
+  });
+  return html+'</div>';
 }
 function renderCreditsReport(){
-  const list=sortCreditsByDateMissed(activeCredits());
-  let html=sectionOpen('credits','Make-up credits ('+list.length+')','<button class="btn sm primary" onclick="openAddCreditForm(\'\')">+ Add credit</button>');
-  html+='<p>Issued automatically for an excused absence (notified in advance), a parent self-cancel, or a centre closure — never for a plain no-show, which gets no credit — or added by hand for a make-up owed from before this system (e.g. carried over from the old manual log), or any other credit front desk needs to grant directly. All expire automatically 3 months after the date entered — no manual cleanup. Once a credit is booked into a make-up it moves to the "Booked" section below; once that make-up happens (or the credit expires unused) it moves on again to "Completed & expired".</p>';
-  if(list.length===0){ html+='<div class="empty-note">No make-up credits currently need action.</div>'; }
+  const v=creditView();
+  const q=v.q.trim().toLowerCase();
+  const base=activeCredits().filter(function(c){ return creditMatchesQuery(c, q); });
+  const list=base.filter(function(c){ return creditPassesFilter(c, v.filter); });
+  const groups=groupCreditsByStudent(list, v.sort);
+  let html=sectionOpen('credits','Make-up credits ('+activeCredits().length+')','<button class="btn sm primary" onclick="openAddCreditForm(\'\')">+ Add credit</button>');
+  html+='<div class="small muted" style="margin-top:0">Credits still to be used, one row per child — click a name to see their credits. '
+    +'<details class="inline-help"><summary>How credits work</summary>Issued automatically for an excused absence (notified in advance), a parent self-cancel, or a centre closure — never for a plain no-show, which gets no credit — or added by hand for a make-up owed from before this system (e.g. carried over from the old manual log), or any other credit front desk needs to grant directly. All expire automatically 3 months after the date entered — no manual cleanup. Once a credit is booked into a make-up it moves to the "Booked" section below; once that make-up happens (or the credit expires unused) it moves on again to "Completed & expired".</details></div>';
+  html+=creditsToolbarHtml(activeCredits().filter(function(c){ return creditMatchesQuery(c, q); }));
+  if(groups.length===0){ html+='<div class="empty-note">'+(q || v.filter!=='all'? 'No credits match.' : 'No make-up credits currently need action.')+'</div>'; }
   else{
-    html+='<table><tr><th>Student</th><th>Issued (missed session)</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
-    list.forEach(function(c){ html+=creditReportRowHtml(c); });
-    html+='</table>';
+    html+='<div class="small muted" style="margin:4px 0 6px">'+list.length+' credit'+(list.length===1?'':'s')+' · '+groups.length+' child'+(groups.length===1?'':'ren')+'</div>';
+    html+=creditGroupsTableHtml('active', groups);
   }
   html+='</div>';
   html+=renderAddCreditModal();
@@ -9952,34 +10062,29 @@ function renderTopUpPickerModal(){
   html+='</div></div>';
   return html;
 }
-// Booked credits — a make-up session is on the calendar but hasn't happened yet. The one settled
-// section that still gets a row action: Re-book, for when the family needs a different date/time.
+// Booked credits — a make-up session is on the calendar but hasn't happened yet. Same grouped
+// layout and the same search box as the main list; Re-book is each credit's main button.
 function renderBookedCreditsPanel(){
-  const list=sortCreditsByDateMissed(bookedCredits());
-  let html=sectionOpen('creditsBooked','Booked credits ('+list.length+')','');
-  html+='<p>A make-up session has been booked against these and hasn\'t happened yet. Use Re-book if the date or time needs to change.</p>';
-  if(list.length===0){ html+='<div class="empty-note">No make-up sessions currently booked and pending.</div>'; }
-  else{
-    html+='<table><tr><th>Student</th><th>Issued (missed session)</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
-    list.forEach(function(c){ html+=creditReportRowHtml(c); });
-    html+='</table>';
-  }
+  const v=creditView(), q=v.q.trim().toLowerCase();
+  const all=bookedCredits();
+  const list=all.filter(function(c){ return creditMatchesQuery(c, q); });
+  let html=sectionOpen('creditsBooked','Booked credits ('+all.length+')','');
+  html+='<p class="small muted" style="margin-top:0">A make-up session has been booked against these and hasn\'t happened yet. Use Re-book if the date or time needs to change.'+(q? ' Showing matches for “'+escapeHtml(v.q.trim())+'”.' : '')+'</p>';
+  if(list.length===0){ html+='<div class="empty-note">'+(q? 'No booked credits match.' : 'No make-up sessions currently booked and pending.')+'</div>'; }
+  else html+=creditGroupsTableHtml('booked', groupCreditsByStudent(list, v.sort));
   html+='</div>';
   return html;
 }
-// Settled credits — completed or expired only now (booked ones have their own section above). Kept
-// around (never deleted) as a record, but tucked into its own collapsed-by-default section, same
-// convention as Inactive Students/Parents below, so it doesn't bury the still-actionable ones.
+// Settled credits — completed or expired. Kept as a record in a collapsed-by-default section,
+// newest first (or A–Z if that sort is picked).
 function renderSettledCreditsPanel(){
-  const list=sortCreditsByDateMissed(settledCredits(), true);
-  let html=sectionOpen('creditsSettled','Completed & expired credits ('+list.length+')','');
-  html+='<p>Make-ups already completed, or credits that expired unused — no action needed, kept here as a record.</p>';
-  if(list.length===0){ html+='<div class="empty-note">No completed or expired credits yet.</div>'; }
-  else{
-    html+='<table><tr><th>Student</th><th>Issued (missed session)</th><th>Expires</th><th>Status</th><th>Source</th><th>Details</th><th></th></tr>';
-    list.forEach(function(c){ html+=creditReportRowHtml(c); });
-    html+='</table>';
-  }
+  const v=creditView(), q=v.q.trim().toLowerCase();
+  const all=settledCredits();
+  const list=all.filter(function(c){ return creditMatchesQuery(c, q); });
+  let html=sectionOpen('creditsSettled','Completed & expired credits ('+all.length+')','');
+  html+='<p class="small muted" style="margin-top:0">Make-ups already completed, or credits that expired unused — no action needed, kept here as a record.'+(q? ' Showing matches for “'+escapeHtml(v.q.trim())+'”.' : '')+'</p>';
+  if(list.length===0){ html+='<div class="empty-note">'+(q? 'No completed or expired credits match.' : 'No completed or expired credits yet.')+'</div>'; }
+  else html+=creditGroupsTableHtml('settled', groupCreditsByStudent(list, v.sort==='name'? 'name' : 'missed', true));
   html+='</div>';
   return html;
 }
